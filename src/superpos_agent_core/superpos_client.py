@@ -76,13 +76,31 @@ class SuperposClient:
         return False
 
     async def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
-        """Make a request, auto-refreshing token on 401."""
-        resp = await self._client.request(method, path, headers=self._headers(), **kwargs)
+        """Make a request, auto-refreshing token on 401.
+
+        Callers may pass ``headers=`` to merge extra headers on top of the
+        bearer token / Accept headers we always send.  Without this merge
+        any caller-supplied ``headers`` would collide with the
+        ``headers=self._headers()`` arg below and Python would raise
+        ``TypeError: got multiple values for keyword argument 'headers'``
+        before the request even left the client.
+        """
+        extra_headers = kwargs.pop("headers", None)
+
+        def _final_headers() -> dict[str, str]:
+            merged = self._headers()
+            if extra_headers:
+                merged.update(extra_headers)
+            return merged
+
+        resp = await self._client.request(
+            method, path, headers=_final_headers(), **kwargs,
+        )
         if resp.status_code == 401:
             log.warning("Superpos 401 — attempting token refresh")
             if await self.refresh_auth():
                 resp = await self._client.request(
-                    method, path, headers=self._headers(), **kwargs
+                    method, path, headers=_final_headers(), **kwargs,
                 )
         resp.raise_for_status()
         return resp
@@ -646,9 +664,8 @@ class SuperposClient:
         if json is not None:
             kwargs["json"] = json
         if headers is not None:
-            merged = self._headers()
-            merged.update(headers)
-            kwargs["headers"] = merged
+            # _request merges these on top of the bearer-token headers.
+            kwargs["headers"] = headers
         return await self._request(method, endpoint, **kwargs)
 
     # ── Drain mode (graceful shutdown) ────────────────────────────────

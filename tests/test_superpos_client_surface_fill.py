@@ -369,6 +369,34 @@ async def test_service_request_passes_json_body():
     await client.close()
 
 
+async def test_service_request_merges_caller_headers_with_auth():
+    """Regression for the bug where service_request passed headers= AND
+    _request passed headers=self._headers() — Python raises
+    `TypeError: got multiple values for keyword argument 'headers'`
+    before the request leaves the client.  Verify the merged request has
+    both the auth header and the caller-supplied one.
+    """
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200)
+
+    client = _make_client(handler)
+    await client.service_request(
+        "GET", "github", "repos/x/y",
+        headers={"Accept": "application/vnd.github.v3+json", "X-Trace": "abc"},
+    )
+
+    req = captured[0]
+    # auth header is still there
+    assert req.headers["authorization"] == "Bearer tok"
+    # caller-supplied headers are merged in
+    assert req.headers["accept"] == "application/vnd.github.v3+json"
+    assert req.headers["x-trace"] == "abc"
+    await client.close()
+
+
 async def test_service_request_returns_raw_response_for_non_json():
     """Some proxied APIs return non-JSON (binary, XML). We return the raw
     Response so callers can pick `.text`, `.content`, or `.json()`."""
