@@ -85,6 +85,25 @@ async def test_search_knowledge_semantic_flag_passed():
     await client.close()
 
 
+async def test_search_knowledge_raises_when_both_q_and_scope_missing():
+    """The server returns 400 if neither q nor scope is provided; we
+    short-circuit with a ValueError so the caller mistake doesn't
+    masquerade as a network failure."""
+    called = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called = True
+        return _envelope([])
+
+    client = _make_client(handler)
+    with pytest.raises(ValueError, match="at least one of"):
+        await client.search_knowledge()  # no q, no scope
+
+    assert not called, "no HTTP request should be sent for an invalid call"
+    await client.close()
+
+
 async def test_search_knowledge_scope_only_no_q():
     """The server allows scope-only queries; client must not require q."""
     captured: list[httpx.Request] = []

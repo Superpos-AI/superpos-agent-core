@@ -304,15 +304,22 @@ class SuperposClient:
     ) -> list[dict[str, Any]]:
         """``GET /knowledge/search`` — PostgreSQL FTS or pgvector semantic search.
 
-        The server requires at least one of ``q`` or ``scope``.  ``semantic=True``
-        routes to pgvector cosine-similarity (embedding-backed); the default
-        ``semantic=False`` uses Postgres ``ts_query`` / ``ts_rank`` with
-        highlighted snippets.
+        The server requires at least one of ``q`` or ``scope`` and returns
+        400 otherwise; we raise ``ValueError`` here instead so a caller
+        mistake fails fast and synchronously rather than as a delayed
+        ``httpx.HTTPStatusError`` from the network.  ``semantic=True``
+        routes to pgvector cosine-similarity (embedding-backed); the
+        default ``semantic=False`` uses Postgres ``ts_query`` / ``ts_rank``
+        with highlighted snippets.
 
         Returns the unwrapped entry list — pagination meta (``total``,
-        ``query``) is on the envelope, callers needing it should hit the raw
-        endpoint via ``_request`` directly.
+        ``query``) is on the envelope, callers needing it should hit the
+        raw endpoint via ``_request`` directly.
         """
+        if q is None and scope is None:
+            raise ValueError(
+                "search_knowledge requires at least one of `q` or `scope`",
+            )
         hive = self._config.superpos_hive_id
         params: dict[str, Any] = {"limit": limit}
         if q is not None:
