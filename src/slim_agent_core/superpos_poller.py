@@ -81,6 +81,7 @@ async def run_superpos_poller(
 
     persona_version: int | None = None
     platform_context_version: int | None = None
+    environment_version: str | None = None
     recent_webhook_entities: dict[str, tuple[float, str]] = {}
     task_claim_counts: dict[str, int] = {}
     _failed_tasks: set[str] = set()
@@ -96,25 +97,41 @@ async def run_superpos_poller(
                 ver_data = await superpos.get_persona_version(
                     known_version=persona_version,
                     known_platform_version=platform_context_version,
+                    known_environment_version=environment_version,
                 )
                 data = ver_data.get("data", ver_data) if isinstance(ver_data, dict) else {}
                 changed = data.get("changed", False)
                 server_version = data.get("version")
                 server_platform_version = data.get("platform_context_version")
-                if changed or (server_version is not None and server_version != persona_version):
+                server_environment_version = data.get("environment_version")
+
+                # Refetch the assembled prompt whenever ANY dimension changed —
+                # persona, platform context, or live hive environment.  The
+                # server's `changed` flag already factors all three in when the
+                # client passed `known_*` for each.
+                if changed or (
+                    server_version is not None and server_version != persona_version
+                ):
                     new_persona = await superpos.get_persona_assembled()
                     executor.update_persona(new_persona, version=server_version)
                     persona_version = server_version
                     if server_platform_version is not None:
                         platform_context_version = server_platform_version
+                    if server_environment_version is not None:
+                        environment_version = server_environment_version
                     log.info(
-                        "Persona refreshed (version=%s, platform=%s)",
-                        persona_version, platform_context_version,
+                        "Persona refreshed (version=%s, platform=%s, env=%s)",
+                        persona_version, platform_context_version, environment_version,
                     )
-                elif persona_version is None and server_version is not None:
-                    persona_version = server_version
-                if server_platform_version is not None and platform_context_version is None:
-                    platform_context_version = server_platform_version
+                else:
+                    # Seed local tracking for first-run / pre-existing state so
+                    # subsequent polls correctly compare known→server values.
+                    if persona_version is None and server_version is not None:
+                        persona_version = server_version
+                    if platform_context_version is None and server_platform_version is not None:
+                        platform_context_version = server_platform_version
+                    if environment_version is None and server_environment_version is not None:
+                        environment_version = server_environment_version
             except Exception:
                 log.debug("Persona version check failed", exc_info=True)
 

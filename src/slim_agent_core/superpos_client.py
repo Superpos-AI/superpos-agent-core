@@ -250,14 +250,23 @@ class SuperposClient:
         self,
         known_version: int | None = None,
         known_platform_version: int | None = None,
+        known_environment_version: str | None = None,
     ) -> dict[str, Any]:
-        """Check the server-assigned persona version. Lightweight poll-friendly call."""
+        """Check the server-assigned persona / platform / environment versions.
+
+        Lightweight poll-friendly call.  ``known_*`` params let the server
+        compute the ``changed`` flag in one round trip without the client
+        having to compare manually.  ``environment_version`` is a content
+        hash (hex string), not an integer like the other two.
+        """
         try:
             params: dict[str, Any] = {}
             if known_version is not None:
                 params["known_version"] = known_version
             if known_platform_version is not None:
                 params["known_platform_version"] = known_platform_version
+            if known_environment_version is not None:
+                params["known_environment_version"] = known_environment_version
             resp = await self._request("GET", "/api/v1/persona/version", params=params or None)
             return resp.json()
         except httpx.HTTPStatusError as e:
