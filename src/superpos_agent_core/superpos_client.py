@@ -76,13 +76,31 @@ class SuperposClient:
         return False
 
     async def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
-        """Make a request, auto-refreshing token on 401."""
-        resp = await self._client.request(method, path, headers=self._headers(), **kwargs)
+        """Make a request, auto-refreshing token on 401.
+
+        Callers may pass ``headers=`` to merge extra headers on top of the
+        bearer token / Accept headers we always send.  Without this merge
+        any caller-supplied ``headers`` would collide with the
+        ``headers=self._headers()`` arg below and Python would raise
+        ``TypeError: got multiple values for keyword argument 'headers'``
+        before the request even left the client.
+        """
+        extra_headers = kwargs.pop("headers", None)
+
+        def _final_headers() -> dict[str, str]:
+            merged = self._headers()
+            if extra_headers:
+                merged.update(extra_headers)
+            return merged
+
+        resp = await self._client.request(
+            method, path, headers=_final_headers(), **kwargs,
+        )
         if resp.status_code == 401:
             log.warning("Superpos 401 — attempting token refresh")
             if await self.refresh_auth():
                 resp = await self._client.request(
-                    method, path, headers=self._headers(), **kwargs
+                    method, path, headers=_final_headers(), **kwargs,
                 )
         resp.raise_for_status()
         return resp
@@ -427,6 +445,440 @@ class SuperposClient:
         )
         data = resp.json()
         return data.get("data", data) if isinstance(data, dict) else data
+
+    # ── Knowledge (write) ─────────────────────────────────────────────
+
+    async def create_knowledge(
+        self,
+        *,
+        key: str,
+        value: Any,
+        scope: str | None = None,
+        visibility: str | None = None,
+        ttl: str | None = None,
+    ) -> dict[str, Any]:
+        """``POST /knowledge`` — create a new entry."""
+        hive = self._config.superpos_hive_id
+        body: dict[str, Any] = {"key": key, "value": value}
+        if scope is not None:
+            body["scope"] = scope
+        if visibility is not None:
+            body["visibility"] = visibility
+        if ttl is not None:
+            body["ttl"] = ttl
+        resp = await self._request("POST", f"/api/v1/hives/{hive}/knowledge", json=body)
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def update_knowledge(
+        self,
+        entry_id: str,
+        *,
+        value: Any,
+        visibility: str | None = None,
+        ttl: str | None = None,
+    ) -> dict[str, Any]:
+        """``PUT /knowledge/{entry}`` — replace value (bumps version)."""
+        hive = self._config.superpos_hive_id
+        body: dict[str, Any] = {"value": value}
+        if visibility is not None:
+            body["visibility"] = visibility
+        if ttl is not None:
+            body["ttl"] = ttl
+        resp = await self._request(
+            "PUT", f"/api/v1/hives/{hive}/knowledge/{entry_id}", json=body,
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def delete_knowledge(self, entry_id: str) -> None:
+        """``DELETE /knowledge/{entry}``."""
+        hive = self._config.superpos_hive_id
+        await self._request("DELETE", f"/api/v1/hives/{hive}/knowledge/{entry_id}")
+
+    async def list_knowledge_links(
+        self,
+        *,
+        source_id: str | None = None,
+        target_id: str | None = None,
+        target_type: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """``GET /knowledge/links`` — list links filtered by source/target."""
+        hive = self._config.superpos_hive_id
+        params: dict[str, Any] = {}
+        if source_id is not None:
+            params["source"] = source_id
+        if target_id is not None:
+            params["target"] = target_id
+        if target_type is not None:
+            params["target_type"] = target_type
+        if limit is not None:
+            params["limit"] = limit
+        resp = await self._request(
+            "GET", f"/api/v1/hives/{hive}/knowledge/links",
+            params=params or None,
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def create_knowledge_link(
+        self,
+        entry_id: str,
+        *,
+        target_id: str | None = None,
+        target_ref: str | None = None,
+        target_type: str = "knowledge",
+        link_type: str = "relates_to",
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """``POST /knowledge/{entry}/links`` — link an entry to another entity."""
+        hive = self._config.superpos_hive_id
+        body: dict[str, Any] = {"target_type": target_type, "link_type": link_type}
+        if target_id is not None:
+            body["target_id"] = target_id
+        if target_ref is not None:
+            body["target_ref"] = target_ref
+        if metadata is not None:
+            body["metadata"] = metadata
+        resp = await self._request(
+            "POST", f"/api/v1/hives/{hive}/knowledge/{entry_id}/links",
+            json=body,
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def delete_knowledge_link(self, link_id: str) -> None:
+        """``DELETE /knowledge/links/{link}``."""
+        hive = self._config.superpos_hive_id
+        await self._request(
+            "DELETE", f"/api/v1/hives/{hive}/knowledge/links/{link_id}",
+        )
+
+    async def confirm_knowledge_link(self, link_id: str) -> dict[str, Any]:
+        """``POST /knowledge/links/{link}/confirm`` — promote suggested → confirmed."""
+        hive = self._config.superpos_hive_id
+        resp = await self._request(
+            "POST", f"/api/v1/hives/{hive}/knowledge/links/{link_id}/confirm",
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def dismiss_knowledge_link(self, link_id: str) -> dict[str, Any]:
+        """``DELETE /knowledge/links/{link}/dismiss`` — exclude from future suggestions."""
+        hive = self._config.superpos_hive_id
+        resp = await self._request(
+            "DELETE", f"/api/v1/hives/{hive}/knowledge/links/{link_id}/dismiss",
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    # ── Sub-agents (read) ─────────────────────────────────────────────
+
+    async def list_sub_agents(self) -> list[dict[str, Any]]:
+        """``GET /sub-agents`` — list active sub-agent definitions in this hive."""
+        resp = await self._request("GET", "/api/v1/sub-agents")
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def get_sub_agent(self, slug: str) -> dict[str, Any]:
+        """``GET /sub-agents/{slug}`` — current active version by slug."""
+        resp = await self._request("GET", f"/api/v1/sub-agents/{slug}")
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def get_sub_agent_by_id(self, sub_agent_id: str) -> dict[str, Any]:
+        """``GET /sub-agents/by-id/{id}`` — version-stable lookup by ULID."""
+        resp = await self._request(
+            "GET", f"/api/v1/sub-agents/by-id/{sub_agent_id}",
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def get_sub_agent_assembled(self, slug: str) -> str | None:
+        """``GET /sub-agents/{slug}/assembled`` — pre-assembled system prompt."""
+        resp = await self._request(
+            "GET", f"/api/v1/sub-agents/{slug}/assembled",
+        )
+        data = resp.json()
+        payload = data.get("data", data) if isinstance(data, dict) else {}
+        return payload.get("prompt") if isinstance(payload, dict) else None
+
+    async def get_sub_agent_assembled_by_id(self, sub_agent_id: str) -> str | None:
+        """``GET /sub-agents/by-id/{id}/assembled`` — pre-assembled by ULID."""
+        resp = await self._request(
+            "GET", f"/api/v1/sub-agents/by-id/{sub_agent_id}/assembled",
+        )
+        data = resp.json()
+        payload = data.get("data", data) if isinstance(data, dict) else {}
+        return payload.get("prompt") if isinstance(payload, dict) else None
+
+    # ── Service proxy ─────────────────────────────────────────────────
+
+    async def discover_services(
+        self,
+        *,
+        capability_prefix: str = "data:",
+    ) -> list[dict[str, Any]]:
+        """``GET /services`` — list service workers registered in this hive.
+
+        Filters to agents whose capability list contains entries with the
+        given prefix (default ``data:``).  Each record carries
+        ``metadata.supported_operations`` for callers that need to decide
+        which operation to invoke through ``service_request``.
+        """
+        params = {"capability_prefix": capability_prefix}
+        resp = await self._request(
+            "GET", "/api/v1/services", params=params,
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def service_request(
+        self,
+        method: str,
+        service: str,
+        path: str = "",
+        *,
+        params: dict[str, Any] | None = None,
+        json: Any = None,
+        headers: dict[str, str] | None = None,
+    ) -> httpx.Response:
+        """Forward an HTTP request through Superpos's credentialed proxy.
+
+        ``GET/POST/PUT/PATCH/DELETE /proxy/{service}/{path}`` — Superpos
+        injects the connection's stored OAuth/API credentials before
+        forwarding, so the agent never sees them.
+
+        Returns the raw ``httpx.Response`` because the target service can
+        return any content type (JSON, XML, binary).  Callers decide
+        whether to ``.json()``, ``.text``, or ``.content`` based on the
+        target API.
+        """
+        endpoint = f"/api/v1/proxy/{service}"
+        if path:
+            endpoint = f"{endpoint}/{path.lstrip('/')}"
+        kwargs: dict[str, Any] = {}
+        if params is not None:
+            kwargs["params"] = params
+        if json is not None:
+            kwargs["json"] = json
+        if headers is not None:
+            # _request merges these on top of the bearer-token headers.
+            kwargs["headers"] = headers
+        return await self._request(method, endpoint, **kwargs)
+
+    # ── Drain mode (graceful shutdown) ────────────────────────────────
+
+    async def enter_drain(
+        self,
+        *,
+        reason: str | None = None,
+        deadline_minutes: int | None = None,
+    ) -> dict[str, Any]:
+        """``POST /agents/drain`` — stop accepting new tasks, finish in-flight."""
+        body: dict[str, Any] = {}
+        if reason is not None:
+            body["reason"] = reason
+        if deadline_minutes is not None:
+            body["deadline_minutes"] = deadline_minutes
+        resp = await self._request(
+            "POST", "/api/v1/agents/drain", json=body or None,
+        )
+        return resp.json()
+
+    async def exit_drain(self) -> dict[str, Any]:
+        """``POST /agents/undrain`` — restore normal operation."""
+        resp = await self._request("POST", "/api/v1/agents/undrain")
+        return resp.json()
+
+    async def drain_status(self) -> dict[str, Any]:
+        """``GET /agents/drain`` — current drain state for this agent."""
+        resp = await self._request("GET", "/api/v1/agents/drain")
+        return resp.json()
+
+    # ── Task tracing / replay ─────────────────────────────────────────
+
+    async def get_task(self, task_id: str) -> dict[str, Any]:
+        """``GET /tasks/{task}`` — single task by ID, same shape as claim/complete."""
+        hive = self._config.superpos_hive_id
+        resp = await self._request("GET", f"/api/v1/hives/{hive}/tasks/{task_id}")
+        return resp.json()
+
+    async def get_task_trace(self, task_id: str) -> dict[str, Any]:
+        """``GET /tasks/{task}/trace`` — full execution trace."""
+        hive = self._config.superpos_hive_id
+        resp = await self._request(
+            "GET", f"/api/v1/hives/{hive}/tasks/{task_id}/trace",
+        )
+        return resp.json()
+
+    async def replay_task(
+        self,
+        task_id: str,
+        *,
+        override_payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """``POST /tasks/{task}/replay`` — recreate a completed/failed/expired task."""
+        hive = self._config.superpos_hive_id
+        body: dict[str, Any] = {}
+        if override_payload is not None:
+            body["override_payload"] = override_payload
+        resp = await self._request(
+            "POST", f"/api/v1/hives/{hive}/tasks/{task_id}/replay",
+            json=body or None,
+        )
+        return resp.json()
+
+    async def compare_tasks(
+        self, task_a: str, task_b: str,
+    ) -> dict[str, Any]:
+        """``GET /tasks/compare`` — diff two tasks (payload + result + trace)."""
+        hive = self._config.superpos_hive_id
+        resp = await self._request(
+            "GET", f"/api/v1/hives/{hive}/tasks/compare",
+            params={"task_a": task_a, "task_b": task_b},
+        )
+        return resp.json()
+
+    # ── Dead-letter queue ─────────────────────────────────────────────
+
+    async def list_dead_letter(self) -> list[dict[str, Any]]:
+        """``GET /tasks/dead-letter`` — list dead-lettered tasks."""
+        hive = self._config.superpos_hive_id
+        resp = await self._request(
+            "GET", f"/api/v1/hives/{hive}/tasks/dead-letter",
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def get_dead_letter(self, task_id: str) -> dict[str, Any]:
+        """``GET /tasks/{task}/dead-letter`` — inspect dead-letter detail."""
+        hive = self._config.superpos_hive_id
+        resp = await self._request(
+            "GET", f"/api/v1/hives/{hive}/tasks/{task_id}/dead-letter",
+        )
+        return resp.json()
+
+    # ── Threads (server-side conversation history) ────────────────────
+
+    async def create_thread(
+        self,
+        *,
+        title: str | None = None,
+        message: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """``POST /threads`` — create a context thread, optionally seeded with a message."""
+        hive = self._config.superpos_hive_id
+        body: dict[str, Any] = {}
+        if title is not None:
+            body["title"] = title
+        if message is not None:
+            body["message"] = message
+        if metadata is not None:
+            body["metadata"] = metadata
+        resp = await self._request(
+            "POST", f"/api/v1/hives/{hive}/threads", json=body or None,
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def list_threads(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        """``GET /threads`` — list context threads in the hive."""
+        hive = self._config.superpos_hive_id
+        resp = await self._request(
+            "GET", f"/api/v1/hives/{hive}/threads", params={"limit": limit},
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def get_thread(self, thread_id: str) -> dict[str, Any]:
+        """``GET /threads/{thread}`` — full thread with messages."""
+        hive = self._config.superpos_hive_id
+        resp = await self._request(
+            "GET", f"/api/v1/hives/{hive}/threads/{thread_id}",
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def append_thread_message(
+        self,
+        thread_id: str,
+        message: str,
+        *,
+        task_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """``POST /threads/{thread}/messages`` — append a message."""
+        hive = self._config.superpos_hive_id
+        body: dict[str, Any] = {"message": message}
+        if task_id is not None:
+            body["task_id"] = task_id
+        if metadata is not None:
+            body["metadata"] = metadata
+        resp = await self._request(
+            "POST", f"/api/v1/hives/{hive}/threads/{thread_id}/messages",
+            json=body,
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def clear_thread_messages(self, thread_id: str) -> dict[str, Any]:
+        """``DELETE /threads/{thread}/messages`` — clear messages, keep thread."""
+        hive = self._config.superpos_hive_id
+        resp = await self._request(
+            "DELETE", f"/api/v1/hives/{hive}/threads/{thread_id}/messages",
+        )
+        return resp.json()
+
+    async def delete_thread(self, thread_id: str) -> None:
+        """``DELETE /threads/{thread}`` — drop thread and all messages."""
+        hive = self._config.superpos_hive_id
+        await self._request(
+            "DELETE", f"/api/v1/hives/{hive}/threads/{thread_id}",
+        )
+
+    # ── Schedule pause / resume ───────────────────────────────────────
+
+    async def pause_schedule(self, schedule_id: str) -> dict[str, Any]:
+        """``PATCH /schedules/{schedule}/pause`` — halt without deleting."""
+        hive = self._config.superpos_hive_id
+        resp = await self._request(
+            "PATCH", f"/api/v1/hives/{hive}/schedules/{schedule_id}/pause",
+        )
+        return resp.json()
+
+    async def resume_schedule(self, schedule_id: str) -> dict[str, Any]:
+        """``PATCH /schedules/{schedule}/resume`` — re-arm a paused schedule."""
+        hive = self._config.superpos_hive_id
+        resp = await self._request(
+            "PATCH", f"/api/v1/hives/{hive}/schedules/{schedule_id}/resume",
+        )
+        return resp.json()
+
+    # ── Events (publish only) ─────────────────────────────────────────
+
+    async def publish_event(
+        self,
+        event_type: str,
+        *,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """``POST /events`` — fire an event for server-side subscription fan-out.
+
+        Subscriptions are materialised as tasks server-side, so the
+        consumer side needs no separate poll loop — events arrive in the
+        normal task queue.  This method exists for the *publish* side.
+        """
+        hive = self._config.superpos_hive_id
+        body: dict[str, Any] = {"type": event_type}
+        if payload is not None:
+            body["payload"] = payload
+        resp = await self._request(
+            "POST", f"/api/v1/hives/{hive}/events", json=body,
+        )
+        return resp.json()
 
     # ── Lifecycle ─────────────────────────────────────────────────────
 
