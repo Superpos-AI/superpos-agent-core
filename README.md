@@ -1,4 +1,4 @@
-# slim-agent-core
+# superpos-agent-core
 
 Shared runtime for the Superpos "slim agent" family — the part that is identical across Claude, Codex, Gemini, Qwen, and any future LLM-CLI-backed agent.
 
@@ -22,13 +22,13 @@ Shared runtime for the Superpos "slim agent" family — the part that is identic
 ## Using it
 
 ```python
-from slim_agent_core import run_agent, BaseConfig, Executor
+from superpos_agent_core import run_agent, BaseConfig, Executor
 
 class MyAgentConfig(BaseConfig):
     my_api_key: str = ""
 
 class MyExecutor:
-    # implements slim_agent_core.Executor
+    # implements superpos_agent_core.Executor
     ...
 
 if __name__ == "__main__":
