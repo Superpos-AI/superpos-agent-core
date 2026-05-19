@@ -292,6 +292,142 @@ class SuperposClient:
         resp = await self._request("PATCH", "/api/v1/persona/memory", json=body)
         return resp.json()
 
+    # ── Knowledge (read-only) ─────────────────────────────────────────
+
+    async def search_knowledge(
+        self,
+        q: str | None = None,
+        *,
+        scope: str | None = None,
+        semantic: bool = False,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """``GET /knowledge/search`` — PostgreSQL FTS or pgvector semantic search.
+
+        The server requires at least one of ``q`` or ``scope`` and returns
+        400 otherwise; we raise ``ValueError`` here instead so a caller
+        mistake fails fast and synchronously rather than as a delayed
+        ``httpx.HTTPStatusError`` from the network.  ``semantic=True``
+        routes to pgvector cosine-similarity (embedding-backed); the
+        default ``semantic=False`` uses Postgres ``ts_query`` / ``ts_rank``
+        with highlighted snippets.
+
+        Returns the unwrapped entry list — pagination meta (``total``,
+        ``query``) is on the envelope, callers needing it should hit the
+        raw endpoint via ``_request`` directly.
+        """
+        if q is None and scope is None:
+            raise ValueError(
+                "search_knowledge requires at least one of `q` or `scope`",
+            )
+        hive = self._config.superpos_hive_id
+        params: dict[str, Any] = {"limit": limit}
+        if q is not None:
+            params["q"] = q
+        if scope is not None:
+            params["scope"] = scope
+        if semantic:
+            params["semantic"] = "true"
+        resp = await self._request(
+            "GET",
+            f"/api/v1/hives/{hive}/knowledge/search",
+            params=params,
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def list_knowledge(
+        self,
+        *,
+        key: str | None = None,
+        scope: str | None = None,
+        tags: str | None = None,
+        stale_days: int | None = None,
+        sort: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """``GET /knowledge`` — filtered listing.
+
+        - ``key`` accepts SQL wildcards (``*`` mapped to ``%`` server-side).
+        - ``tags`` is comma-separated; results must contain ALL listed tags.
+        - ``stale_days`` filters to entries not read in N days (great for
+          finding what needs refreshing).
+        - ``sort="least_read"`` orders ascending by read count.
+        - ``limit`` is clamped 1-100 server-side; default 50.
+        """
+        hive = self._config.superpos_hive_id
+        params: dict[str, Any] = {"limit": limit}
+        if key is not None:
+            params["key"] = key
+        if scope is not None:
+            params["scope"] = scope
+        if tags is not None:
+            params["tags"] = tags
+        if stale_days is not None:
+            params["stale_days"] = stale_days
+        if sort is not None:
+            params["sort"] = sort
+        resp = await self._request(
+            "GET",
+            f"/api/v1/hives/{hive}/knowledge",
+            params=params,
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def get_knowledge(self, entry_id: str) -> dict[str, Any]:
+        """``GET /knowledge/{entry}`` — fetch a single entry."""
+        hive = self._config.superpos_hive_id
+        resp = await self._request(
+            "GET", f"/api/v1/hives/{hive}/knowledge/{entry_id}",
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def get_knowledge_graph(
+        self,
+        entry_id: str,
+        *,
+        depth: int = 2,
+        max_nodes: int = 50,
+        link_types: str | None = None,
+    ) -> dict[str, Any]:
+        """``GET /knowledge/{entry}/graph`` — BFS link traversal.
+
+        Server clamps ``depth`` to 1-5 and ``max_nodes`` to 1-200.
+        ``link_types`` is a comma-separated allowlist (e.g.
+        ``"decides,depends_on"``) — omit to include every link type.
+        """
+        hive = self._config.superpos_hive_id
+        params: dict[str, Any] = {"depth": depth, "max_nodes": max_nodes}
+        if link_types:
+            params["link_types"] = link_types
+        resp = await self._request(
+            "GET",
+            f"/api/v1/hives/{hive}/knowledge/{entry_id}/graph",
+            params=params,
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def knowledge_topics(self) -> dict[str, Any]:
+        """``GET /knowledge/index/topics`` — convenience index of topic clusters."""
+        hive = self._config.superpos_hive_id
+        resp = await self._request(
+            "GET", f"/api/v1/hives/{hive}/knowledge/index/topics",
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def knowledge_decisions(self) -> dict[str, Any]:
+        """``GET /knowledge/index/decisions`` — convenience index of decisions."""
+        hive = self._config.superpos_hive_id
+        resp = await self._request(
+            "GET", f"/api/v1/hives/{hive}/knowledge/index/decisions",
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
     # ── Lifecycle ─────────────────────────────────────────────────────
 
     async def close(self) -> None:
