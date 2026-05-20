@@ -51,7 +51,7 @@ def test_corrupt_json_starts_fresh(tmp_path):
 def test_set_with_version_then_get_with_version(tmp_path):
     store = SessionStore(str(tmp_path / "sessions.json"))
     store.set_with_version("chat1", "session-abc", 3)
-    assert store.get_with_version("chat1") == ("session-abc", 3)
+    assert store.get_with_version("chat1") == ("session-abc", 3, None)
     # plain get still works
     assert store.get("chat1") == "session-abc"
 
@@ -67,7 +67,7 @@ def test_set_records_none_version(tmp_path):
     for comparison."""
     store = SessionStore(str(tmp_path / "sessions.json"))
     store.set("chat1", "sess-a")
-    assert store.get_with_version("chat1") == ("sess-a", None)
+    assert store.get_with_version("chat1") == ("sess-a", None, None)
 
 
 def test_version_persists_across_instances(tmp_path):
@@ -75,7 +75,43 @@ def test_version_persists_across_instances(tmp_path):
     store1 = SessionStore(path)
     store1.set_with_version("chat1", "session-abc", 2)
     store2 = SessionStore(path)
-    assert store2.get_with_version("chat1") == ("session-abc", 2)
+    assert store2.get_with_version("chat1") == ("session-abc", 2, None)
+
+
+# ── Branch field ─────────────────────────────────────────────────────────
+
+
+def test_set_with_branch_round_trip(tmp_path):
+    store = SessionStore(str(tmp_path / "sessions.json"))
+    store.set_with_version("chat1", "session-abc", 3, branch="feat/foo")
+    assert store.get_with_version("chat1") == ("session-abc", 3, "feat/foo")
+
+
+def test_branch_persists_across_instances(tmp_path):
+    path = str(tmp_path / "sessions.json")
+    store1 = SessionStore(path)
+    store1.set_with_version("chat1", "session-abc", 2, branch="feat/bar")
+    store2 = SessionStore(path)
+    assert store2.get_with_version("chat1") == ("session-abc", 2, "feat/bar")
+
+
+def test_branch_overwrite_replaces_previous(tmp_path):
+    """Saving a new session id with a different branch overwrites the old
+    branch — the user has explicitly switched context, so the resume
+    should follow the new cwd."""
+    store = SessionStore(str(tmp_path / "sessions.json"))
+    store.set_with_version("chat1", "session-1", 1, branch="feat/old")
+    store.set_with_version("chat1", "session-2", 1, branch="feat/new")
+    assert store.get_with_version("chat1") == ("session-2", 1, "feat/new")
+
+
+def test_branch_omitted_defaults_to_none(tmp_path):
+    """Callers that don't pass branch keep the same behavior as before
+    the field existed — branch is None and the executor falls back to
+    the default cwd."""
+    store = SessionStore(str(tmp_path / "sessions.json"))
+    store.set_with_version("chat1", "session-abc", 1)
+    assert store.get_with_version("chat1") == ("session-abc", 1, None)
 
 
 # ── Backward compatibility ───────────────────────────────────────────────
@@ -86,13 +122,28 @@ def test_legacy_plain_string_loads_as_version_zero(tmp_path):
 
     They load as version=0 so the next persona update naturally
     invalidates them via invalidate_older_than() — preferable to
-    treating them as "unknown" and exempting them forever.
+    treating them as "unknown" and exempting them forever.  Branch
+    is None because the legacy entry has no cwd context.
     """
     path = tmp_path / "sessions.json"
     path.write_text(json.dumps({"chat1": "legacy-session"}))
     store = SessionStore(str(path))
-    assert store.get_with_version("chat1") == ("legacy-session", 0)
+    assert store.get_with_version("chat1") == ("legacy-session", 0, None)
     assert store.get("chat1") == "legacy-session"
+
+
+def test_legacy_dict_without_branch_field_loads_with_none_branch(tmp_path):
+    """Versioned entries written before the branch field existed should
+    load with branch=None — the executor will treat them as "no
+    worktree" and fall back to the default cwd, matching the
+    pre-branch behavior.
+    """
+    path = tmp_path / "sessions.json"
+    path.write_text(json.dumps({
+        "chat1": {"session_id": "sess-a", "persona_version": 4},
+    }))
+    store = SessionStore(str(path))
+    assert store.get_with_version("chat1") == ("sess-a", 4, None)
 
 
 # ── invalidate_older_than ────────────────────────────────────────────────
@@ -138,6 +189,17 @@ def test_invalidate_persists_to_disk(tmp_path):
     store2 = SessionStore(path)
     assert store2.get("chat_old") is None
     assert store2.get("chat_new") == "s2"
+
+
+def test_invalidate_preserves_branch_on_surviving_entries(tmp_path):
+    """Surviving entries keep their branch — invalidation drops stale
+    rows wholesale, it does not silently rewrite the rest."""
+    store = SessionStore(str(tmp_path / "sessions.json"))
+    store.set_with_version("chat_keep", "s2", 5, branch="feat/bar")
+    store.set_with_version("chat_drop", "s1", 1, branch="feat/foo")
+    store.invalidate_older_than(3)
+    assert store.get_with_version("chat_keep") == ("s2", 5, "feat/bar")
+    assert store.get_with_version("chat_drop") is None
 
 
 # ── active_session_ids ───────────────────────────────────────────────────

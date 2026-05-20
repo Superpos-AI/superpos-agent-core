@@ -1,11 +1,20 @@
-"""Persistent session store: maps chat_id → (session_id, persona_version).
+"""Persistent session store: maps chat_id → (session_id, persona_version, branch).
 
 Each agent stores its CLI-specific session/thread ID per chat so follow-up
 messages can resume the existing conversation instead of starting fresh.
-The persona version is captured alongside so a downstream executor can
-drop the resume when its current persona is newer than the one the
-session was started under — preventing the LLM from inheriting an old
-identity from conversation history written under a previous persona.
+
+Two pieces of context travel with the session id:
+
+* ``persona_version`` — captured so a downstream executor can drop the
+  resume when its current persona is newer than the one the session was
+  started under, preventing the LLM from inheriting an old identity
+  from conversation history written under a previous persona.
+* ``branch`` — the git branch (and therefore worktree cwd) the session
+  was started under.  Claude CLI keys its on-disk transcripts by
+  ``~/.claude/projects/<cwd-encoded>/<sid>.jsonl``, so resuming a
+  worktree-scoped session from the default cwd silently starts a fresh
+  conversation.  Persisting the branch lets the executor restore the
+  same cwd when the user follows up without re-stating the branch.
 """
 
 from __future__ import annotations
@@ -34,14 +43,22 @@ class SessionStore:
             return
         # Backward compat: legacy entries stored as plain session_id strings.
         # Treat their persona_version as 0 so the next persona update
-        # naturally invalidates them via invalidate_older_than().
+        # naturally invalidates them via invalidate_older_than().  Entries
+        # written before the ``branch`` field existed get branch=None,
+        # which means the executor falls back to the default cwd on
+        # resume — same behavior as before this field was added.
         for chat_id, value in raw.items():
             if isinstance(value, str):
-                self._data[chat_id] = {"session_id": value, "persona_version": 0}
+                self._data[chat_id] = {
+                    "session_id": value,
+                    "persona_version": 0,
+                    "branch": None,
+                }
             elif isinstance(value, dict) and "session_id" in value:
                 self._data[chat_id] = {
                     "session_id": value["session_id"],
                     "persona_version": value.get("persona_version"),
+                    "branch": value.get("branch"),
                 }
         log.info("Loaded %d session(s) from %s", len(self._data), self._path)
 
@@ -75,19 +92,25 @@ class SessionStore:
 
     def get_with_version(
         self, chat_id: int | str,
-    ) -> tuple[str, int | None] | None:
-        """Return (session_id, persona_version) or None.
+    ) -> tuple[str, int | None, str | None] | None:
+        """Return (session_id, persona_version, branch) or None.
 
         ``persona_version`` is None when the session was saved before any
-        persona version was known (e.g. via legacy ``set()``).
+        persona version was known (e.g. via legacy ``set()``).  ``branch``
+        is None when the session was started on the default cwd (no
+        worktree) or pre-dates the branch field.
         """
         entry = self._data.get(str(chat_id))
         if not entry:
             return None
-        return entry["session_id"], entry.get("persona_version")
+        return (
+            entry["session_id"],
+            entry.get("persona_version"),
+            entry.get("branch"),
+        )
 
     def set(self, chat_id: int | str, session_id: str) -> None:
-        """Persist a session id without a persona version.
+        """Persist a session id without a persona version or branch.
 
         Agents that track persona versions should prefer
         ``set_with_version()``.  Sessions saved via this path are exempt
@@ -97,6 +120,7 @@ class SessionStore:
         self._data[str(chat_id)] = {
             "session_id": session_id,
             "persona_version": None,
+            "branch": None,
         }
         self._save()
 
@@ -105,11 +129,20 @@ class SessionStore:
         chat_id: int | str,
         session_id: str,
         persona_version: int | None,
+        branch: str | None = None,
     ) -> None:
-        """Persist a session id paired with the current persona version."""
+        """Persist a session id paired with the current persona version and branch.
+
+        ``branch`` is the git branch the session was started on, or
+        None if the session lives on the default cwd.  The executor
+        uses it to restore the original cwd on resume so Claude CLI
+        can find the existing transcript under
+        ``~/.claude/projects/<cwd-encoded>/<sid>.jsonl``.
+        """
         self._data[str(chat_id)] = {
             "session_id": session_id,
             "persona_version": persona_version,
+            "branch": branch,
         }
         self._save()
 
