@@ -132,6 +132,34 @@ async def run_telegram_bot(
         log.info("Restart requested by user %s — sending SIGTERM", update.effective_user.id)
         os.kill(os.getpid(), signal.SIGTERM)
 
+    async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Cancel any in-flight work for this chat.
+
+        Targets only the calling chat — other chats keep running.  This
+        is the kill-switch for "the agent went off the rails on the
+        thing it's doing right now"; use ``/restart`` for a full reboot
+        or ``/new`` to start a fresh conversation without interrupting
+        current work.
+        """
+        if not update.effective_user or not is_allowed(update.effective_user.id):
+            return
+        chat_id = update.effective_chat.id
+        cancelled = executor.cancel_chat(chat_id)
+        if cancelled:
+            log.info(
+                "Cancelled %d in-flight task(s) for chat %s via /stop",
+                cancelled, chat_id,
+            )
+            plural = "tasks" if cancelled != 1 else "task"
+            await update.message.reply_text(
+                f"⏹ Stopped {cancelled} in-flight {plural}.  Next message "
+                f"starts fresh execution.",
+            )
+        else:
+            await update.message.reply_text(
+                "ℹ️ Nothing in flight to stop for this chat.",
+            )
+
     async def cmd_cleanup(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.effective_user or not is_allowed(update.effective_user.id):
             return
@@ -337,6 +365,7 @@ async def run_telegram_bot(
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("new", cmd_new))
+    app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("restart", cmd_restart))
     app.add_handler(CommandHandler("cleanup", cmd_cleanup))
     app.add_handler(CommandHandler("model", cmd_model))

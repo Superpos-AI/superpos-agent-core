@@ -39,6 +39,12 @@ class Executor(abc.ABC):
         self._in_flight_superpos_tasks: set[str] = set()
         self._max_parallel = max_parallel
         self._active_count = 0
+        # Per-chat asyncio.Task tracking for /stop.  Subclasses call
+        # ``_track_chat_task`` once they have the running task in hand;
+        # ``cancel_chat`` walks this map.  Keyed by ``str(chat_id)`` so
+        # int/str keys interop with Telegram's int chat_ids and Superpos's
+        # string ones.
+        self._chat_tasks: dict[str, set[asyncio.Task]] = {}
 
     # ── Abstract: must be implemented per agent ────────────────────────
 
@@ -121,3 +127,48 @@ class Executor(abc.ABC):
 
     def has_superpos_task(self, task_id: str) -> bool:
         return task_id in self._in_flight_superpos_tasks
+
+    # ── /stop support ─────────────────────────────────────────────────
+
+    def _track_chat_task(
+        self, chat_id: int | str, task: asyncio.Task,
+    ) -> None:
+        """Register an in-flight asyncio.Task so ``cancel_chat`` can find it.
+
+        Subclasses should call this from ``_execute`` (or wherever the
+        per-request worker is spawned) right after they create the task,
+        then trust the auto-removal on done.  Calling more than once for
+        the same chat is fine — a chat with parallel work (e.g. branch-
+        scoped tasks) gets a set of tasks tracked.
+        """
+        key = str(chat_id)
+        bucket = self._chat_tasks.setdefault(key, set())
+        bucket.add(task)
+        task.add_done_callback(lambda _t: self._untrack_chat_task(key, _t))
+
+    def _untrack_chat_task(self, chat_key: str, task: asyncio.Task) -> None:
+        bucket = self._chat_tasks.get(chat_key)
+        if not bucket:
+            return
+        bucket.discard(task)
+        if not bucket:
+            self._chat_tasks.pop(chat_key, None)
+
+    def cancel_chat(self, chat_id: int | str) -> int:
+        """Cancel every in-flight task tracked for ``chat_id``.
+
+        Returns the number of tasks signalled (which may be 0 if nothing
+        was running).  Subclasses that need richer behaviour (kill a
+        subprocess, send a Telegram "stopped" message, mark the Superpos
+        task as failed) should override and call ``super().cancel_chat``
+        to keep the asyncio cancellation path uniform.
+        """
+        bucket = self._chat_tasks.get(str(chat_id))
+        if not bucket:
+            return 0
+        cancelled = 0
+        for task in list(bucket):
+            if not task.done():
+                task.cancel()
+                cancelled += 1
+        return cancelled
