@@ -157,6 +157,13 @@ async def run_telegram_bot(
         """
         if not update.effective_user or not is_allowed(update.effective_user.id):
             return
+        # CommandHandler reprocesses edited commands, and on edit updates
+        # update.message is None while update.effective_message is the
+        # edited message.  Use effective_message so editing a /stop
+        # message doesn't crash the handler with AttributeError.
+        reply_target = update.effective_message
+        if reply_target is None:
+            return
         chat_id = update.effective_chat.id
         cancelled = executor.cancel_chat(chat_id)
         if cancelled:
@@ -165,7 +172,7 @@ async def run_telegram_bot(
                 cancelled, chat_id,
             )
             plural = "tasks" if cancelled != 1 else "task"
-            await update.message.reply_text(
+            await reply_target.reply_text(
                 f"⏹ Stopped {cancelled} in-flight {plural}.  Next message "
                 f"starts fresh execution.",
             )
@@ -182,7 +189,7 @@ async def run_telegram_bot(
                 "and you need to interrupt regardless, /restart reboots "
                 "the whole agent (heavier — affects every chat)."
             )
-        await update.message.reply_text(message)
+        await reply_target.reply_text(message)
 
     async def cmd_cleanup(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.effective_user or not is_allowed(update.effective_user.id):
