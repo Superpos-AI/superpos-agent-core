@@ -140,6 +140,17 @@ async def run_telegram_bot(
         thing it's doing right now"; use ``/restart`` for a full reboot
         or ``/new`` to start a fresh conversation without interrupting
         current work.
+
+        Three response paths:
+
+        1. ``cancel_chat`` returned > 0 → success.
+        2. ``cancel_chat`` returned 0 but the executor is busy → the
+           concrete executor hasn't wired ``_track_chat_task``, so we
+           can see work is running but can't target it.  Be explicit
+           about that rather than misleading the user with "nothing in
+           flight" — point them at ``/restart`` for a hard stop.
+        3. ``cancel_chat`` returned 0 and the executor is idle →
+           genuinely nothing to stop.
         """
         if not update.effective_user or not is_allowed(update.effective_user.id):
             return
@@ -154,6 +165,18 @@ async def run_telegram_bot(
             await update.message.reply_text(
                 f"⏹ Stopped {cancelled} in-flight {plural}.  Next message "
                 f"starts fresh execution.",
+            )
+        elif executor.is_busy:
+            log.warning(
+                "/stop called for chat %s while executor is busy but no "
+                "tasks are tracked — concrete executor hasn't wired "
+                "_track_chat_task; pointing user at /restart.",
+                chat_id,
+            )
+            await update.message.reply_text(
+                "⚠️ Agent is busy, but this executor doesn't support "
+                "per-chat cancellation yet.  Use /restart for a full "
+                "reboot (interrupts every chat).",
             )
         else:
             await update.message.reply_text(
