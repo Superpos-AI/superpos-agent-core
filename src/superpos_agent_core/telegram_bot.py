@@ -141,16 +141,19 @@ async def run_telegram_bot(
         or ``/new`` to start a fresh conversation without interrupting
         current work.
 
-        Three response paths:
+        Two response paths:
 
         1. ``cancel_chat`` returned > 0 → success.
-        2. ``cancel_chat`` returned 0 but the executor is busy → the
-           concrete executor hasn't wired ``_track_chat_task``, so we
-           can see work is running but can't target it.  Be explicit
-           about that rather than misleading the user with "nothing in
-           flight" — point them at ``/restart`` for a hard stop.
-        3. ``cancel_chat`` returned 0 and the executor is idle →
-           genuinely nothing to stop.
+        2. ``cancel_chat`` returned 0 → nothing was cancelled for this
+           chat.  This could mean genuinely no work, OR untracked work
+           in this chat (executor hasn't wired ``_track_chat_task``).
+           We can't tell from here, so don't claim either way — just
+           offer ``/restart`` as the always-works escape hatch *when
+           there's any global busyness*, so the hint is contextually
+           relevant.  Crucially, we never tell chat B that *its* work
+           is uncancellable when in reality chat A is the busy one —
+           ``is_busy`` is global, so claiming "this chat's executor
+           doesn't support cancellation" based on it is misleading.
         """
         if not update.effective_user or not is_allowed(update.effective_user.id):
             return
@@ -166,22 +169,20 @@ async def run_telegram_bot(
                 f"⏹ Stopped {cancelled} in-flight {plural}.  Next message "
                 f"starts fresh execution.",
             )
-        elif executor.is_busy:
-            log.warning(
-                "/stop called for chat %s while executor is busy but no "
-                "tasks are tracked — concrete executor hasn't wired "
-                "_track_chat_task; pointing user at /restart.",
-                chat_id,
+            return
+
+        message = "ℹ️ Nothing to stop for this chat."
+        if executor.is_busy:
+            # Something is running somewhere — could be this chat with
+            # untracked work, could be another chat entirely.  Offer
+            # /restart as a contextually-relevant hard-stop without
+            # making any claim about which chat the busy work belongs to.
+            message += (
+                "\n\nIf you believe this chat is the one running work "
+                "and you need to interrupt regardless, /restart reboots "
+                "the whole agent (heavier — affects every chat)."
             )
-            await update.message.reply_text(
-                "⚠️ Agent is busy, but this executor doesn't support "
-                "per-chat cancellation yet.  Use /restart for a full "
-                "reboot (interrupts every chat).",
-            )
-        else:
-            await update.message.reply_text(
-                "ℹ️ Nothing in flight to stop for this chat.",
-            )
+        await update.message.reply_text(message)
 
     async def cmd_cleanup(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.effective_user or not is_allowed(update.effective_user.id):
