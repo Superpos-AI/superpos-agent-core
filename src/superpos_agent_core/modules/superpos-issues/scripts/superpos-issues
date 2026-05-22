@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+"""CLI wrapper around superpos_agent_core.SuperposClient issue methods.
+
+Subcommands mirror the client API:
+  list, show, create, update, transition, close,
+  link-task, link-channel, request-approval,
+  add-dependency, remove-dependency,
+  types
+
+Prints JSON to stdout, errors to stderr.  Designed for the LLM to call
+via Bash and pipe through ``jq`` for follow-up queries.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import sys
+from typing import Any
+
+# ``superpos_agent_core`` is pip-installed via the container's requirements.txt.
+from superpos_agent_core import BaseConfig, SuperposClient
+
+
+def _config_from_env() -> BaseConfig:
+    base_url = os.environ.get("SUPERPOS_BASE_URL", "").rstrip("/")
+    hive_id = os.environ.get("SUPERPOS_HIVE_ID", "")
+    agent_id = os.environ.get("SUPERPOS_AGENT_ID", "")
+    token = os.environ.get("SUPERPOS_API_TOKEN", "")
+    refresh = os.environ.get("SUPERPOS_REFRESH_TOKEN", "")
+
+    if not (base_url and hive_id and token):
+        print(
+            "Error: SUPERPOS_BASE_URL, SUPERPOS_HIVE_ID, and "
+            "SUPERPOS_API_TOKEN must be set in the environment.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    return BaseConfig(
+        superpos_base_url=base_url,
+        superpos_hive_id=hive_id,
+        superpos_agent_id=agent_id,
+        superpos_api_token=token,
+        superpos_refresh_token=refresh,
+    )
+
+
+def _print(value: Any) -> None:
+    """Print a JSON-serialisable value, indented for human reading."""
+    print(json.dumps(value, indent=2, default=str))
+
+
+def _parse_json_arg(label: str, raw: str | None) -> dict[str, Any] | None:
+    """Parse a CLI flag value that should be a JSON object, with a clear error."""
+    if raw is None:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as e:
+        print(f"Error: --{label} must be valid JSON ({e})", file=sys.stderr)
+        sys.exit(2)
+    if not isinstance(parsed, dict):
+        print(f"Error: --{label} must be a JSON object, got {type(parsed).__name__}",
+              file=sys.stderr)
+        sys.exit(2)
+    return parsed
+
+
+async def _run(args: argparse.Namespace) -> int:
+    config = _config_from_env()
+    client = SuperposClient(config)
+    try:
+        if args.cmd == "list":
+            _print(await client.list_issues(
+                state=args.state,
+                issue_type_id=args.issue_type_id,
+                assignee_id=args.assignee_id,
+                q=args.q,
+                per_page=args.per_page,
+            ))
+
+        elif args.cmd == "show":
+            _print(await client.get_issue(args.issue_id))
+
+        elif args.cmd == "create":
+            _print(await client.create_issue(
+                title=args.title,
+                issue_type_id=args.issue_type_id,
+                description=args.description,
+                assignee_type=args.assignee_type,
+                assignee_id=args.assignee_id,
+                metadata=_parse_json_arg("metadata", args.metadata),
+                channel_id=args.channel_id,
+                thread_id=args.thread_id,
+            ))
+
+        elif args.cmd == "update":
+            try:
+                _print(await client.update_issue(
+                    args.issue_id,
+                    title=args.title,
+                    description=args.description,
+                    assignee_type=args.assignee_type,
+                    assignee_id=args.assignee_id,
+                    metadata=_parse_json_arg("metadata", args.metadata),
+                    issue_type_id=args.issue_type_id,
+                    channel_id=args.channel_id,
+                    thread_id=args.thread_id,
+                ))
+            except ValueError as e:
+                print(f"Error: {e}", file=sys.stderr)
+                return 2
+
+        elif args.cmd == "transition":
+            _print(await client.transition_issue(
+                args.issue_id, to=args.to, reason=args.reason,
+            ))
+
+        elif args.cmd == "close":
+            _print(await client.close_issue(args.issue_id, reason=args.reason))
+
+        elif args.cmd == "link-task":
+            _print(await client.link_task_to_issue(
+                args.issue_id, task_id=args.task_id,
+            ))
+
+        elif args.cmd == "link-channel":
+            _print(await client.link_channel_to_issue(
+                args.issue_id, channel_id=args.channel_id,
+            ))
+
+        elif args.cmd == "request-approval":
+            _print(await client.request_issue_approval(
+                args.issue_id,
+                summary=args.summary,
+                recommended_action=args.recommended_action,
+                risks=args.risks,
+                linked_issue_ids=args.linked_issue_id or None,
+            ))
+
+        elif args.cmd == "add-dependency":
+            _print(await client.create_issue_dependency(
+                args.issue_id,
+                depends_on_issue_id=args.depends_on,
+                kind=args.kind,
+            ))
+
+        elif args.cmd == "remove-dependency":
+            await client.delete_issue_dependency(args.issue_id, args.dependency_id)
+            _print({"ok": True})
+
+        elif args.cmd == "types":
+            _print(await client.list_issue_types())
+
+        else:
+            print(f"Unknown subcommand: {args.cmd}", file=sys.stderr)
+            return 2
+
+        return 0
+    finally:
+        await client.close()
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="superpos-issues",
+        description=(
+            "Manage Superpos issues: list, show, create, transition, close, "
+            "link to tasks/channels, request approval, manage dependencies."
+        ),
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    # list
+    p_list = sub.add_parser("list", help="Paginated list with filters")
+    p_list.add_argument("--state", help="Filter by state (open, in_progress, awaiting_review, done, blocked, cancelled)")
+    p_list.add_argument("--issue-type-id", help="Restrict to a single issue type")
+    p_list.add_argument("--assignee-id", help="Restrict to issues assigned to this ID")
+    p_list.add_argument("--q", help="Case-insensitive title substring")
+    p_list.add_argument("--per-page", type=int, help="Page size (server caps at 100)")
+
+    # show
+    p_show = sub.add_parser("show", help="Fetch a single issue with relations")
+    p_show.add_argument("issue_id")
+
+    # create
+    p_create = sub.add_parser("create", help="File a new issue")
+    p_create.add_argument("--title", required=True)
+    p_create.add_argument("--issue-type-id", required=True, help="ID of a row from `types`")
+    p_create.add_argument("--description")
+    p_create.add_argument("--assignee-type", help="Polymorphic class, e.g. App\\\\Models\\\\Agent")
+    p_create.add_argument("--assignee-id")
+    p_create.add_argument("--metadata", help="JSON object")
+    p_create.add_argument("--channel-id")
+    p_create.add_argument("--thread-id")
+
+    # update
+    p_update = sub.add_parser("update", help="Partial update of an existing issue")
+    p_update.add_argument("issue_id")
+    p_update.add_argument("--title")
+    p_update.add_argument("--description")
+    p_update.add_argument("--assignee-type")
+    p_update.add_argument("--assignee-id")
+    p_update.add_argument("--metadata", help="JSON object")
+    p_update.add_argument("--issue-type-id")
+    p_update.add_argument("--channel-id")
+    p_update.add_argument("--thread-id")
+
+    # transition
+    p_trans = sub.add_parser("transition", help="Drive the issue state machine")
+    p_trans.add_argument("issue_id")
+    p_trans.add_argument("--to", required=True, help="Target state (see `show` -> allowed_transitions)")
+    p_trans.add_argument("--reason")
+
+    # close
+    p_close = sub.add_parser("close", help="Policy-aware close")
+    p_close.add_argument("issue_id")
+    p_close.add_argument("--reason")
+
+    # link-task
+    p_lt = sub.add_parser("link-task", help="Attach an existing task to this issue")
+    p_lt.add_argument("issue_id")
+    p_lt.add_argument("--task-id", required=True)
+
+    # link-channel
+    p_lc = sub.add_parser("link-channel", help="Bind a channel to this issue")
+    p_lc.add_argument("issue_id")
+    p_lc.add_argument("--channel-id", required=True)
+
+    # request-approval
+    p_ra = sub.add_parser("request-approval", help="Escalate for human approval")
+    p_ra.add_argument("issue_id")
+    p_ra.add_argument("--summary", required=True)
+    p_ra.add_argument("--recommended-action")
+    p_ra.add_argument("--risks")
+    p_ra.add_argument(
+        "--linked-issue-id", action="append",
+        help="Linked issue ID (repeatable)",
+    )
+
+    # add-dependency
+    p_ad = sub.add_parser("add-dependency", help="Declare a dependency on another issue")
+    p_ad.add_argument("issue_id")
+    p_ad.add_argument("--depends-on", required=True, help="Issue ID this one depends on")
+    p_ad.add_argument("--kind", required=True, help="Dependency kind (e.g. blocks, related_to)")
+
+    # remove-dependency
+    p_rd = sub.add_parser("remove-dependency", help="Drop a dependency row")
+    p_rd.add_argument("issue_id")
+    p_rd.add_argument("dependency_id")
+
+    # types
+    sub.add_parser("types", help="List the hive's issue-type catalogue")
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
+    return asyncio.run(_run(args))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

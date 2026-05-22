@@ -573,6 +573,262 @@ class SuperposClient:
         data = resp.json()
         return data.get("data", data) if isinstance(data, dict) else data
 
+    # ── Issues ────────────────────────────────────────────────────────
+
+    async def list_issues(
+        self,
+        *,
+        state: str | None = None,
+        issue_type_id: str | None = None,
+        assignee_id: str | None = None,
+        q: str | None = None,
+        per_page: int | None = None,
+    ) -> dict[str, Any]:
+        """``GET /issues`` — paginated list with optional filters.
+
+        Returns the full envelope (``{"data": [...], "meta": {...}}``) because
+        callers need ``meta.has_more`` / ``meta.current_page`` to paginate.
+        """
+        hive = self._config.superpos_hive_id
+        params: dict[str, Any] = {}
+        if state is not None:
+            params["state"] = state
+        if issue_type_id is not None:
+            params["issue_type_id"] = issue_type_id
+        if assignee_id is not None:
+            params["assignee_id"] = assignee_id
+        if q is not None:
+            params["q"] = q
+        if per_page is not None:
+            params["per_page"] = per_page
+        resp = await self._request(
+            "GET", f"/api/v1/hives/{hive}/issues", params=params or None,
+        )
+        return resp.json()
+
+    async def get_issue(self, issue_id: str) -> dict[str, Any]:
+        """``GET /issues/{issue}`` — full issue with relations (type, tasks,
+        dependencies, channel, thread, pending approvals)."""
+        hive = self._config.superpos_hive_id
+        resp = await self._request(
+            "GET", f"/api/v1/hives/{hive}/issues/{issue_id}",
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def create_issue(
+        self,
+        *,
+        title: str,
+        issue_type_id: str,
+        description: str | None = None,
+        assignee_type: str | None = None,
+        assignee_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        channel_id: str | None = None,
+        thread_id: str | None = None,
+    ) -> dict[str, Any]:
+        """``POST /issues`` — open a new issue in this hive."""
+        hive = self._config.superpos_hive_id
+        body: dict[str, Any] = {"title": title, "issue_type_id": issue_type_id}
+        if description is not None:
+            body["description"] = description
+        if assignee_type is not None:
+            body["assignee_type"] = assignee_type
+        if assignee_id is not None:
+            body["assignee_id"] = assignee_id
+        if metadata is not None:
+            body["metadata"] = metadata
+        if channel_id is not None:
+            body["channel_id"] = channel_id
+        if thread_id is not None:
+            body["thread_id"] = thread_id
+        resp = await self._request(
+            "POST", f"/api/v1/hives/{hive}/issues", json=body,
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def update_issue(
+        self,
+        issue_id: str,
+        *,
+        title: str | None = None,
+        description: str | None = None,
+        assignee_type: str | None = None,
+        assignee_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        issue_type_id: str | None = None,
+        channel_id: str | None = None,
+        thread_id: str | None = None,
+    ) -> dict[str, Any]:
+        """``PATCH /issues/{issue}`` — partial update; omitted fields stay put."""
+        hive = self._config.superpos_hive_id
+        body: dict[str, Any] = {}
+        for field, value in (
+            ("title", title),
+            ("description", description),
+            ("assignee_type", assignee_type),
+            ("assignee_id", assignee_id),
+            ("metadata", metadata),
+            ("issue_type_id", issue_type_id),
+            ("channel_id", channel_id),
+            ("thread_id", thread_id),
+        ):
+            if value is not None:
+                body[field] = value
+        if not body:
+            raise ValueError("update_issue requires at least one field to change")
+        resp = await self._request(
+            "PATCH", f"/api/v1/hives/{hive}/issues/{issue_id}", json=body,
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def transition_issue(
+        self,
+        issue_id: str,
+        *,
+        to: str,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        """``POST /issues/{issue}/transition`` — drive the issue state machine.
+
+        ``to`` is one of the platform's ``Issue::STATES`` values
+        (e.g. ``in_progress``, ``awaiting_review``, ``done``, ``blocked``,
+        ``cancelled``).  Server returns 422 if the transition is illegal
+        from the current state.
+        """
+        hive = self._config.superpos_hive_id
+        body: dict[str, Any] = {"to": to}
+        if reason is not None:
+            body["reason"] = reason
+        resp = await self._request(
+            "POST", f"/api/v1/hives/{hive}/issues/{issue_id}/transition",
+            json=body,
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def close_issue(
+        self, issue_id: str, *, reason: str | None = None,
+    ) -> dict[str, Any]:
+        """``POST /issues/{issue}/close`` — policy-aware close.
+
+        The server consults the issue type's ``closure_policy``: a direct
+        close to ``done`` happens when allowed; otherwise the call either
+        moves the issue to ``awaiting_review`` or creates a closure
+        ``ApprovalRequest`` (issue goes to ``blocked``).  Callers should
+        inspect ``state`` on the returned issue to know which path ran.
+        """
+        hive = self._config.superpos_hive_id
+        body: dict[str, Any] = {}
+        if reason is not None:
+            body["reason"] = reason
+        resp = await self._request(
+            "POST", f"/api/v1/hives/{hive}/issues/{issue_id}/close",
+            json=body or None,
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def link_task_to_issue(
+        self, issue_id: str, *, task_id: str,
+    ) -> dict[str, Any]:
+        """``POST /issues/{issue}/link-task`` — attach an existing task to this issue."""
+        hive = self._config.superpos_hive_id
+        resp = await self._request(
+            "POST", f"/api/v1/hives/{hive}/issues/{issue_id}/link-task",
+            json={"task_id": task_id},
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def link_channel_to_issue(
+        self, issue_id: str, *, channel_id: str,
+    ) -> dict[str, Any]:
+        """``POST /issues/{issue}/link-channel`` — bind a channel to this issue."""
+        hive = self._config.superpos_hive_id
+        resp = await self._request(
+            "POST", f"/api/v1/hives/{hive}/issues/{issue_id}/link-channel",
+            json={"channel_id": channel_id},
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def request_issue_approval(
+        self,
+        issue_id: str,
+        *,
+        summary: str,
+        recommended_action: str | None = None,
+        risks: str | None = None,
+        linked_issue_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """``POST /issues/{issue}/request-approval`` — escalate for human review.
+
+        Only valid when the issue is ``in_progress`` or ``blocked``.  The
+        server creates a pending ``ApprovalRequest`` and (from
+        ``in_progress``) drives the issue to ``blocked``.  Concurrent
+        duplicate calls return 422 ``invalid_state``.
+        """
+        hive = self._config.superpos_hive_id
+        body: dict[str, Any] = {"summary": summary}
+        if recommended_action is not None:
+            body["recommended_action"] = recommended_action
+        if risks is not None:
+            body["risks"] = risks
+        if linked_issue_ids is not None:
+            body["linked_issue_ids"] = linked_issue_ids
+        resp = await self._request(
+            "POST", f"/api/v1/hives/{hive}/issues/{issue_id}/request-approval",
+            json=body,
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def create_issue_dependency(
+        self,
+        issue_id: str,
+        *,
+        depends_on_issue_id: str,
+        kind: str,
+    ) -> dict[str, Any]:
+        """``POST /issues/{issue}/dependencies`` — declare a blocking
+        relationship to another issue (``kind`` per platform enum, e.g.
+        ``blocks``, ``related_to``)."""
+        hive = self._config.superpos_hive_id
+        resp = await self._request(
+            "POST", f"/api/v1/hives/{hive}/issues/{issue_id}/dependencies",
+            json={
+                "depends_on_issue_id": depends_on_issue_id,
+                "kind": kind,
+            },
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def delete_issue_dependency(
+        self, issue_id: str, dependency_id: str,
+    ) -> None:
+        """``DELETE /issues/{issue}/dependencies/{dependency}``."""
+        hive = self._config.superpos_hive_id
+        await self._request(
+            "DELETE",
+            f"/api/v1/hives/{hive}/issues/{issue_id}/dependencies/{dependency_id}",
+        )
+
+    # ── Issue types ───────────────────────────────────────────────────
+
+    async def list_issue_types(self) -> list[dict[str, Any]]:
+        """``GET /issue-types`` — issue-type catalogue for this hive."""
+        hive = self._config.superpos_hive_id
+        resp = await self._request(
+            "GET", f"/api/v1/hives/{hive}/issue-types",
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
     # ── Sub-agents (read) ─────────────────────────────────────────────
 
     async def list_sub_agents(self) -> list[dict[str, Any]]:

@@ -3,8 +3,14 @@
 from .config import BaseConfig
 from .executor import Executor, ExecutionRequest
 from .main import ExecutorFactory, run_agent, setup_logging
-from .module_loader import collect_mcp_servers, discover_modules, generate_modules_doc
+from .module_loader import (
+    bundled_modules_dir,
+    collect_mcp_servers,
+    discover_modules,
+    generate_modules_doc,
+)
 from .module_setup import run_setup as run_module_setup
+from .module_setup import symlink_module_scripts
 from .recent_tasks import RecentTasksLog, TaskSummary
 from .redactor import redact
 from .runtime_config import RuntimeConfig
@@ -37,6 +43,7 @@ __all__ = [
     "TelegramGateway",
     "TelegramStreamer",
     "build_telegram_app",
+    "bundled_modules_dir",
     "collect_mcp_servers",
     "discover_modules",
     "ensure_worktree",
@@ -51,5 +58,6 @@ __all__ = [
     "run_telegram_bot",
     "setup_logging",
     "slot_key",
+    "symlink_module_scripts",
     "worktree_path",
 ]
