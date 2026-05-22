@@ -24,6 +24,10 @@ log = logging.getLogger(__name__)
 MAX_MSG_LEN = 4000
 MIN_EDIT_INTERVAL = 5.0  # seconds between edits (per-streamer)
 
+
+def _is_not_modified(err: BadRequest) -> bool:
+    return "message is not modified" in str(err).lower()
+
 # -- Human-readable tool descriptions ----------------------------------------
 
 _TOOL_LABELS: dict[str, str] = {
@@ -329,8 +333,13 @@ class TelegramStreamer:
                 await self._gateway.edit_message_text(
                     self._chat_id, self._status_msg_id, status_text,
                 )
-        except BadRequest:
-            pass
+        except BadRequest as e:
+            # "not modified" is harmless. Anything else (message deleted,
+            # too old, identifier invalid) means we can never edit this
+            # message again — drop the id so the next tick sends a fresh
+            # status message instead of silently failing forever.
+            if not _is_not_modified(e):
+                self._status_msg_id = None
 
     async def error(self, error_text: str) -> None:
         """Send an error message (fire-and-forget — must never crash or hang)."""
@@ -387,17 +396,25 @@ class TelegramStreamer:
             )
             self._last_edit = time.monotonic()
         except BadRequest as e:
-            if "message is not modified" not in str(e).lower():
-                log.warning("Markdown parse failed, falling back to plain text: %s", e)
-                try:
-                    await self._gateway.edit_message_text(
-                        self._chat_id,
-                        self._current_msg_id,
-                        self._buffer[:4096],
-                    )
-                    self._last_edit = time.monotonic()
-                except Exception:
-                    pass
+            if _is_not_modified(e):
+                return
+            log.warning("Markdown parse failed, falling back to plain text: %s", e)
+            try:
+                await self._gateway.edit_message_text(
+                    self._chat_id,
+                    self._current_msg_id,
+                    self._buffer[:4096],
+                )
+                self._last_edit = time.monotonic()
+            except BadRequest:
+                # Plain-text retry also rejected — the message is gone,
+                # too old to edit, or otherwise unreachable.  Drop the id
+                # so the next render sends a new message; without this we
+                # silently loop forever on the same dead id and the user
+                # stops seeing any further streaming output.
+                self._current_msg_id = None
+            except Exception:
+                pass
 
     async def _finalize_current(self) -> None:
         finalize_text = self._buffer[:MAX_MSG_LEN]
