@@ -1,8 +1,15 @@
-"""One-time module setup: install deps and update the agent's system-prompt doc.
+"""One-time module setup: install deps, symlink scripts, update system prompt.
 
 Run at container startup from each agent's entrypoint.sh.  The agent passes
-its modules directory and the path to its system-prompt file
+its workspace modules directory and the path to its system-prompt file
 (``AGENTS.md`` for Codex/Gemini, ``CLAUDE.md`` for Claude, etc.).
+
+Bundled modules (shipped inside the ``superpos_agent_core`` package under
+``modules/``) are always merged in alongside the workspace modules — see
+:func:`superpos_agent_core.module_loader.discover_modules`.  Setup scripts
+and ``requirements.txt`` are only run for workspace modules, since the
+package directory is typically read-only on a pip-installed core; bundled
+modules should declare their Python deps in core's own ``pyproject.toml``.
 """
 
 from __future__ import annotations
@@ -10,11 +17,16 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import stat
 import subprocess
 import sys
 from pathlib import Path
 
-from .module_loader import discover_modules, generate_modules_doc
+from .module_loader import (
+    bundled_modules_dir,
+    discover_modules,
+    generate_modules_doc,
+)
 
 log = logging.getLogger(__name__)
 
@@ -23,7 +35,12 @@ END_MARKER = "<!-- MODULES:END -->"
 
 
 def run_setup_scripts(modules_dir: str) -> None:
-    """Run each module's setup.sh if present (for cloning vendored repos, etc.)."""
+    """Run each workspace module's setup.sh if present.
+
+    Skips bundled modules — the package directory is not a writable
+    install target.  If a bundled module needs build-time setup, ship it
+    pre-built.
+    """
     for entry in sorted(Path(modules_dir).iterdir()):
         setup = entry / "setup.sh"
         if setup.exists():
@@ -33,7 +50,7 @@ def run_setup_scripts(modules_dir: str) -> None:
 
 
 def install_requirements(modules_dir: str) -> None:
-    """Install requirements.txt for each module that has one."""
+    """Install requirements.txt for each workspace module that has one."""
     for entry in sorted(Path(modules_dir).iterdir()):
         req = entry / "requirements.txt"
         if req.exists():
@@ -76,17 +93,83 @@ def update_agents_md(doc: str, agents_md_path: str) -> None:
     log.info("Updated %s with module documentation", agents_md_path)
 
 
-def run_setup(modules_dir: str, agents_md_path: str) -> None:
-    """Discover modules, run setup scripts, install deps, update system prompt."""
-    if not os.path.isdir(modules_dir):
-        log.info("No modules directory at %s — skipping module setup", modules_dir)
-        return
+def symlink_module_scripts(modules_dir: str | None, bin_dir: str) -> None:
+    """Symlink every module's executable script into ``bin_dir`` (created if missing).
 
-    modules = discover_modules(modules_dir)
+    Walks bundled modules first, then the workspace ``modules_dir`` — so a
+    workspace script with the same basename as a bundled one wins.  The
+    target file is chmod +x'd so the symlink is callable without further
+    setup.
+    """
+    bin_path = Path(bin_dir)
+    bin_path.mkdir(parents=True, exist_ok=True)
+
+    roots: list[Path] = []
+    bundled = Path(bundled_modules_dir())
+    if bundled.is_dir():
+        roots.append(bundled)
+    if modules_dir:
+        ws = Path(modules_dir)
+        if ws.is_dir():
+            roots.append(ws)
+
+    for root in roots:
+        for module_entry in sorted(root.iterdir()):
+            scripts_dir = module_entry / "scripts"
+            if not scripts_dir.is_dir():
+                continue
+            for script in sorted(scripts_dir.iterdir()):
+                if not script.is_file():
+                    continue
+                try:
+                    script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+                except PermissionError:
+                    # Bundled scripts on a read-only install — they're
+                    # already +x at build time, so a chmod failure here
+                    # is non-fatal.
+                    log.debug("Could not chmod %s (read-only?); continuing", script)
+                # symlink_to stores the literal target string, resolved
+                # *relative to the symlink location* — not the cwd.  If
+                # the caller passed a relative ``modules_dir`` (e.g.
+                # ``.codex/modules``), the script Path is relative too,
+                # and the resulting symlink would point at a sibling of
+                # ``bin_dir`` that doesn't exist.  Resolve to an absolute
+                # path so the link is correct regardless of caller cwd.
+                resolved_script = script.resolve()
+                target = bin_path / script.name
+                if target.is_symlink() or target.exists():
+                    target.unlink()
+                target.symlink_to(resolved_script)
+                log.debug("Linked %s -> %s", target, resolved_script)
+
+
+def run_setup(
+    modules_dir: str,
+    agents_md_path: str,
+    *,
+    bin_dir: str | None = None,
+) -> None:
+    """Discover modules, run setup scripts, install deps, update system prompt.
+
+    ``bin_dir`` (optional) — if provided, every discovered module's
+    ``scripts/`` files are symlinked here.  Set to a directory that's on
+    ``$PATH`` so the agent can invoke scripts by name.
+    """
+    if not os.path.isdir(modules_dir):
+        log.info(
+            "No workspace modules directory at %s — proceeding with bundled modules only",
+            modules_dir,
+        )
+
+    modules = discover_modules(modules_dir if os.path.isdir(modules_dir) else None)
     log.info("Discovered %d module(s): %s", len(modules), [m.name for m in modules])
 
-    run_setup_scripts(modules_dir)
-    install_requirements(modules_dir)
+    if os.path.isdir(modules_dir):
+        run_setup_scripts(modules_dir)
+        install_requirements(modules_dir)
+
+    if bin_dir:
+        symlink_module_scripts(modules_dir, bin_dir)
 
     doc = generate_modules_doc(modules)
     update_agents_md(doc, agents_md_path)
@@ -95,7 +178,7 @@ def run_setup(modules_dir: str, agents_md_path: str) -> None:
 def main() -> None:
     """CLI entry point invoked from entrypoint.sh."""
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-    parser = argparse.ArgumentParser(description="Slim-agent module setup")
+    parser = argparse.ArgumentParser(description="Superpos agent module setup")
     parser.add_argument(
         "--modules-dir", required=True,
         help="Path to the agent's modules directory (e.g. /workspace/.gemini/modules)",
@@ -104,8 +187,15 @@ def main() -> None:
         "--agents-md", required=True,
         help="Path to the agent's system-prompt file (e.g. /workspace/AGENTS.md)",
     )
+    parser.add_argument(
+        "--bin-dir",
+        help=(
+            "Optional directory to symlink every module's scripts into. "
+            "Add this directory to PATH so the agent can invoke them by name."
+        ),
+    )
     args = parser.parse_args()
-    run_setup(args.modules_dir, args.agents_md)
+    run_setup(args.modules_dir, args.agents_md, bin_dir=args.bin_dir)
 
 
 if __name__ == "__main__":
