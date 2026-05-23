@@ -79,6 +79,7 @@ async def _run(args: argparse.Namespace) -> int:
                 issue_type_id=args.issue_type_id,
                 assignee_id=args.assignee_id,
                 q=args.q,
+                page=args.page,
                 per_page=args.per_page,
             ))
 
@@ -180,6 +181,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_list.add_argument("--issue-type-id", help="Restrict to a single issue type")
     p_list.add_argument("--assignee-id", help="Restrict to issues assigned to this ID")
     p_list.add_argument("--q", help="Case-insensitive title substring")
+    p_list.add_argument("--page", type=int, help="1-based page index (see meta.current_page / has_more)")
     p_list.add_argument("--per-page", type=int, help="Page size (server caps at 100)")
 
     # show

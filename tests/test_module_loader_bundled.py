@@ -178,3 +178,38 @@ def test_symlink_module_scripts_replaces_stale_link(tmp_path: Path):
 
     assert stale.is_symlink()
     assert os.readlink(stale) != "/nonexistent/path"
+
+
+def test_symlink_module_scripts_handles_relative_modules_dir(tmp_path: Path, monkeypatch):
+    """Codex P2: when ``modules_dir`` is passed as a relative path (the
+    natural CLI invocation, e.g. ``--modules-dir .codex/modules``), the
+    individual script Paths are also relative.  ``Path.symlink_to``
+    stores the target literally and resolves it relative to the symlink
+    *location* (``bin_dir``), so a naive relative target produces a
+    broken link.  The helper must resolve to absolute before linking.
+    """
+    # Build the layout under a workdir, then chdir there and pass a
+    # relative path — mirrors how `python3 -m superpos_agent_core.module_setup`
+    # is typically invoked from a project root.
+    workdir = tmp_path
+    rel_modules = "myagent/modules"
+    workspace = workdir / rel_modules
+    workspace.mkdir(parents=True)
+    _write_module(
+        workspace, "demo", "Demo module",
+        scripts={"demo-cli": "#!/usr/bin/env bash\necho ok\n"},
+    )
+
+    bin_dir = workdir / "bin"
+    monkeypatch.chdir(workdir)
+
+    symlink_module_scripts(rel_modules, str(bin_dir))
+
+    link = bin_dir / "demo-cli"
+    assert link.is_symlink()
+    # Critical assertion: the symlink target is absolute and actually
+    # resolves to a real file.  A relative target stored verbatim would
+    # resolve relative to ``bin_dir`` and point at a non-existent path.
+    target = Path(os.readlink(link))
+    assert target.is_absolute(), f"target should be absolute, got {target!r}"
+    assert link.resolve().is_file()

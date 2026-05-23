@@ -582,12 +582,15 @@ class SuperposClient:
         issue_type_id: str | None = None,
         assignee_id: str | None = None,
         q: str | None = None,
+        page: int | None = None,
         per_page: int | None = None,
     ) -> dict[str, Any]:
         """``GET /issues`` — paginated list with optional filters.
 
         Returns the full envelope (``{"data": [...], "meta": {...}}``) because
         callers need ``meta.has_more`` / ``meta.current_page`` to paginate.
+        Pass ``page=2`` (etc.) to advance past the first page — Laravel's
+        ``simplePaginate`` honours the standard ``?page=`` query param.
         """
         hive = self._config.superpos_hive_id
         params: dict[str, Any] = {}
@@ -599,6 +602,8 @@ class SuperposClient:
             params["assignee_id"] = assignee_id
         if q is not None:
             params["q"] = q
+        if page is not None:
+            params["page"] = page
         if per_page is not None:
             params["per_page"] = per_page
         resp = await self._request(

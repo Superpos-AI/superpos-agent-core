@@ -39,10 +39,12 @@ superpos-issues list --state open --per-page 5
 superpos-issues list --q "auth"           # title substring (case-insensitive)
 superpos-issues list --assignee-id <id>
 superpos-issues list --issue-type-id <id>
+superpos-issues list --page 2 --per-page 50   # advance past the first page
 ```
 
 Returns the full envelope including `meta.has_more` / `meta.current_page`
-so you can decide whether to fetch more.
+so you can decide whether to fetch more — pass the next index via
+`--page` to walk the rest.
 
 ### `superpos-issues show <issue-id>`
 

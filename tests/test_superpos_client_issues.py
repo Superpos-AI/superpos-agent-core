@@ -90,6 +90,26 @@ async def test_list_issues_passes_all_filters():
     await client.close()
 
 
+async def test_list_issues_forwards_page_param():
+    """A response with ``meta.has_more=true`` is useless without a way to
+    request the next page — the page selector must round-trip to the
+    server as ``?page=N``.
+    """
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return _envelope([], meta={"current_page": 2, "has_more": False})
+
+    client = _make_client(handler)
+    await client.list_issues(page=2, per_page=50)
+
+    req = captured[0]
+    assert req.url.params["page"] == "2"
+    assert req.url.params["per_page"] == "50"
+    await client.close()
+
+
 # ── get_issue ───────────────────────────────────────────────────────────
 
 

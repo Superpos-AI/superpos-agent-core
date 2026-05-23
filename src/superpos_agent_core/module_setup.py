@@ -128,11 +128,19 @@ def symlink_module_scripts(modules_dir: str | None, bin_dir: str) -> None:
                     # already +x at build time, so a chmod failure here
                     # is non-fatal.
                     log.debug("Could not chmod %s (read-only?); continuing", script)
+                # symlink_to stores the literal target string, resolved
+                # *relative to the symlink location* — not the cwd.  If
+                # the caller passed a relative ``modules_dir`` (e.g.
+                # ``.codex/modules``), the script Path is relative too,
+                # and the resulting symlink would point at a sibling of
+                # ``bin_dir`` that doesn't exist.  Resolve to an absolute
+                # path so the link is correct regardless of caller cwd.
+                resolved_script = script.resolve()
                 target = bin_path / script.name
                 if target.is_symlink() or target.exists():
                     target.unlink()
-                target.symlink_to(script)
-                log.debug("Linked %s -> %s", target, script)
+                target.symlink_to(resolved_script)
+                log.debug("Linked %s -> %s", target, resolved_script)
 
 
 def run_setup(
