@@ -20,8 +20,17 @@ log = logging.getLogger(__name__)
 WEBHOOK_ENTITY_COOLDOWN = 300
 
 # Maximum number of times a task can be re-claimed after claim expiry.
-# After this limit the task is left for the server to handle (timeout/fail).
-MAX_TASK_CLAIMS = 3
+# After this limit the poller explicitly fails the task server-side so it
+# stops endlessly re-circulating through the queue.
+#
+# Set to 2 (not 3): each claim-expire cycle wastes up to one full
+# server-side ``progress_timeout`` window (~60s by default) plus however
+# long the agent ran before noticing.  Three attempts on a genuinely
+# stuck task burned ~17 minutes per cycle in observed traces; two
+# attempts cuts that roughly in half while still letting one transient
+# blip recover.  Combined with ``progress_reporter.report_progress``'s
+# in-flight silence detection, healthy tasks should never reach this cap.
+MAX_TASK_CLAIMS = 2
 
 
 def _webhook_entity_key(task: dict) -> str | None:

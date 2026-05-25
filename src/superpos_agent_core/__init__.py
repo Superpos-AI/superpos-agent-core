@@ -11,6 +11,7 @@ from .module_loader import (
 )
 from .module_setup import run_setup as run_module_setup
 from .module_setup import symlink_module_scripts
+from .progress_reporter import report_progress
 from .recent_tasks import RecentTasksLog, TaskSummary
 from .redactor import redact
 from .runtime_config import RuntimeConfig
@@ -52,6 +53,7 @@ __all__ = [
     "is_git_repo",
     "prune_worktrees",
     "redact",
+    "report_progress",
     "run_agent",
     "run_module_setup",
     "run_superpos_poller",
