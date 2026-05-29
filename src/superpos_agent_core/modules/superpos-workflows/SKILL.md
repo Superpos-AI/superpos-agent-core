@@ -82,11 +82,33 @@ optional `overlap_policy`.
 controls what happens if the previous run is still alive when the next
 tick fires.
 
-**`webhook`** — kicked off when a matching inbound webhook arrives on
-a configured `webhook_route`. Configure the route in the dashboard /
-via the webhooks API and reference it by ID from the workflow's
-`trigger_config`. The webhook payload is available to steps under
-`{{trigger.payload}}`.
+**`webhook`** — kicked off when an inbound webhook arrives that
+matches all of `service_connection_id`, `event_type`, and (optionally)
+every entry in `field_filters`. The service connection is the
+org-level integration the webhook arrived on (GitHub, Slack, etc.);
+`event_type` is the normalised event (e.g. `"pull_request"`,
+`"push"`). `field_filters` is an **array of `{field, operator, value}`
+objects** evaluated by `FieldFilterEvaluator` — supports `eq`,
+`contains`, `in`, `exists`, `regex`, `gt`/`lt`, and wildcard paths.
+All filters must pass (AND). Empty/missing `field_filters` matches any
+payload for the event.
+
+```json
+{
+  "type": "webhook",
+  "service_connection_id": "01HSVC...",
+  "event_type": "pull_request",
+  "field_filters": [
+    { "field": "pull_request.base.ref", "operator": "eq", "value": "main" },
+    { "field": "action", "operator": "eq", "value": "opened" }
+  ]
+}
+```
+
+The full parsed webhook payload is available to steps under
+`{{trigger.payload}}`. Note: `webhook_route_id` is **not** part of
+the top-level trigger config — that field belongs only to
+`webhook_wait` *steps* (see below).
 
 ## Step types
 
