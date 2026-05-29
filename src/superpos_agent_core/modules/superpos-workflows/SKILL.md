@@ -19,10 +19,10 @@ an external signal.
 
 Decision tree, in order:
 
-- **Single ad-hoc prompt** → just create a task (`superpos_task.py
+- **Single ad-hoc prompt** → just create a task (`superpos-task
   create`). No workflow needed.
 - **A prompt that should fire on a schedule (no branching)** → use a
-  `TaskSchedule` (`superpos_task.py schedule`). Workflows are
+  `TaskSchedule` (`superpos-task schedule`). Workflows are
   overkill for "run this prompt every weekday at 9am".
 - **Multi-step orchestration with branching, loops, fan-in, or a wait
   for an external event** → use a workflow.
