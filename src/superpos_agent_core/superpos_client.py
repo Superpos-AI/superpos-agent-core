@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Mapping
 
 import httpx
 
@@ -839,22 +839,27 @@ class SuperposClient:
     async def list_workflows(
         self,
         *,
-        active: bool | None = None,
-        q: str | None = None,
+        is_active: bool | None = None,
+        search: str | None = None,
         page: int | None = None,
         per_page: int | None = None,
     ) -> dict[str, Any]:
         """``GET /workflows`` — paginated list with optional filters.
+
+        Server-side query params are ``is_active`` (boolean filter) and
+        ``search`` (case-insensitive substring against name/slug); the
+        kwargs here mirror those names exactly so the filters are not
+        silently dropped.
 
         Returns the full envelope so callers can paginate via
         ``meta.has_more`` / ``meta.current_page``.
         """
         hive = self._config.superpos_hive_id
         params: dict[str, Any] = {}
-        if active is not None:
-            params["active"] = "true" if active else "false"
-        if q is not None:
-            params["q"] = q
+        if is_active is not None:
+            params["is_active"] = "true" if is_active else "false"
+        if search is not None:
+            params["search"] = search
         if page is not None:
             params["page"] = page
         if per_page is not None:
@@ -878,13 +883,20 @@ class SuperposClient:
         *,
         name: str,
         slug: str,
-        trigger_config: dict[str, Any],
-        steps: list[dict[str, Any]],
+        trigger_config: Mapping[str, Any],
+        steps: Mapping[str, Any],
         description: str | None = None,
-        settings: dict[str, Any] | None = None,
+        settings: Mapping[str, Any] | None = None,
         is_active: bool = True,
     ) -> dict[str, Any]:
-        """``POST /workflows`` — create a new workflow definition (v1)."""
+        """``POST /workflows`` — create a new workflow definition (v1).
+
+        ``steps`` is a mapping keyed by step name (e.g.
+        ``{"plan": {...}, "build": {...}}``); the executor uses those
+        keys as the canonical step IDs that ``next`` / ``then`` /
+        ``depends_on_steps`` reference. Shape validation is the
+        server's job — anything JSON-serialisable is forwarded as-is.
+        """
         hive = self._config.superpos_hive_id
         body: dict[str, Any] = {
             "name": name,
@@ -909,15 +921,19 @@ class SuperposClient:
         *,
         name: str | None = None,
         slug: str | None = None,
-        trigger_config: dict[str, Any] | None = None,
-        steps: list[dict[str, Any]] | None = None,
+        trigger_config: Mapping[str, Any] | None = None,
+        steps: Mapping[str, Any] | None = None,
         description: str | None = None,
-        settings: dict[str, Any] | None = None,
+        settings: Mapping[str, Any] | None = None,
         is_active: bool | None = None,
     ) -> dict[str, Any]:
         """``PUT /workflows/{id}`` — full-shape update; snapshots a new
         ``WorkflowVersion`` when ``steps`` / ``trigger_config`` / ``settings``
-        change."""
+        change.
+
+        ``steps`` is a mapping keyed by step name; see
+        :meth:`create_workflow` for shape details.
+        """
         hive = self._config.superpos_hive_id
         body: dict[str, Any] = {}
         for field, value in (

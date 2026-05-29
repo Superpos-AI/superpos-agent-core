@@ -79,25 +79,14 @@ def _load_json_arg(label: str, raw: str | None) -> Any:
         sys.exit(2)
 
 
-def _require_type(label: str, value: Any, expected: type, type_name: str) -> Any:
-    if not isinstance(value, expected):
-        print(
-            f"Error: --{label} must be a JSON {type_name}, "
-            f"got {type(value).__name__}",
-            file=sys.stderr,
-        )
-        sys.exit(2)
-    return value
-
-
 async def _run(args: argparse.Namespace) -> int:
     config = _config_from_env()
     client = SuperposClient(config)
     try:
         if args.cmd == "list":
             _print(await client.list_workflows(
-                active=args.active,
-                q=args.q,
+                is_active=args.active,
+                search=args.q,
                 page=args.page,
                 per_page=args.per_page,
             ))
@@ -106,19 +95,9 @@ async def _run(args: argparse.Namespace) -> int:
             _print(await client.get_workflow(args.workflow))
 
         elif args.cmd == "create":
-            trigger = _require_type(
-                "trigger-config",
-                _load_json_arg("trigger-config", args.trigger_config),
-                dict, "object",
-            )
-            steps = _require_type(
-                "steps",
-                _load_json_arg("steps", args.steps),
-                list, "array",
-            )
+            trigger = _load_json_arg("trigger-config", args.trigger_config)
+            steps = _load_json_arg("steps", args.steps)
             settings = _load_json_arg("settings", args.settings)
-            if settings is not None:
-                _require_type("settings", settings, dict, "object")
             _print(await client.create_workflow(
                 name=args.name,
                 slug=args.slug,
@@ -131,14 +110,8 @@ async def _run(args: argparse.Namespace) -> int:
 
         elif args.cmd == "update":
             trigger = _load_json_arg("trigger-config", args.trigger_config)
-            if trigger is not None:
-                _require_type("trigger-config", trigger, dict, "object")
             steps = _load_json_arg("steps", args.steps)
-            if steps is not None:
-                _require_type("steps", steps, list, "array")
             settings = _load_json_arg("settings", args.settings)
-            if settings is not None:
-                _require_type("settings", settings, dict, "object")
             is_active: bool | None = None
             if args.activate:
                 is_active = True
@@ -190,8 +163,6 @@ async def _run(args: argparse.Namespace) -> int:
 
         elif args.cmd == "start":
             payload = _load_json_arg("payload", args.payload)
-            if payload is not None:
-                _require_type("payload", payload, dict, "object")
             _print(await client.start_workflow_run(
                 args.workflow, payload=payload,
             ))
@@ -225,9 +196,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p_list = sub.add_parser("list", help="Paginated list with filters")
     p_list.add_argument(
         "--active", dest="active", action="store_true", default=None,
-        help="Only return active workflows",
+        help="Only return active workflows (server param: is_active=true)",
     )
-    p_list.add_argument("--q", help="Case-insensitive name substring")
+    p_list.add_argument(
+        "--q",
+        help="Case-insensitive substring against name/slug "
+             "(server param: search)",
+    )
     p_list.add_argument("--page", type=int, help="1-based page index")
     p_list.add_argument("--per-page", type=int, help="Page size (server caps at 100)")
 
@@ -248,7 +223,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_create.add_argument(
         "--steps", required=True,
-        help="JSON array of step definitions or @path/to/file.json",
+        help="JSON object keyed by step name (or @path/to/file.json). "
+             "Example: {\"plan\": {...}, \"build\": {...}}",
     )
     p_create.add_argument("--description")
     p_create.add_argument(
@@ -270,7 +246,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--trigger-config", help="JSON object or @path/to/file.json",
     )
     p_update.add_argument(
-        "--steps", help="JSON array or @path/to/file.json",
+        "--steps",
+        help="JSON object keyed by step name, or @path/to/file.json",
     )
     p_update.add_argument("--description")
     p_update.add_argument(

@@ -35,7 +35,7 @@ do not reach for this skill.
 Four objects, in this order:
 
 1. **Workflow** — the template. Has a slug, a `trigger_config`, and a
-   list of `steps`. Versioned.
+   `steps` map keyed by step name. Versioned.
 2. **WorkflowVersion** — an immutable frozen copy of a workflow's
    `steps` / `trigger_config` / `settings` at a point in time. Created
    automatically whenever you `update` one of those fields. Sub-agent
@@ -53,7 +53,9 @@ Run statuses: `running`, `completed`, `failed`, `cancelled`,
 
 ## Triggers
 
-Three trigger types, set under `trigger_config.type`.
+Three trigger types, set under `trigger_config.type`. The server's
+`StoreWorkflowRequest` only accepts `schedule`, `webhook`, or `manual`
+— anything else 422s.
 
 **`manual`** — only ever started by an explicit `start` call. No extra
 fields.
@@ -63,7 +65,9 @@ fields.
 ```
 
 **`schedule`** — periodic. Requires **either** `cron` **or**
-`interval_seconds` (≥ 60).
+`interval_seconds` (≥ 60). Optional `timezone` (must be a valid
+tz name), optional `expires_at` (ISO8601, must be in the future), and
+optional `overlap_policy`.
 
 ```json
 {
@@ -78,21 +82,23 @@ fields.
 controls what happens if the previous run is still alive when the next
 tick fires.
 
-**`event`** — fan-out from a Superpos event. Matches on `event_type`
-and optional payload field filters.
-
-```json
-{
-  "type": "event",
-  "event_type": "pr.opened",
-  "field_filters": { "repo": "superpos-app" }
-}
-```
+**`webhook`** — kicked off when a matching inbound webhook arrives on
+a configured `webhook_route`. Configure the route in the dashboard /
+via the webhooks API and reference it by ID from the workflow's
+`trigger_config`. The webhook payload is available to steps under
+`{{trigger.payload}}`.
 
 ## Step types
 
-Every step has a unique `key`, a `type`, and (except for terminals) a
-`next` pointing at the next step's key. Four step types:
+`steps` is a JSON **object** keyed by step name (e.g.
+`{"plan": {...}, "build": {...}, "review": {...}}`). The executor
+treats those keys as the canonical step IDs that `next`, `then`, and
+`depends_on_steps` reference — so the outer key *is* the step's
+identity. Do **not** wrap each step in `{"key": "..."}`; the outer key
+is the only source of truth.
+
+Every step has a `type` and (except for terminals) a `next` pointing
+at the next step's key. Four step types:
 
 ### `agent`
 
@@ -102,19 +108,20 @@ variables" below.
 
 ```json
 {
-  "key": "summarize_pr",
-  "type": "agent",
-  "name": "Summarize PR diff",
-  "target_capability": "code-review",
-  "prompt": "Summarize the diff for PR {{trigger.payload.pr_number}}.",
-  "output_schema": [
-    { "name": "summary", "type": "string" },
-    { "name": "risk_level", "type": "string" }
-  ],
-  "on_failure": "fallback_step",
-  "fallback_step": "notify_human",
-  "timeout_seconds": 600,
-  "next": "decide_route"
+  "summarize_pr": {
+    "type": "agent",
+    "name": "Summarize PR diff",
+    "target_capability": "code-review",
+    "prompt": "Summarize the diff for PR {{trigger.payload.pr_number}}.",
+    "output_schema": [
+      { "name": "summary", "type": "string" },
+      { "name": "risk_level", "type": "string" }
+    ],
+    "on_failure": "fallback_step",
+    "fallback_step": "notify_human",
+    "timeout_seconds": 600,
+    "next": "decide_route"
+  }
 }
 ```
 
@@ -131,16 +138,17 @@ or anything that should iterate until a quality check passes.
 
 ```json
 {
-  "key": "qa_loop",
-  "type": "loop",
-  "generator_capability": "code-write",
-  "generator_prompt": "Implement the change described in {{trigger.payload.spec}}. {{#if loop.feedback}}Address the prior reviewer feedback: {{loop.feedback}}{{/if}}",
-  "evaluator_sub_agent_definition_slug": "qa-reviewer",
-  "evaluator_prompt": "Review this implementation:\n{{loop.generator_output}}",
-  "max_iterations": 4,
-  "exit_condition": "approved",
-  "on_max_iterations": "use_last",
-  "next": "open_pr"
+  "qa_loop": {
+    "type": "loop",
+    "generator_capability": "code-write",
+    "generator_prompt": "Implement the change described in {{trigger.payload.spec}}. {{#if loop.feedback}}Address the prior reviewer feedback: {{loop.feedback}}{{/if}}",
+    "evaluator_sub_agent_definition_slug": "qa-reviewer",
+    "evaluator_prompt": "Review this implementation:\n{{loop.generator_output}}",
+    "max_iterations": 4,
+    "exit_condition": "approved",
+    "on_max_iterations": "use_last",
+    "next": "open_pr"
+  }
 }
 ```
 
@@ -157,13 +165,14 @@ truthy wins, otherwise `default` fires.
 
 ```json
 {
-  "key": "decide_route",
-  "type": "condition",
-  "conditions": [
-    { "if": "{{eq steps.summarize_pr.result.risk_level 'high'}}", "then": "notify_human" },
-    { "if": "{{eq steps.summarize_pr.result.risk_level 'medium'}}", "then": "qa_loop" }
-  ],
-  "default": "open_pr"
+  "decide_route": {
+    "type": "condition",
+    "conditions": [
+      { "if": "{{eq steps.summarize_pr.result.risk_level 'high'}}", "then": "notify_human" },
+      { "if": "{{eq steps.summarize_pr.result.risk_level 'medium'}}", "then": "qa_loop" }
+    ],
+    "default": "open_pr"
+  }
 }
 ```
 
@@ -173,18 +182,19 @@ Pause the run until a matching webhook arrives on a configured route.
 
 ```json
 {
-  "key": "wait_for_signoff",
-  "type": "webhook_wait",
-  "match": {
-    "webhook_route_id": "01HWEBHOOK...",
-    "field_filters": {
-      "action": "approved",
-      "pr_number": "{{trigger.payload.pr_number}}"
-    }
-  },
-  "timeout_seconds": 86400,
-  "on_timeout": "fail_workflow",
-  "next": "merge"
+  "wait_for_signoff": {
+    "type": "webhook_wait",
+    "match": {
+      "webhook_route_id": "01HWEBHOOK...",
+      "field_filters": {
+        "action": "approved",
+        "pr_number": "{{trigger.payload.pr_number}}"
+      }
+    },
+    "timeout_seconds": 86400,
+    "on_timeout": "fail_workflow",
+    "next": "merge"
+  }
 }
 ```
 
@@ -208,7 +218,35 @@ webhook field filters) you have:
 
 ## Authoring end-to-end
 
-Author the two JSON blobs locally, then `create`:
+Author the two JSON blobs locally, then `create`. `steps.json` is a
+JSON **object keyed by step name** — each top-level key is the step's
+canonical ID that `next`, `then`, and `depends_on_steps` resolve
+against.
+
+```json
+// steps.json — note the outer keys ("plan", "build", "review") ARE
+// the step IDs. Do NOT add a "key" field inside each step.
+{
+  "plan": {
+    "type": "agent",
+    "target_capability": "planning",
+    "prompt": "Plan the change described in {{trigger.payload.spec}}.",
+    "next": "build"
+  },
+  "build": {
+    "type": "agent",
+    "target_capability": "coding",
+    "prompt": "Implement the plan: {{steps.plan.result.plan}}",
+    "next": "review"
+  },
+  "review": {
+    "type": "agent",
+    "target_capability": "qa",
+    "prompt": "Review the build output: {{steps.build.result.diff}}",
+    "depends_on_steps": ["build"]
+  }
+}
+```
 
 ```bash
 # Write steps.json and trigger.json locally
@@ -226,7 +264,8 @@ superpos-workflows run-show pr-review <run-id>
 ```
 
 `--trigger-config`, `--steps`, `--settings`, and `--payload` all accept
-either an inline JSON string or `@path/to/file.json`.
+either an inline JSON string or `@path/to/file.json`. The CLI does not
+re-validate shape; the server is the source of truth.
 
 ## Built-in templates to copy from
 
@@ -292,9 +331,12 @@ Do not:
 - Use a slug that doesn't match `^[a-z0-9]+(?:-[a-z0-9]+)*$` — the
   server returns 422 and the message often gets blamed on the wrong
   field.
-- Ship a `steps` list with no entry point. At least one step must
+- Ship a `steps` map with no entry point. At least one step must
   have no incoming edge (nothing else `next`s into it, and it isn't
   in any `depends_on_steps`).
+- Wrap each step in a `{"key": "..."}` field. The outer map key IS
+  the step's identity — adding an inner `key` is ignored at best and
+  confusing at worst.
 - Reference a `sub_agent_definition_slug` that isn't active in the
   hive at create time — slugs are pinned at snapshot, and the snapshot
   refuses to write.
@@ -311,7 +353,23 @@ Do not:
   `depends_on_steps`. The executor silently treats it as "no next
   step" / "dependency never resolves" — easy to misdiagnose.
 
-## Requirements
+## Requirements / permissions
 
-- `SUPERPOS_*` env vars (already set in the container)
-- `workflows.read` and/or `workflows.manage` permission on the hive
+- `SUPERPOS_*` env vars (already set in the container).
+- One or more workflow permissions on the hive, split four ways
+  by the server (`routes/api.php` workflow group):
+
+| CLI subcommand                              | Required permission |
+| ------------------------------------------- | ------------------- |
+| `list`, `show`                              | `workflows.read`    |
+| `versions`, `version`, `diff`               | `workflows.read`    |
+| `runs`, `run-show`                          | `workflows.read`    |
+| `create`, `update`, `delete`, `rollback`    | `workflows.write`   |
+| `start`                                     | `workflows.run`     |
+| `cancel`, `retry`                           | `workflows.manage`  |
+
+A read-only inspector needs only `workflows.read`. An agent that
+authors and ships workflow definitions needs `workflows.read +
+workflows.write`. An agent that just triggers existing workflows
+needs `workflows.run`. An agent that babysits in-flight runs (cancel
+/ retry) needs `workflows.manage`.

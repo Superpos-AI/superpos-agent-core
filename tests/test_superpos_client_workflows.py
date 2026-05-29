@@ -69,11 +69,15 @@ async def test_list_workflows_passes_all_filters():
         return _envelope([])
 
     client = _make_client(handler)
-    await client.list_workflows(active=True, q="pr", page=2, per_page=25)
+    await client.list_workflows(is_active=True, search="pr", page=2, per_page=25)
 
     req = captured[0]
-    assert req.url.params["active"] == "true"
-    assert req.url.params["q"] == "pr"
+    # Server-side WorkflowController only reads is_active / search — sending
+    # the bare names "active" / "q" would silently no-op.
+    assert req.url.params["is_active"] == "true"
+    assert req.url.params["search"] == "pr"
+    assert "active" not in req.url.params
+    assert "q" not in req.url.params
     assert req.url.params["page"] == "2"
     assert req.url.params["per_page"] == "25"
     await client.close()
@@ -87,9 +91,9 @@ async def test_list_workflows_active_false_serialises():
         return _envelope([])
 
     client = _make_client(handler)
-    await client.list_workflows(active=False)
+    await client.list_workflows(is_active=False)
 
-    assert captured[0].url.params["active"] == "false"
+    assert captured[0].url.params["is_active"] == "false"
     await client.close()
 
 
@@ -122,7 +126,7 @@ async def test_create_workflow_sends_required_and_optional():
         name="PR Review",
         slug="pr-review",
         trigger_config={"type": "manual"},
-        steps=[{"key": "s1", "type": "agent"}],
+        steps={"s1": {"type": "agent"}},
         description="Reviews PRs",
         settings={"max_runs": 5},
     )
@@ -135,7 +139,7 @@ async def test_create_workflow_sends_required_and_optional():
         "name": "PR Review",
         "slug": "pr-review",
         "trigger_config": {"type": "manual"},
-        "steps": [{"key": "s1", "type": "agent"}],
+        "steps": {"s1": {"type": "agent"}},
         "is_active": True,
         "description": "Reviews PRs",
         "settings": {"max_runs": 5},
@@ -155,7 +159,7 @@ async def test_create_workflow_inactive_flag():
         name="WF",
         slug="wf",
         trigger_config={"type": "manual"},
-        steps=[],
+        steps={},
         is_active=False,
     )
 
@@ -177,13 +181,13 @@ async def test_update_workflow_only_sends_provided_fields():
         return _envelope({"id": "w1", "name": "new"})
 
     client = _make_client(handler)
-    await client.update_workflow("w1", name="new", steps=[{"key": "s1"}])
+    await client.update_workflow("w1", name="new", steps={"s1": {"type": "agent"}})
 
     req = captured[0]
     body = json.loads(req.content)
     assert req.method == "PUT"
     assert req.url.path == "/api/v1/hives/hive-x/workflows/w1"
-    assert body == {"name": "new", "steps": [{"key": "s1"}]}
+    assert body == {"name": "new", "steps": {"s1": {"type": "agent"}}}
     await client.close()
 
 
