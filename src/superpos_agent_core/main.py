@@ -205,7 +205,12 @@ async def run_agent(
             if me.get("hive_id"):
                 config.superpos_hive_id = me["hive_id"]
             caps = me.get("capabilities")
-            if isinstance(caps, list) and caps:
+            if isinstance(caps, list):
+                # Treat any list — including `[]` — as authoritative.  An
+                # operator clearing every capability in the dashboard is a
+                # real config change; requiring `caps` to be truthy would
+                # silently fall back to env-derived caps and the poller
+                # would keep claiming tasks the operator just revoked.
                 config.superpos_capabilities = [str(c) for c in caps]
             perms = me.get("permissions")
             if isinstance(perms, list):
