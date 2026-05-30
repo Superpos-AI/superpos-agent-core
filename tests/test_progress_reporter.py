@@ -226,6 +226,46 @@ async def test_silence_detected_before_next_interval_boundary():
     )
 
 
+async def test_silence_bounded_even_when_ping_hangs():
+    """Regression for gilfoilbot follow-up on #10: a `update_progress`
+    call that hangs (e.g. up to httpx's 30s default timeout) must not
+    push silence detection past `silent_max_seconds`.  The hardened
+    loop bounds the ping itself with `asyncio.wait_for` against the
+    remaining silence budget."""
+
+    async def handler(progress: int) -> Any:
+        # Hang far longer than the silence threshold — wait_for must
+        # cut this short before it returns.
+        await asyncio.sleep(10)
+        return {"ok": True}
+
+    client = _StubClient(handler)
+    claim_expired = asyncio.Event()
+
+    started = time.monotonic()
+    await asyncio.wait_for(
+        report_progress(
+            client, "t1", claim_expired,
+            interval=0.2,
+            silent_max_seconds=0.5,
+        ),
+        timeout=2.0,
+    )
+
+    elapsed = time.monotonic() - started
+    assert claim_expired.is_set()
+    # Without per-call timeout, the helper would block inside
+    # update_progress for the full 10s the handler sleeps.  With it,
+    # we exit at ≈silent_max_seconds.
+    assert elapsed < 0.8, (
+        f"silence detected at {elapsed:.2f}s; the per-ping timeout did "
+        f"not bound the hung call"
+    )
+    assert elapsed >= 0.5, (
+        f"silence detected at {elapsed:.2f}s; must not bail before threshold"
+    )
+
+
 async def test_silence_resets_after_successful_ping():
     """A transient failure followed by a successful ping should reset the
     silence clock — we don't want one network blip to count toward the

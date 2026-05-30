@@ -85,9 +85,23 @@ async def report_progress(
             return
 
         progress = min(progress + 5, 95)
+        # Bound the ping itself by the remaining silence budget — without
+        # this, an `update_progress` call that hangs until the underlying
+        # httpx timeout (default 30s) defeats the silence check entirely:
+        # we'd sit inside the call until ~`silent_max_seconds + 30s`,
+        # racing the server's progress_timeout the very thing this loop
+        # exists to beat.
+        ping_timeout = silent_max_seconds - (time.monotonic() - last_success)
         try:
-            await client.update_progress(task_id, progress)
+            async with asyncio.timeout(ping_timeout):
+                await client.update_progress(task_id, progress)
             last_success = time.monotonic()
+        except asyncio.TimeoutError:
+            log.warning(
+                "Progress update for task %s exceeded silence budget "
+                "(%.1fs); next iter will abort",
+                task_id, ping_timeout,
+            )
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 409:
                 log.warning(
