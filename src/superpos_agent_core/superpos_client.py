@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import warnings
-from typing import Any
+from typing import Any, Mapping
 
 import httpx
 
@@ -852,6 +852,269 @@ class SuperposClient:
         hive = self._config.superpos_hive_id
         resp = await self._request(
             "GET", f"/api/v1/hives/{hive}/issue-types",
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    # ── Workflows ─────────────────────────────────────────────────────
+
+    async def list_workflows(
+        self,
+        *,
+        is_active: bool | None = None,
+        search: str | None = None,
+        page: int | None = None,
+        per_page: int | None = None,
+    ) -> dict[str, Any]:
+        """``GET /workflows`` — paginated list with optional filters.
+
+        Server-side query params are ``is_active`` (boolean filter) and
+        ``search`` (case-insensitive substring against name/slug); the
+        kwargs here mirror those names exactly so the filters are not
+        silently dropped.
+
+        Returns the full envelope so callers can paginate via
+        ``meta.has_more`` / ``meta.current_page``.
+        """
+        hive = self._config.superpos_hive_id
+        params: dict[str, Any] = {}
+        if is_active is not None:
+            params["is_active"] = "true" if is_active else "false"
+        if search is not None:
+            params["search"] = search
+        if page is not None:
+            params["page"] = page
+        if per_page is not None:
+            params["per_page"] = per_page
+        resp = await self._request(
+            "GET", f"/api/v1/hives/{hive}/workflows", params=params or None,
+        )
+        return resp.json()
+
+    async def get_workflow(self, workflow_id_or_slug: str) -> dict[str, Any]:
+        """``GET /workflows/{id}`` — fetch by ID or slug (server resolves both)."""
+        hive = self._config.superpos_hive_id
+        resp = await self._request(
+            "GET", f"/api/v1/hives/{hive}/workflows/{workflow_id_or_slug}",
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def create_workflow(
+        self,
+        *,
+        name: str,
+        slug: str,
+        trigger_config: Mapping[str, Any],
+        steps: Mapping[str, Any],
+        description: str | None = None,
+        settings: Mapping[str, Any] | None = None,
+        is_active: bool = True,
+    ) -> dict[str, Any]:
+        """``POST /workflows`` — create a new workflow definition (v1).
+
+        ``steps`` is a mapping keyed by step name (e.g.
+        ``{"plan": {...}, "build": {...}}``); the executor uses those
+        keys as the canonical step IDs that ``next`` / ``then`` /
+        ``depends_on_steps`` reference. Shape validation is the
+        server's job — anything JSON-serialisable is forwarded as-is.
+        """
+        hive = self._config.superpos_hive_id
+        body: dict[str, Any] = {
+            "name": name,
+            "slug": slug,
+            "trigger_config": trigger_config,
+            "steps": steps,
+            "is_active": is_active,
+        }
+        if description is not None:
+            body["description"] = description
+        if settings is not None:
+            body["settings"] = settings
+        resp = await self._request(
+            "POST", f"/api/v1/hives/{hive}/workflows", json=body,
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def update_workflow(
+        self,
+        workflow_id: str,
+        *,
+        name: str | None = None,
+        slug: str | None = None,
+        trigger_config: Mapping[str, Any] | None = None,
+        steps: Mapping[str, Any] | None = None,
+        description: str | None = None,
+        settings: Mapping[str, Any] | None = None,
+        is_active: bool | None = None,
+    ) -> dict[str, Any]:
+        """``PUT /workflows/{id}`` — full-shape update; snapshots a new
+        ``WorkflowVersion`` when ``steps`` / ``trigger_config`` / ``settings``
+        change.
+
+        ``steps`` is a mapping keyed by step name; see
+        :meth:`create_workflow` for shape details.
+        """
+        hive = self._config.superpos_hive_id
+        body: dict[str, Any] = {}
+        for field, value in (
+            ("name", name),
+            ("slug", slug),
+            ("trigger_config", trigger_config),
+            ("steps", steps),
+            ("description", description),
+            ("settings", settings),
+            ("is_active", is_active),
+        ):
+            if value is not None:
+                body[field] = value
+        if not body:
+            raise ValueError("update_workflow requires at least one field to change")
+        resp = await self._request(
+            "PUT", f"/api/v1/hives/{hive}/workflows/{workflow_id}", json=body,
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def delete_workflow(self, workflow_id: str) -> None:
+        """``DELETE /workflows/{id}`` — server refuses if active runs exist."""
+        hive = self._config.superpos_hive_id
+        await self._request(
+            "DELETE", f"/api/v1/hives/{hive}/workflows/{workflow_id}",
+        )
+
+    async def list_workflow_versions(
+        self, workflow_id: str,
+    ) -> list[dict[str, Any]]:
+        """``GET /workflows/{id}/versions`` — version history (newest first)."""
+        hive = self._config.superpos_hive_id
+        resp = await self._request(
+            "GET", f"/api/v1/hives/{hive}/workflows/{workflow_id}/versions",
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def get_workflow_version(
+        self, workflow_id: str, version: int,
+    ) -> dict[str, Any]:
+        """``GET /workflows/{id}/versions/{n}`` — a single immutable snapshot."""
+        hive = self._config.superpos_hive_id
+        resp = await self._request(
+            "GET",
+            f"/api/v1/hives/{hive}/workflows/{workflow_id}/versions/{version}",
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def diff_workflow_versions(
+        self, workflow_id: str, from_version: int, to_version: int,
+    ) -> dict[str, Any]:
+        """``GET /workflows/{id}/versions/{from}/diff/{to}`` — structural diff."""
+        hive = self._config.superpos_hive_id
+        resp = await self._request(
+            "GET",
+            f"/api/v1/hives/{hive}/workflows/{workflow_id}"
+            f"/versions/{from_version}/diff/{to_version}",
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def rollback_workflow_version(
+        self, workflow_id: str, version: int,
+    ) -> dict[str, Any]:
+        """``POST /workflows/{id}/versions/{n}/rollback`` — restore an
+        older snapshot as the new head version."""
+        hive = self._config.superpos_hive_id
+        resp = await self._request(
+            "POST",
+            f"/api/v1/hives/{hive}/workflows/{workflow_id}"
+            f"/versions/{version}/rollback",
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def list_workflow_runs(
+        self,
+        workflow_id: str,
+        *,
+        status: str | None = None,
+        page: int | None = None,
+        per_page: int | None = None,
+    ) -> dict[str, Any]:
+        """``GET /workflows/{id}/runs`` — paginated runs index."""
+        hive = self._config.superpos_hive_id
+        params: dict[str, Any] = {}
+        if status is not None:
+            params["status"] = status
+        if page is not None:
+            params["page"] = page
+        if per_page is not None:
+            params["per_page"] = per_page
+        resp = await self._request(
+            "GET",
+            f"/api/v1/hives/{hive}/workflows/{workflow_id}/runs",
+            params=params or None,
+        )
+        return resp.json()
+
+    async def get_workflow_run(
+        self, workflow_id: str, run_id: str,
+    ) -> dict[str, Any]:
+        """``GET /workflows/{id}/runs/{run}`` — single run with ``thread`` and
+        ``step_states`` embedded."""
+        hive = self._config.superpos_hive_id
+        resp = await self._request(
+            "GET",
+            f"/api/v1/hives/{hive}/workflows/{workflow_id}/runs/{run_id}",
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def start_workflow_run(
+        self,
+        workflow_id: str,
+        *,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """``POST /workflows/{id}/runs`` — kick off a new run.
+
+        Body is ``{"payload": ...}`` when ``payload`` is provided, else an
+        empty object — the server requires a JSON body either way.
+        """
+        hive = self._config.superpos_hive_id
+        body: dict[str, Any] = {"payload": payload} if payload is not None else {}
+        resp = await self._request(
+            "POST",
+            f"/api/v1/hives/{hive}/workflows/{workflow_id}/runs",
+            json=body,
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def cancel_workflow_run(
+        self, workflow_id: str, run_id: str,
+    ) -> dict[str, Any]:
+        """``POST /workflows/{id}/runs/{run}/cancel`` — best-effort cancel."""
+        hive = self._config.superpos_hive_id
+        resp = await self._request(
+            "POST",
+            f"/api/v1/hives/{hive}/workflows/{workflow_id}"
+            f"/runs/{run_id}/cancel",
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def retry_workflow_run(
+        self, workflow_id: str, run_id: str,
+    ) -> dict[str, Any]:
+        """``POST /workflows/{id}/runs/{run}/retry`` — re-run a failed
+        run from the failed step (or from start if non-resumable)."""
+        hive = self._config.superpos_hive_id
+        resp = await self._request(
+            "POST",
+            f"/api/v1/hives/{hive}/workflows/{workflow_id}"
+            f"/runs/{run_id}/retry",
         )
         data = resp.json()
         return data.get("data", data) if isinstance(data, dict) else data
