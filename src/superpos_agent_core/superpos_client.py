@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import warnings
 from typing import Any, Mapping
 
 import httpx
@@ -317,35 +318,56 @@ class SuperposClient:
         q: str | None = None,
         *,
         scope: str | None = None,
+        mode: str | None = None,
+        explain: bool = False,
         semantic: bool = False,
         limit: int = 50,
     ) -> list[dict[str, Any]]:
-        """``GET /knowledge/search`` — PostgreSQL FTS or pgvector semantic search.
+        """``GET /knowledge/search`` — hybrid / FTS / semantic knowledge search.
 
         The server requires at least one of ``q`` or ``scope`` and returns
         400 otherwise; we raise ``ValueError`` here instead so a caller
         mistake fails fast and synchronously rather than as a delayed
-        ``httpx.HTTPStatusError`` from the network.  ``semantic=True``
-        routes to pgvector cosine-similarity (embedding-backed); the
-        default ``semantic=False`` uses Postgres ``ts_query`` / ``ts_rank``
-        with highlighted snippets.
+        ``httpx.HTTPStatusError`` from the network.
+
+        ``mode`` selects the ranking strategy: ``"hybrid"`` (default, RRF
+        fusion of FTS + pgvector + read-count + recency), ``"fts"``
+        (Postgres ``ts_query`` / ``ts_rank``), or ``"semantic"`` (pgvector
+        cosine).  When ``mode`` is ``None`` the server picks its own
+        default (currently ``hybrid``).  Pass ``explain=True`` to receive
+        a per-result ``score_breakdown`` for debugging weights.
+
+        ``semantic=True`` is the deprecated alias for ``mode="semantic"``
+        and emits :class:`DeprecationWarning`.  ``mode`` wins if both are
+        set.
 
         Returns the unwrapped entry list — pagination meta (``total``,
-        ``query``) is on the envelope, callers needing it should hit the
-        raw endpoint via ``_request`` directly.
+        ``query``, ``mode``) is on the envelope; callers needing it
+        should hit the raw endpoint via ``_request`` directly.
         """
         if q is None and scope is None:
             raise ValueError(
                 "search_knowledge requires at least one of `q` or `scope`",
             )
+        if semantic:
+            warnings.warn(
+                "search_knowledge(semantic=True) is deprecated; "
+                "use mode='semantic' instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if mode is None:
+                mode = "semantic"
         hive = self._config.superpos_hive_id
         params: dict[str, Any] = {"limit": limit}
         if q is not None:
             params["q"] = q
         if scope is not None:
             params["scope"] = scope
-        if semantic:
-            params["semantic"] = "true"
+        if mode is not None:
+            params["mode"] = mode
+        if explain:
+            params["explain"] = "true"
         resp = await self._request(
             "GET",
             f"/api/v1/hives/{hive}/knowledge/search",

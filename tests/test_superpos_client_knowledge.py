@@ -76,12 +76,62 @@ async def test_search_knowledge_semantic_flag_passed():
         return _envelope([])
 
     client = _make_client(handler)
-    await client.search_knowledge("auth migration", semantic=True, limit=10)
+    with pytest.warns(DeprecationWarning, match="semantic=True"):
+        await client.search_knowledge("auth migration", semantic=True, limit=10)
 
     req = captured[0]
     assert req.url.params["q"] == "auth migration"
-    assert req.url.params["semantic"] == "true"
+    assert req.url.params["mode"] == "semantic"
+    assert "semantic" not in req.url.params
     assert req.url.params["limit"] == "10"
+    await client.close()
+
+
+async def test_search_knowledge_mode_passed():
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return _envelope([])
+
+    client = _make_client(handler)
+    for mode in ("fts", "semantic", "hybrid"):
+        await client.search_knowledge("x", mode=mode)
+
+    assert [r.url.params["mode"] for r in captured] == ["fts", "semantic", "hybrid"]
+    await client.close()
+
+
+async def test_search_knowledge_explain_passed():
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return _envelope([])
+
+    client = _make_client(handler)
+    await client.search_knowledge("x", explain=True)
+    await client.search_knowledge("y")  # default False — should not appear
+
+    assert captured[0].url.params["explain"] == "true"
+    assert "explain" not in captured[1].url.params
+    await client.close()
+
+
+async def test_search_knowledge_mode_wins_over_semantic():
+    """If both `mode` and the deprecated `semantic=True` are passed, `mode`
+    wins — and the deprecation warning still fires."""
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return _envelope([])
+
+    client = _make_client(handler)
+    with pytest.warns(DeprecationWarning):
+        await client.search_knowledge("x", mode="hybrid", semantic=True)
+
+    assert captured[0].url.params["mode"] == "hybrid"
     await client.close()
 
 
