@@ -291,9 +291,13 @@ re-validate shape; the server is the source of truth.
 
 ## Built-in templates to copy from
 
-The hive ships four seeded workflow templates. Fetch them with
-`superpos-workflows list` and copy the `steps` / `trigger_config` into
-a new workflow to adapt.
+Superpos ships four canonical `WorkflowTemplate` seeds. They are
+**dashboard-only** — the agent REST API does not currently expose a
+template listing endpoint, so `superpos-workflows list` will not
+return them (it only lists live workflows already created in the
+hive). To use one, open the dashboard's templates page, fork the
+template into the hive, then operate on the resulting workflow with
+this CLI.
 
 - **`superpos-plan-build-qa`** — plan → build (with QA loop) → exit.
 - **`superpos-research-summarize`** — gather sources → structured
