@@ -188,6 +188,44 @@ async def test_silent_max_seconds_triggers_abort():
     assert len(client.calls) >= 1
 
 
+async def test_silence_detected_before_next_interval_boundary():
+    """Regression for the original ``await asyncio.sleep(interval)`` loop:
+    with defaults (interval=30, silent_max_seconds=50), silence was only
+    re-evaluated after each full interval, so detection fired at ~60s
+    rather than ~50s — racing the server's 60s progress_timeout.
+    The hardened loop caps each sleep at the remaining silence budget."""
+
+    async def handler(progress: int) -> Any:
+        raise _http_503()
+
+    client = _StubClient(handler)
+    claim_expired = asyncio.Event()
+
+    started = time.monotonic()
+    await asyncio.wait_for(
+        report_progress(
+            client, "t1", claim_expired,
+            interval=0.4,
+            silent_max_seconds=0.5,
+        ),
+        timeout=1.5,
+    )
+
+    elapsed = time.monotonic() - started
+    assert claim_expired.is_set()
+    # New code bails at silent_max_seconds (≈0.5s).  Old code would have
+    # slept the full 0.4s interval twice before noticing, bailing at
+    # ≈0.8s.  A 0.7s upper bound fails the old code but tolerates
+    # scheduler noise on a loaded CI box.
+    assert elapsed < 0.7, (
+        f"silence detected at {elapsed:.2f}s; expected < 0.7s "
+        f"(0.5s threshold + ~0.2s slack)"
+    )
+    assert elapsed >= 0.5, (
+        f"silence detected at {elapsed:.2f}s; must not bail before threshold"
+    )
+
+
 async def test_silence_resets_after_successful_ping():
     """A transient failure followed by a successful ping should reset the
     silence clock — we don't want one network blip to count toward the

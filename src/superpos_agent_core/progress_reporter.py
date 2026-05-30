@@ -65,9 +65,26 @@ async def report_progress(
     last_success = time.monotonic()
 
     while True:
-        await asyncio.sleep(interval)
-        progress = min(progress + 5, 95)
+        # Cap each wait at the remaining silence budget so an outage is
+        # detected at silent_max_seconds rather than at the next interval
+        # boundary.  Without this, defaults (interval=30, threshold=50)
+        # would only re-check silence at ~30s and ~60s — racing the
+        # server's own 60s progress_timeout.
+        budget = silent_max_seconds - (time.monotonic() - last_success)
+        sleep_for = max(0.0, min(float(interval), budget))
+        await asyncio.sleep(sleep_for)
 
+        silence = time.monotonic() - last_success
+        if silence >= silent_max_seconds:
+            log.warning(
+                "Progress silent for %.1fs on task %s (>=%ds threshold); "
+                "treating claim as lost, aborting execution",
+                silence, task_id, silent_max_seconds,
+            )
+            claim_expired.set()
+            return
+
+        progress = min(progress + 5, 95)
         try:
             await client.update_progress(task_id, progress)
             last_success = time.monotonic()
@@ -87,13 +104,3 @@ async def report_progress(
                 "Progress update failed for task %s (%s)",
                 task_id, type(e).__name__,
             )
-
-        silence = time.monotonic() - last_success
-        if silence > silent_max_seconds:
-            log.warning(
-                "Progress silent for %.1fs on task %s (>%ds threshold); "
-                "treating claim as lost, aborting execution",
-                silence, task_id, silent_max_seconds,
-            )
-            claim_expired.set()
-            return
