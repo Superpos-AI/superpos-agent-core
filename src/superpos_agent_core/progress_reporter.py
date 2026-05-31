@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 import time
 
 import httpx
@@ -33,6 +34,44 @@ import httpx
 from .superpos_client import SuperposClient
 
 log = logging.getLogger(__name__)
+
+# asyncio.timeout() was added in Python 3.11.  On 3.10 we fall back to a
+# minimal contextmanager that uses asyncio.current_task().cancel() with a
+# deadline callback — avoiding asyncio.wait_for() whose 3.10
+# implementation has a known bug where external cancellation can be
+# swallowed (https://github.com/python/cpython/issues/86296).
+_HAS_ASYNCIO_TIMEOUT = sys.version_info >= (3, 11)
+
+
+async def _wait_for_compat(coro, timeout: float) -> None:
+    """Await *coro* with a timeout, safe against external cancellation.
+
+    Unlike ``asyncio.wait_for`` on Python 3.10, this implementation does
+    not swallow ``CancelledError`` delivered from outside.  It schedules a
+    cancel callback via ``loop.call_later`` and distinguishes between
+    "we timed out" (raise ``TimeoutError``) and "someone else cancelled
+    us" (re-raise ``CancelledError``).
+    """
+    loop = asyncio.get_running_loop()
+    task = asyncio.ensure_future(coro, loop=loop)
+    timed_out = False
+
+    def _on_timeout():
+        nonlocal timed_out
+        timed_out = True
+        task.cancel()
+
+    handle = loop.call_later(max(timeout, 0), _on_timeout)
+    try:
+        return await task
+    except asyncio.CancelledError:
+        if timed_out:
+            raise TimeoutError
+        # External cancellation — clean up the inner task and propagate.
+        task.cancel()
+        raise
+    finally:
+        handle.cancel()
 
 
 async def report_progress(
@@ -93,10 +132,16 @@ async def report_progress(
         # exists to beat.
         ping_timeout = silent_max_seconds - (time.monotonic() - last_success)
         try:
-            async with asyncio.timeout(ping_timeout):
-                await client.update_progress(task_id, progress)
+            if _HAS_ASYNCIO_TIMEOUT:
+                async with asyncio.timeout(ping_timeout):
+                    await client.update_progress(task_id, progress)
+            else:
+                await _wait_for_compat(
+                    client.update_progress(task_id, progress),
+                    ping_timeout,
+                )
             last_success = time.monotonic()
-        except asyncio.TimeoutError:
+        except (asyncio.TimeoutError, TimeoutError):
             log.warning(
                 "Progress update for task %s exceeded silence budget "
                 "(%.1fs); next iter will abort",
