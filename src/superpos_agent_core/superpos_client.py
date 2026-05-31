@@ -1159,6 +1159,24 @@ class SuperposClient:
         payload = data.get("data", data) if isinstance(data, dict) else {}
         return payload.get("prompt") if isinstance(payload, dict) else None
 
+    async def get_runtime_bundle(self) -> dict[str, Any] | None:
+        """``GET /sub-agents/runtime-bundle`` — all definitions + agent memory in one call.
+
+        Returns dict with ``definitions``, ``agent_memory``, ``persona_version``
+        or ``None`` if the endpoint is not available (older backend).
+        """
+        try:
+            resp = await self._request("GET", "/api/v1/sub-agents/runtime-bundle")
+        except Exception:
+            return None
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        payload = data.get("data", data) if isinstance(data, dict) else {}
+        if not isinstance(payload, dict) or "definitions" not in payload:
+            return None
+        return payload
+
     # ── Service proxy ─────────────────────────────────────────────────
 
     async def discover_services(

@@ -11,6 +11,7 @@ from .module_loader import (
 )
 from .module_setup import run_setup as run_module_setup
 from .module_setup import symlink_module_scripts
+from .sub_agent_sync import sync_sub_agents
 from .progress_reporter import report_progress
 from .recent_tasks import RecentTasksLog, TaskSummary
 from .redactor import redact
@@ -60,6 +61,7 @@ __all__ = [
     "run_telegram_bot",
     "setup_logging",
     "slot_key",
+    "sync_sub_agents",
     "symlink_module_scripts",
     "worktree_path",
 ]
