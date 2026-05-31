@@ -34,6 +34,13 @@ WEBHOOK_ENTITY_COOLDOWN = 300
 # in-flight silence detection, healthy tasks should never reach this cap.
 MAX_TASK_CLAIMS = 2
 
+# Sentinel for "we have never observed the persona version yet" — distinct
+# from ``None``, which is a legitimate server response (agent has no active
+# persona but may still have sub-agent definitions).  Used so the first
+# poll always triggers a sub-agent re-sync regardless of whether the
+# server reports a version.
+_UNSET = object()
+
 
 def _webhook_entity_key(task: dict) -> str | None:
     """Extract dedup key for a webhook task (e.g. 'owner/repo:pr:123').
@@ -132,6 +139,10 @@ async def run_superpos_poller(
     persona_version: int | None = None
     platform_context_version: int | None = None
     environment_version: str | None = None
+    # Tracks whether the poller has observed *any* persona-version response
+    # yet.  Used to force a one-time sub-agent sync on the first successful
+    # poll even when ``server_version`` is ``None`` (no active persona).
+    last_observed_version: object = _UNSET
     recent_webhook_entities: dict[str, tuple[float, str]] = {}
     task_claim_counts: dict[str, int] = {}
     _failed_tasks: set[str] = set()
@@ -159,9 +170,10 @@ async def run_superpos_poller(
                 # persona, platform context, or live hive environment.  The
                 # server's `changed` flag already factors all three in when the
                 # client passed `known_*` for each.
-                if changed or (
+                persona_changed = changed or (
                     server_version is not None and server_version != persona_version
-                ):
+                )
+                if persona_changed:
                     new_persona = await superpos.get_persona_assembled()
                     executor.update_persona(new_persona, version=server_version)
                     persona_version = server_version
@@ -173,7 +185,6 @@ async def run_superpos_poller(
                         "Persona refreshed (version=%s, platform=%s, env=%s)",
                         persona_version, platform_context_version, environment_version,
                     )
-                    _resync_sub_agents(superpos, config)
                 else:
                     # Seed local tracking for first-run / pre-existing state so
                     # subsequent polls correctly compare known→server values.
@@ -183,6 +194,17 @@ async def run_superpos_poller(
                         platform_context_version = server_platform_version
                     if environment_version is None and server_environment_version is not None:
                         environment_version = server_environment_version
+
+                # Trigger sub-agent re-sync on persona change OR on the very
+                # first poll, even if the server reports no active persona
+                # (``server_version is None``).  Sub-agent definitions are
+                # tracked independently of persona version, so a null
+                # persona doesn't imply zero sub-agents.  Subsequent polls
+                # with unchanged null version won't re-sync.
+                first_observation = last_observed_version is _UNSET
+                if persona_changed or first_observation:
+                    _resync_sub_agents(superpos, config)
+                last_observed_version = server_version
             except Exception:
                 log.debug("Persona version check failed", exc_info=True)
 

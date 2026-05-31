@@ -6,11 +6,16 @@ from pathlib import Path
 
 import pytest
 
+import yaml
+
+from superpos_agent_core import sub_agent_sync as sas
 from superpos_agent_core.sub_agent_sync import (
     MANAGED_MARKER,
+    SubAgentFetchError,
     assemble_prompt,
     build_subagent_md,
     discover_local_context,
+    fetch_sub_agent_definitions,
     sync_sub_agents,
     _get_document_content,
 )
@@ -85,7 +90,8 @@ class TestBuildSubagentMd:
         }
         result = build_subagent_md(defn)
         assert "name: coder" in result
-        assert 'description: "Coding Agent — Writes code"' in result
+        # yaml.safe_dump emits plain scalars when no escaping is needed.
+        assert "description: Coding Agent — Writes code" in result
         assert "model: claude-opus-4-6" in result
         assert "# SOUL\n\nYou write code." in result
         assert MANAGED_MARKER in result
@@ -243,3 +249,195 @@ class TestSyncSubAgents:
         )
         content = (tmp_path / "test.md").read_text()
         assert "important context" in content
+
+
+# ── Finding 1: fetch failure must not destroy managed files ───────────
+
+
+def _write_managed_file(path: Path, slug: str) -> None:
+    path.write_text(
+        f"---\nname: {slug}\n---\nBody.\n\n{MANAGED_MARKER}\n",
+        encoding="utf-8",
+    )
+
+
+class TestFetchFailureNoDestructiveCleanup:
+    """fetch failure → managed files preserved (Finding 1)."""
+
+    def test_list_endpoint_failure_preserves_managed_files(self, tmp_path, monkeypatch):
+        managed = tmp_path / "coder.md"
+        _write_managed_file(managed, "coder")
+
+        def _boom(base_url, token):  # noqa: ARG001
+            raise SubAgentFetchError("list endpoint returned 500")
+
+        monkeypatch.setattr(sas, "fetch_runtime_bundle", lambda *a, **kw: None)
+        monkeypatch.setattr(sas, "fetch_sub_agent_definitions", _boom)
+
+        count = sync_sub_agents(
+            subagents_dir=str(tmp_path),
+            base_url="http://fake",
+            token="fake",
+        )
+
+        assert count == 0
+        assert managed.exists(), "Managed file must NOT be deleted on fetch failure"
+
+    def test_per_slug_failure_propagates_and_preserves_files(
+        self, tmp_path, monkeypatch,
+    ):
+        managed = tmp_path / "coder.md"
+        _write_managed_file(managed, "coder")
+
+        # Simulate fetch_sub_agent_definitions raising after partial work
+        # (per-slug detail endpoint failed).
+        def _boom(base_url, token):  # noqa: ARG001
+            raise SubAgentFetchError("detail endpoint for coder returned 503")
+
+        monkeypatch.setattr(sas, "fetch_runtime_bundle", lambda *a, **kw: None)
+        monkeypatch.setattr(sas, "fetch_sub_agent_definitions", _boom)
+
+        count = sync_sub_agents(
+            subagents_dir=str(tmp_path),
+            base_url="http://fake",
+            token="fake",
+        )
+
+        assert count == 0
+        assert managed.exists()
+
+    def test_empty_response_still_cleans_up_managed_files(
+        self, tmp_path, monkeypatch,
+    ):
+        """Genuine empty response → managed files ARE cleaned up."""
+        stale = tmp_path / "old.md"
+        _write_managed_file(stale, "old")
+
+        monkeypatch.setattr(sas, "fetch_runtime_bundle", lambda *a, **kw: None)
+        monkeypatch.setattr(sas, "fetch_sub_agent_definitions", lambda *a, **kw: [])
+
+        count = sync_sub_agents(
+            subagents_dir=str(tmp_path),
+            base_url="http://fake",
+            token="fake",
+        )
+
+        assert count == 0
+        assert not stale.exists(), "Empty response is authoritative; stale must be removed"
+
+
+class TestFetchRaisesOnFailure:
+    """fetch_sub_agent_definitions itself raises SubAgentFetchError on failure."""
+
+    def _client_with(self, monkeypatch, handler):
+        import httpx
+
+        class FakeClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def get(self, url, headers=None):
+                return handler(url, headers)
+
+        monkeypatch.setattr(httpx, "Client", FakeClient)
+
+    def test_list_500_raises(self, monkeypatch):
+        import httpx
+
+        def handler(url, headers):  # noqa: ARG001
+            return httpx.Response(500, text="boom")
+
+        self._client_with(monkeypatch, handler)
+
+        with pytest.raises(SubAgentFetchError):
+            fetch_sub_agent_definitions("http://fake", "tok")
+
+    def test_per_slug_500_raises(self, monkeypatch):
+        import httpx
+
+        def handler(url, headers):  # noqa: ARG001
+            if url == "/api/v1/sub-agents":
+                return httpx.Response(
+                    200, json={"data": [{"slug": "coder"}, {"slug": "reviewer"}]},
+                )
+            # detail endpoint fails for one slug
+            if url.endswith("/coder"):
+                return httpx.Response(
+                    200, json={"data": {"slug": "coder", "name": "C", "version": 1}},
+                )
+            return httpx.Response(503, text="nope")
+
+        self._client_with(monkeypatch, handler)
+
+        with pytest.raises(SubAgentFetchError):
+            fetch_sub_agent_definitions("http://fake", "tok")
+
+    def test_empty_list_returns_empty(self, monkeypatch):
+        import httpx
+
+        def handler(url, headers):  # noqa: ARG001
+            return httpx.Response(200, json={"data": []})
+
+        self._client_with(monkeypatch, handler)
+
+        assert fetch_sub_agent_definitions("http://fake", "tok") == []
+
+
+# ── Finding 3: frontmatter must round-trip through yaml.safe_load ─────
+
+
+class TestFrontmatterYamlValid:
+    def _extract_frontmatter(self, content: str) -> str:
+        # content starts with `---\n<yaml>\n---\n…`
+        first = content.index("---")
+        rest = content[first + 4 :]
+        end = rest.index("\n---")
+        return rest[:end]
+
+    def test_quote_in_name_round_trips(self):
+        defn = {
+            "slug": "coder",
+            "name": 'Bob "the builder" Coder',
+            "description": "Writes code",
+            "version": 1,
+            "documents": {},
+        }
+        content = build_subagent_md(defn)
+        fm = self._extract_frontmatter(content)
+        parsed = yaml.safe_load(fm)
+        assert parsed["name"] == "coder"
+        assert 'Bob "the builder" Coder' in parsed["description"]
+
+    def test_newline_in_description_round_trips(self):
+        defn = {
+            "slug": "coder",
+            "name": "Coder",
+            "description": "first line\nsecond line",
+            "version": 1,
+            "documents": {},
+        }
+        content = build_subagent_md(defn)
+        fm = self._extract_frontmatter(content)
+        parsed = yaml.safe_load(fm)
+        assert parsed["name"] == "coder"
+        assert "first line" in parsed["description"]
+        assert "second line" in parsed["description"]
+
+    def test_managed_marker_still_present(self):
+        defn = {
+            "slug": "coder",
+            "name": 'Tricky: "name" with colon',
+            "description": "desc",
+            "version": 1,
+            "documents": {},
+        }
+        content = build_subagent_md(defn)
+        assert MANAGED_MARKER in content
+        # And the version comment still appears in the frontmatter block.
+        assert "# synced from Superpos SubAgentDefinition v1" in content

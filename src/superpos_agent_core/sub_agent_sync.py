@@ -23,11 +23,21 @@ import sys
 from pathlib import Path
 
 import httpx
+import yaml
 
 log = logging.getLogger(__name__)
 
 MANAGED_MARKER = "<!-- managed-by: superpos-sync -->"
 DOCUMENT_ORDER = ("SOUL", "AGENT", "RULES", "STYLE", "EXAMPLES", "NOTES")
+
+
+class SubAgentFetchError(RuntimeError):
+    """Raised when sub-agent definitions cannot be reliably fetched.
+
+    Distinguishes transport / API failures from a legitimate empty
+    response so callers don't treat a failed fetch as "platform has zero
+    sub-agents" and delete managed files.
+    """
 
 
 # ── HTTP helpers (sync, for CLI usage) ────────────────────────────────
@@ -65,33 +75,65 @@ def fetch_runtime_bundle(
 def fetch_sub_agent_definitions(
     base_url: str, token: str,
 ) -> list[dict]:
-    """Fetch all active sub-agent definitions with full documents (N+1 fallback)."""
+    """Fetch all active sub-agent definitions with full documents (N+1 fallback).
+
+    Raises:
+        SubAgentFetchError: if the list endpoint fails (non-200) or returns
+            an unparseable body, or if any per-slug detail fetch fails.
+            Callers must distinguish this from a legitimate empty list.
+    """
     with httpx.Client(base_url=base_url, timeout=30.0, follow_redirects=True) as client:
-        resp = client.get("/api/v1/sub-agents", headers=_headers(token))
+        try:
+            resp = client.get("/api/v1/sub-agents", headers=_headers(token))
+        except httpx.HTTPError as exc:
+            raise SubAgentFetchError(f"list request failed: {exc}") from exc
+
         if resp.status_code != 200:
             log.warning("Failed to list sub-agents: %s %s", resp.status_code, resp.text[:200])
-            return []
+            raise SubAgentFetchError(
+                f"list endpoint returned {resp.status_code}"
+            )
 
-        data = resp.json()
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            raise SubAgentFetchError(f"list response not JSON: {exc}") from exc
         summaries = data.get("data", data) if isinstance(data, dict) else []
         if not isinstance(summaries, list):
-            return []
+            raise SubAgentFetchError("list response payload is not a list")
 
         definitions = []
         for summary in summaries:
             slug = summary.get("slug")
             if not slug:
                 continue
-            detail_resp = client.get(
-                f"/api/v1/sub-agents/{slug}", headers=_headers(token),
-            )
-            if detail_resp.status_code == 200:
+            try:
+                detail_resp = client.get(
+                    f"/api/v1/sub-agents/{slug}", headers=_headers(token),
+                )
+            except httpx.HTTPError as exc:
+                raise SubAgentFetchError(
+                    f"detail request for {slug} failed: {exc}"
+                ) from exc
+            if detail_resp.status_code != 200:
+                log.warning(
+                    "Failed to fetch sub-agent %s: %s", slug, detail_resp.status_code,
+                )
+                raise SubAgentFetchError(
+                    f"detail endpoint for {slug} returned {detail_resp.status_code}"
+                )
+            try:
                 detail_data = detail_resp.json()
-                definition = detail_data.get("data", detail_data)
-                if isinstance(definition, dict):
-                    definitions.append(definition)
-            else:
-                log.warning("Failed to fetch sub-agent %s: %s", slug, detail_resp.status_code)
+            except ValueError as exc:
+                raise SubAgentFetchError(
+                    f"detail response for {slug} not JSON: {exc}"
+                ) from exc
+            definition = detail_data.get("data", detail_data)
+            if not isinstance(definition, dict):
+                raise SubAgentFetchError(
+                    f"detail payload for {slug} is not an object"
+                )
+            definitions.append(definition)
 
         return definitions
 
@@ -204,19 +246,33 @@ def build_subagent_md(
 
     desc_text = f"{name} — {description}" if description else name
 
-    frontmatter_lines = [
-        "---",
-        f"name: {slug}",
-        f'description: "{desc_text}"',
-    ]
+    # Serialize via yaml.safe_dump so quotes/newlines/colons in name or
+    # description don't produce broken frontmatter that yaml.safe_load
+    # can't round-trip.
+    frontmatter_data: dict[str, object] = {
+        "name": slug,
+        "description": desc_text,
+    }
     if model:
-        frontmatter_lines.append(f"model: {model}")
-    frontmatter_lines.append(f"# synced from Superpos SubAgentDefinition v{version}")
-    frontmatter_lines.append("---")
+        frontmatter_data["model"] = model
+
+    frontmatter_yaml = yaml.safe_dump(
+        frontmatter_data,
+        default_flow_style=False,
+        sort_keys=False,
+        allow_unicode=True,
+    ).rstrip()
+
+    frontmatter = (
+        "---\n"
+        f"{frontmatter_yaml}\n"
+        f"# synced from Superpos SubAgentDefinition v{version}\n"
+        "---"
+    )
 
     body = assemble_prompt(documents)
 
-    parts = ["\n".join(frontmatter_lines), ""]
+    parts = [frontmatter, ""]
 
     if body:
         parts.append(body)
@@ -279,7 +335,17 @@ def sync_sub_agents(
                 len(definitions), "yes" if memory else "no",
             )
         else:
-            definitions = fetch_sub_agent_definitions(base_url, token)
+            try:
+                definitions = fetch_sub_agent_definitions(base_url, token)
+            except SubAgentFetchError as exc:
+                # Bail out without touching any managed files — we cannot
+                # distinguish "no sub-agents" from "fetch failed", and
+                # deleting on failure would wipe valid local state.
+                log.warning(
+                    "Skipping sub-agent sync: fetch failed (%s); "
+                    "leaving existing managed files in place.", exc,
+                )
+                return 0
             if inject_memory and definitions:
                 memory = fetch_persona_memory(base_url, token)
     elif not inject_memory:
