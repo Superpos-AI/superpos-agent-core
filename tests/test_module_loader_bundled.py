@@ -66,6 +66,18 @@ def test_discover_includes_bundled_superpos_issues():
     assert "superpos-issues" in issues_mod.scripts
 
 
+def test_discover_includes_bundled_superpos_knowledge():
+    """The write-capable knowledge module must ship bundled so every agent
+    flavor inherits read + bounded write without a workspace copy."""
+    modules = discover_modules(modules_dir=None)
+    names = [m.name for m in modules]
+    assert "superpos-knowledge" in names
+
+    kn = next(m for m in modules if m.name == "superpos-knowledge")
+    assert "knowledge" in kn.description.lower()
+    assert "superpos-knowledge" in kn.scripts
+
+
 def test_workspace_module_does_not_evict_bundled(tmp_path: Path):
     """A workspace module with a different name must coexist with bundled ones."""
     workspace = tmp_path / "modules"

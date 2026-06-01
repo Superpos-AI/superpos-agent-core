@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+"""CLI wrapper around superpos_agent_core.SuperposClient knowledge methods.
+
+Subcommands mirror the client API:
+  search, get, list, graph, topics, decisions   (read)
+  create, update                                 (bounded write)
+
+Prints JSON to stdout, errors to stderr.  Designed for the LLM to call
+via Bash and pipe through ``jq`` for follow-up queries.
+
+Writes are *bounded*: every created/updated entry is stamped with
+``metadata.source = "agent_inline"`` so the Curator can audit and decay
+inline-authored knowledge.  Org-scope writes remain gated server-side by
+the ``knowledge.write_organization`` permission.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import sys
+from typing import Any
+
+# `superpos_agent_core` is pip-installed via the container's requirements.txt.
+from superpos_agent_core import BaseConfig, SuperposClient
+
+
+def _config_from_env() -> BaseConfig:
+    base_url = os.environ.get("SUPERPOS_BASE_URL", "").rstrip("/")
+    hive_id = os.environ.get("SUPERPOS_HIVE_ID", "")
+    agent_id = os.environ.get("SUPERPOS_AGENT_ID", "")
+    token = os.environ.get("SUPERPOS_API_TOKEN", "")
+    refresh = os.environ.get("SUPERPOS_REFRESH_TOKEN", "")
+
+    if not (base_url and hive_id and token):
+        print(
+            "Error: SUPERPOS_BASE_URL, SUPERPOS_HIVE_ID, and "
+            "SUPERPOS_API_TOKEN must be set in the environment.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    return BaseConfig(
+        superpos_base_url=base_url,
+        superpos_hive_id=hive_id,
+        superpos_agent_id=agent_id,
+        superpos_api_token=token,
+        superpos_refresh_token=refresh,
+    )
+
+
+def _print(value: Any) -> None:
+    """Print a JSON-serialisable value, indented for human reading."""
+    print(json.dumps(value, indent=2, default=str))
+
+
+def _parse_json_arg(label: str, raw: str | None) -> dict[str, Any] | None:
+    """Parse a CLI flag value that should be a JSON object, with a clear error."""
+    if raw is None:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as e:
+        print(f"Error: --{label} must be valid JSON ({e})", file=sys.stderr)
+        sys.exit(2)
+    if not isinstance(parsed, dict):
+        print(f"Error: --{label} must be a JSON object, got {type(parsed).__name__}",
+              file=sys.stderr)
+        sys.exit(2)
+    return parsed
+
+
+def _build_value(args: argparse.Namespace) -> dict[str, Any]:
+    """Assemble the canonical knowledge ``value`` dict from CLI flags.
+
+    ``--value`` (raw JSON) is the escape hatch / base; the structured flags
+    override individual fields on top of it.  Provenance metadata is always
+    stamped so inline writes are auditable.
+    """
+    value: dict[str, Any] = _parse_json_arg("value", args.value) or {}
+
+    if args.title:
+        value["title"] = args.title
+    if args.summary:
+        value["summary"] = args.summary
+    if args.content:
+        value["content"] = args.content
+    if args.tags:
+        value["tags"] = [t.strip() for t in args.tags.split(",") if t.strip()]
+    if args.confidence:
+        value["confidence"] = args.confidence
+
+    meta = value.get("metadata")
+    if not isinstance(meta, dict):
+        meta = {}
+    meta.setdefault("source", "agent_inline")
+    meta.setdefault("auto_generated", True)
+    value["metadata"] = meta
+    return value
+
+
+def _default_scope(explicit: str | None) -> str:
+    """Resolve the write scope: explicit flag → fillin default env → ``hive``."""
+    return explicit or os.environ.get("SUPERPOS_KNOWLEDGE_FILLIN_SCOPE", "hive")
+
+
+async def _run(args: argparse.Namespace) -> int:
+    config = _config_from_env()
+    client = SuperposClient(config)
+    try:
+        if args.cmd == "search":
+            try:
+                out = await client.search_knowledge(
+                    q=args.query,
+                    scope=args.scope,
+                    semantic=args.semantic,
+                    limit=args.limit,
+                )
+            except ValueError as e:
+                print(f"Error: {e}", file=sys.stderr)
+                return 2
+            _print(out)
+
+        elif args.cmd == "get":
+            _print(await client.get_knowledge(args.entry_id))
+
+        elif args.cmd == "list":
+            _print(await client.list_knowledge(
+                key=args.key,
+                scope=args.scope,
+                tags=args.tags,
+                stale_days=args.stale_days,
+                sort=args.sort,
+                limit=args.limit,
+            ))
+
+        elif args.cmd == "graph":
+            _print(await client.get_knowledge_graph(
+                args.entry_id,
+                depth=args.depth,
+                max_nodes=args.max_nodes,
+                link_types=args.link_types,
+            ))
+
+        elif args.cmd == "topics":
+            _print(await client.knowledge_topics())
+
+        elif args.cmd == "decisions":
+            _print(await client.knowledge_decisions())
+
+        elif args.cmd == "create":
+            _print(await client.create_knowledge(
+                key=args.key,
+                value=_build_value(args),
+                scope=_default_scope(args.scope),
+                visibility=args.visibility,
+                ttl=args.ttl,
+            ))
+
+        elif args.cmd == "update":
+            _print(await client.update_knowledge(
+                args.entry_id,
+                value=_build_value(args),
+                visibility=args.visibility,
+                ttl=args.ttl,
+            ))
+
+        else:
+            print(f"Unknown subcommand: {args.cmd}", file=sys.stderr)
+            return 2
+
+        return 0
+    finally:
+        await client.close()
+
+
+def _add_value_flags(p: argparse.ArgumentParser, *, require_content: bool) -> None:
+    """Shared value-shaping flags for create/update."""
+    p.add_argument(
+        "--content", required=require_content,
+        help="Entry body. Prefer the shape 'Rule: …  Why: …  How to apply: …'",
+    )
+    p.add_argument("--title", help="Short headline for the entry")
+    p.add_argument("--summary", help="One-line summary (shown in search results)")
+    p.add_argument("--tags", help="Comma-separated tags")
+    p.add_argument(
+        "--confidence", choices=["high", "medium", "low"],
+        help="Confidence level for this entry",
+    )
+    p.add_argument(
+        "--visibility", choices=["public", "private"],
+        help="Override visibility (defaults server-side by scope)",
+    )
+    p.add_argument("--ttl", help="ISO8601 expiry timestamp (entry auto-expires after)")
+    p.add_argument(
+        "--value",
+        help="Raw JSON object for the full value (escape hatch; structured "
+             "flags override fields on top of it)",
+    )
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="superpos-knowledge",
+        description=(
+            "Read and write the Superpos knowledge store: FTS/semantic search, "
+            "list, get, graph traversal, topic & decision indexes, plus bounded "
+            "create/update for recording lasting decisions."
+        ),
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    # search
+    p_search = sub.add_parser("search", help="Full-text or semantic search")
+    p_search.add_argument("query", nargs="?", help="Search query string")
+    p_search.add_argument("--scope", help="Restrict to a scope (hive, apiary, agent:<id>)")
+    p_search.add_argument(
+        "--semantic", action="store_true",
+        help="Use pgvector cosine-similarity (embedding-backed) instead of Postgres FTS",
+    )
+    p_search.add_argument("--limit", type=int, default=10, help="Top-N results (default 10)")
+
+    # get
+    p_get = sub.add_parser("get", help="Fetch a single entry by ID")
+    p_get.add_argument("entry_id", help="Knowledge entry ULID")
+
+    # list
+    p_list = sub.add_parser("list", help="Browse entries with filters")
+    p_list.add_argument("--key", help="Key pattern (* wildcard)")
+    p_list.add_argument("--scope", help="Restrict to a scope")
+    p_list.add_argument("--tags", help="Comma-separated tags (all must match)")
+    p_list.add_argument("--stale-days", type=int, help="Entries not read in N days")
+    p_list.add_argument(
+        "--sort",
+        choices=["least-read"],
+        help="Sort order — currently only least-read is supported server-side",
+    )
+    p_list.add_argument("--limit", type=int, default=50, help="Default 50, server cap 100")
+
+    # graph
+    p_graph = sub.add_parser("graph", help="BFS link traversal from an entry")
+    p_graph.add_argument("entry_id", help="Knowledge entry ULID to start from")
+    p_graph.add_argument("--depth", type=int, default=2, help="Hops to traverse (server clamps 1-5)")
+    p_graph.add_argument(
+        "--max-nodes", type=int, default=50,
+        help="Max nodes returned (server clamps 1-200)",
+    )
+    p_graph.add_argument(
+        "--link-types",
+        help="Comma-separated link-type allowlist (e.g. 'decides,depends_on')",
+    )
+
+    # topics / decisions
+    sub.add_parser("topics", help="Convenience index of topic clusters in this hive")
+    sub.add_parser("decisions", help="Convenience index of recorded decisions")
+
+    # create
+    p_create = sub.add_parser(
+        "create", help="Record a new lasting knowledge entry (bounded write)",
+    )
+    p_create.add_argument("--key", required=True, help="Stable key, e.g. 'decisions:eventbus-unification'")
+    p_create.add_argument(
+        "--scope",
+        help="Scope (default: SUPERPOS_KNOWLEDGE_FILLIN_SCOPE env or 'hive'). "
+             "Org scope needs the knowledge.write_organization permission.",
+    )
+    _add_value_flags(p_create, require_content=True)
+
+    # update
+    p_update = sub.add_parser(
+        "update", help="Replace an existing entry's value (bumps version)",
+    )
+    p_update.add_argument("entry_id", help="Knowledge entry ULID to update")
+    _add_value_flags(p_update, require_content=False)
+
+    return parser
+
+
+def _normalise_sort(value: str | None) -> str | None:
+    """Map the user-friendly ``--sort least-read`` to the server's
+    ``least_read`` parameter (the underscore variant the controller
+    expects)."""
+    if value == "least-read":
+        return "least_read"
+    return value
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
+    args.sort = _normalise_sort(getattr(args, "sort", None))
+    return asyncio.run(_run(args))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
