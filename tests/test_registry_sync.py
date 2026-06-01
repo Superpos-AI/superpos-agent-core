@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
 from superpos_agent_core import registry_sync as rs
 from superpos_agent_core.registry_sync import (
@@ -32,6 +33,7 @@ from superpos_agent_core.registry_sync import (
     RegistrySyncConfig,
     ResolvedItem,
     TaskScopeSyncResult,
+    UnsafePathSegmentError,
     feature_enabled,
     materialise_items,
     resolve_path,
@@ -669,3 +671,275 @@ class TestMaterialiseItems:
         materialise_items(items, target_root=tmp_path, layout="by-kind")
         assert (tmp_path / "skill" / "lint" / "SKILL.md").exists()
         assert (tmp_path / "subagent" / "coder" / "coder.md").exists()
+
+
+# ── Path-traversal defences ───────────────────────────────────────────
+
+
+class TestPathTraversalDefences:
+    """Refuse to materialise items whose slug/task_id would escape root.
+
+    Triggered by the security blocker in the PR review: a malicious
+    resolver payload (or a bug upstream) could ship ``slug='../escape'``
+    and reach ``rmtree`` / ``write_text`` outside the agent-owned root.
+    """
+
+    @pytest.mark.parametrize(
+        "bad_slug",
+        ["../escape", "../../etc/passwd", "a/b", "..", ".", "", "with\x00null"],
+    )
+    def test_materialise_rejects_unsafe_slug(self, tmp_path: Path, bad_slug: str):
+        item = ResolvedItem.from_api(
+            _make_resolved_item_dict(kind="skill", slug=bad_slug or "x"),
+        )
+        # Force the slug post-construction so ResolvedItem accepts it
+        # (no client-side validation today on raw bytes) — the helper
+        # is the boundary we care about.
+        object.__setattr__(item, "slug", bad_slug)
+        with pytest.raises(UnsafePathSegmentError):
+            materialise_items([item], target_root=tmp_path, layout="flat")
+        # Nothing escaped: tmp_path's parent must still be untouched.
+        assert list(tmp_path.iterdir()) == []
+
+    def test_agent_scope_skips_unsafe_slug(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        _enable_flag(monkeypatch)
+        config = _config(tmp_path)
+        resolver = FakeResolver(
+            agent_scope=_resolved_envelope([
+                _make_resolved_item_dict(kind="skill", slug="../escape"),
+                _make_resolved_item_dict(kind="skill", slug="lint"),
+            ]),
+        )
+        results = sync_agent_scope(config, client=resolver)
+        # Only the safe slug landed; the traversal attempt did not.
+        assert results["skill"].installed == ["lint"]
+        skill_root = Path(config.shared_roots["skill"])
+        # The shared root contains only the legitimate install.
+        assert sorted(p.name for p in skill_root.iterdir()) == ["lint"]
+        # And no sibling of the shared root was created — i.e. nothing
+        # was written via ``shared_root/../escape``.
+        assert sorted(p.name for p in skill_root.parent.iterdir()) == [
+            "modules", "skills", "subagents",
+        ]
+
+    def test_task_scope_rejects_unsafe_task_id(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        _enable_flag(monkeypatch)
+        config = _config(tmp_path)
+        resolver = FakeResolver(
+            task_scopes={
+                "../escape": _resolved_envelope([
+                    _make_resolved_item_dict(
+                        kind="skill", slug="taskonly", scope="task",
+                    ),
+                ]),
+            },
+        )
+        result = sync_task_scope(config, "../escape", client=resolver)
+        assert result.skipped is True
+        assert result.sandbox_dir is None
+        # The resolver was never called — we refused before issuing HTTP.
+        assert resolver.calls == []
+        # Sandbox root parent must not contain an "escape" sibling.
+        assert not (Path(config.sandbox_root).parent / "escape").exists()
+        # Teardown stays callable + no-op.
+        result.teardown()
+
+
+# ── resolve_path() round-trips the subagent layout sync writes ───────
+
+
+class TestResolvePathSubagentRoundTrip:
+    """A subagent installed by sync_agent_scope must be reachable via resolve_path.
+
+    Blocker from the PR review: sync writes ``<shared>/<slug>/<slug>.md``
+    but the original lookup returned the per-item directory because the
+    dir exists first.  Any loader that opens the returned path would
+    hit the directory and fail.
+    """
+
+    def test_finds_subagent_md_inside_per_item_dir(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        _enable_flag(monkeypatch)
+        config = _config(tmp_path)
+        resolver = FakeResolver(
+            agent_scope=_resolved_envelope([
+                _make_resolved_item_dict(kind="subagent", slug="coder"),
+            ]),
+        )
+        sync_agent_scope(config, client=resolver)
+
+        found = resolve_path(
+            "subagent", "coder",
+            shared_root=config.shared_roots["subagent"],
+        )
+        assert found is not None
+        # Must point at the markdown file, not the per-item directory.
+        assert found.is_file()
+        assert found.name == "coder.md"
+        # And the content must be the rendered subagent body, so a
+        # consumer can read it straight off the returned path.
+        text = found.read_text()
+        assert "name: coder" in text
+
+    def test_finds_subagent_via_task_overlay(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        _enable_flag(monkeypatch)
+        config = _config(tmp_path)
+        # Install an agent-scope subagent that lives in the shared root.
+        agent_resolver = FakeResolver(
+            agent_scope=_resolved_envelope([
+                _make_resolved_item_dict(
+                    kind="subagent", slug="coder",
+                    payload=_subagent_payload(body="shared body"),
+                ),
+            ]),
+        )
+        sync_agent_scope(config, client=agent_resolver)
+
+        # Materialise a task-scoped override of the same slug.
+        task_resolver = FakeResolver(
+            task_scopes={
+                "task-X": _resolved_envelope([
+                    _make_resolved_item_dict(
+                        kind="subagent", slug="coder",
+                        scope="task",
+                        attachment_id="att-task",
+                        payload=_subagent_payload(body="task body"),
+                    ),
+                ]),
+            },
+        )
+        sync_task_scope(config, "task-X", client=task_resolver)
+
+        found = resolve_path(
+            "subagent", "coder",
+            shared_root=config.shared_roots["subagent"],
+            task_id="task-X",
+            sandbox_root=config.sandbox_root,
+        )
+        assert found is not None
+        # Task overlay wins, and the returned path is the .md file
+        # inside the per-item dir of the task sandbox.
+        assert found.is_file()
+        assert "task body" in found.read_text()
+
+    def test_unsafe_slug_returns_none(self, tmp_path: Path):
+        # resolve_path must also refuse traversal — it's a public
+        # helper that takes raw strings from arbitrary callers.
+        (tmp_path / "shared").mkdir()
+        assert resolve_path(
+            "subagent", "../escape",
+            shared_root=str(tmp_path / "shared"),
+        ) is None
+
+
+# ── Module manifest round-trip (mcp field preserved) ──────────────────
+
+
+class TestModuleManifestRoundTrip:
+    """The synced module.yaml must contain every field module_loader reads.
+
+    Blocker from the PR review: the original installer only persisted
+    ``description`` and ``env``, silently dropping ``mcp`` — which
+    means a registry-synced module would lose its MCP server bindings
+    relative to a hand-installed copy.
+    """
+
+    @staticmethod
+    def _module_payload(*, mcp: dict | None = None) -> dict[str, Any]:
+        manifest: dict[str, Any] = {
+            "description": "Knowledge module",
+            "env_keys": ["SUPERPOS_API_TOKEN", "SUPERPOS_HIVE_ID"],
+        }
+        if mcp is not None:
+            manifest["mcp"] = mcp
+        return {"manifest": manifest, "skill": "Module SKILL body\n"}
+
+    def test_mcp_config_round_trips_through_module_yaml(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        _enable_flag(monkeypatch)
+        config = _config(tmp_path)
+        mcp_cfg = {
+            "knowledge-mcp": {
+                "command": "knowledge-mcp",
+                "args": ["--stdio"],
+                "env": {"SUPERPOS_API_TOKEN": "${SUPERPOS_API_TOKEN}"},
+            },
+        }
+        resolver = FakeResolver(
+            agent_scope=_resolved_envelope([
+                _make_resolved_item_dict(
+                    kind="module", slug="knowledge",
+                    payload=self._module_payload(mcp=mcp_cfg),
+                ),
+            ]),
+        )
+        sync_agent_scope(config, client=resolver)
+        module_yaml = Path(config.shared_roots["module"]) / "knowledge" / "module.yaml"
+        assert module_yaml.exists()
+        data = yaml.safe_load(module_yaml.read_text())
+        # description + env still present.
+        assert data["description"] == "Knowledge module"
+        assert data["env"] == ["SUPERPOS_API_TOKEN", "SUPERPOS_HIVE_ID"]
+        # mcp config preserved verbatim — this is the regression guard.
+        assert data["mcp"] == mcp_cfg
+
+    def test_module_loader_reads_synced_mcp_config(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        # End-to-end: sync writes the module → module_loader picks up
+        # the same MCP config that ``collect_mcp_servers`` would merge.
+        from superpos_agent_core import module_loader
+
+        _enable_flag(monkeypatch)
+        config = _config(tmp_path)
+        mcp_cfg = {"my-mcp": {"command": "echo", "args": ["hi"]}}
+        resolver = FakeResolver(
+            agent_scope=_resolved_envelope([
+                _make_resolved_item_dict(
+                    kind="module", slug="hello",
+                    payload=self._module_payload(mcp=mcp_cfg),
+                ),
+            ]),
+        )
+        sync_agent_scope(config, client=resolver)
+        modules = module_loader.discover_modules(
+            config.shared_roots["module"], include_bundled=False,
+        )
+        names = [m.name for m in modules]
+        assert "hello" in names
+        hello = next(m for m in modules if m.name == "hello")
+        assert hello.has_mcp is True
+        assert hello.mcp_config == mcp_cfg
+        # And the merged collector returns the same payload.
+        assert module_loader.collect_mcp_servers(modules) == mcp_cfg
+
+    def test_module_without_mcp_field_omits_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        # Symmetry: a module whose manifest lacks ``mcp`` should not
+        # have a stray ``mcp: null`` written into module.yaml — that
+        # would set ``has_mcp=False`` correctly today, but tomorrow's
+        # loader checks should not have to special-case the value.
+        _enable_flag(monkeypatch)
+        config = _config(tmp_path)
+        resolver = FakeResolver(
+            agent_scope=_resolved_envelope([
+                _make_resolved_item_dict(
+                    kind="module", slug="plain",
+                    payload=self._module_payload(mcp=None),
+                ),
+            ]),
+        )
+        sync_agent_scope(config, client=resolver)
+        data = yaml.safe_load(
+            (Path(config.shared_roots["module"]) / "plain" / "module.yaml").read_text(),
+        )
+        assert "mcp" not in data

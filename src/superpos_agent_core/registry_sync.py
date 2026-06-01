@@ -83,6 +83,56 @@ MANAGED_MARKER_FILENAME = ".registry-managed"
 SUPPORTED_KINDS = ("subagent", "skill", "module")
 
 
+# ── Path-segment validation ──────────────────────────────────────────
+
+
+class UnsafePathSegmentError(ValueError):
+    """Raised when a ``slug`` or ``task_id`` would escape its install root.
+
+    The resolver's payload is trusted *less* than the agent's own
+    config: a malicious hive admin (or compromised server) could ship a
+    ``slug`` like ``../../escape`` that, without validation, would land
+    a managed install — and worse, a managed ``rmtree`` — outside the
+    agent-owned shared root.  We refuse to materialise such items at
+    all and let the surrounding diff loop log + continue.
+    """
+
+
+def _is_safe_segment(seg: str) -> bool:
+    """Return True if ``seg`` is a safe *single* path component.
+
+    Rejects: empty, ``.``/``..``, any path separator, NUL byte, or any
+    string whose ``Path.name`` doesn't round-trip (catches OS-specific
+    edge cases like leading drive letters on Windows).
+    """
+    if not isinstance(seg, str) or not seg or seg in (".", ".."):
+        return False
+    if "/" in seg or "\\" in seg or "\x00" in seg:
+        return False
+    if Path(seg).name != seg:
+        return False
+    return True
+
+
+def _ensure_under_root(candidate: Path, root: Path) -> Path:
+    """Return ``candidate`` resolved, raising if it escapes ``root``.
+
+    Defence-in-depth on top of :func:`_is_safe_segment`: even if a
+    future caller forgets the up-front segment check, this final guard
+    will stop any ``mkdir`` / ``write_text`` / ``rmtree`` that would
+    leave the agent-owned root.
+    """
+    root_abs = root.absolute()
+    cand_abs = candidate.absolute()
+    try:
+        cand_abs.relative_to(root_abs)
+    except ValueError:
+        raise UnsafePathSegmentError(
+            f"resolved path {cand_abs} escapes root {root_abs}",
+        ) from None
+    return cand_abs
+
+
 # ── Config ───────────────────────────────────────────────────────────
 
 
@@ -232,21 +282,45 @@ def resolve_path(
     intentionally separate so the subagent / skill loaders can be
     rewired piecemeal in follow-up PRs without circular dependencies.
 
-    A slug is matched both as a bare filename (``<slug>``) and as
-    ``<slug>.md`` — subagents land as ``<slug>.md`` files today and
-    skills land as directories named ``<slug>``.  Picking the right
-    suffix is the caller's concern in general, but accepting both here
-    keeps the helper usable for either primitive without the caller
-    needing two code paths.
+    For ``kind == "subagent"`` the per-item install layout written by
+    :func:`sync_agent_scope` / :func:`materialise_items` is
+    ``<root>/<slug>/<slug>.md``: a per-item directory (so the
+    ``.registry-managed`` marker has a home) with the actual subagent
+    markdown inside it.  The overlay therefore probes the nested file
+    *before* falling back to the legacy flat ``<root>/<slug>.md`` or
+    bare-directory shapes — otherwise a loader that opens the returned
+    path would hit the directory and fail.
     """
+    if not _is_safe_segment(slug):
+        return None
+    if task_id is not None and not _is_safe_segment(task_id):
+        return None
+
+    def _candidates(root: Path) -> tuple[Path, ...]:
+        if kind == "subagent":
+            # Order matters: registry-managed subagents land as
+            # ``<root>/<slug>/<slug>.md`` (per-item dir holds the marker
+            # too).  Fall back to the legacy flat ``<slug>.md`` shape
+            # ``sub_agent_sync`` historically wrote, then the bare
+            # directory for skill-style probes that happen to pass
+            # ``kind="subagent"``.
+            return (
+                root / slug / f"{slug}.md",
+                root / f"{slug}.md",
+                root / slug,
+            )
+        # Skills / modules are directory-shaped at the per-item level
+        # (SKILL.md / module.yaml live inside ``<root>/<slug>/``).
+        return (root / slug, root / f"{slug}.md")
+
     if task_id:
         task_dir = Path(sandbox_root) / task_id / kind
-        for candidate in (task_dir / slug, task_dir / f"{slug}.md"):
+        for candidate in _candidates(task_dir):
             if candidate.exists():
                 return candidate.resolve()
 
     shared = Path(shared_root)
-    for candidate in (shared / slug, shared / f"{slug}.md"):
+    for candidate in _candidates(shared):
         if candidate.exists():
             return candidate.resolve()
     return None
@@ -419,10 +493,20 @@ def _install_module(install_dir: Path, item: ResolvedItem) -> None:
     payload = item.payload or {}
     manifest = payload.get("manifest") or {}
 
+    # ``module_loader._load_one`` reads ``description`` / ``env`` /
+    # ``mcp`` from ``module.yaml``.  Persist every field the loader
+    # consumes; in particular ``mcp`` carries the MCP server config
+    # that ``collect_mcp_servers`` later merges into the agent's MCP
+    # runtime — dropping it here would silently strip a registry-synced
+    # module of its server bindings.  The server already validates the
+    # manifest shape, so we trust the payload contents.
     yaml_data: dict[str, Any] = {
         "description": manifest.get("description") or item.name,
         "env": list(manifest.get("env_keys") or []),
     }
+    mcp_cfg = manifest.get("mcp")
+    if mcp_cfg is not None:
+        yaml_data["mcp"] = mcp_cfg
     (install_dir / "module.yaml").write_text(
         yaml.safe_dump(yaml_data, default_flow_style=False, sort_keys=False),
         encoding="utf-8",
@@ -446,8 +530,19 @@ def _materialise(target_root: Path, item: ResolvedItem) -> Path:
     Returns the per-item install dir.  Caller is responsible for the
     outer ``<kind>`` layer (so a shared root can be flat per kind while
     a task sandbox is layered as ``<task>/<kind>/<slug>``).
+
+    The ``item.slug`` is validated up front and the resolved install
+    path is asserted to lie under ``target_root`` before any filesystem
+    side effect — see :class:`UnsafePathSegmentError`.  Without this,
+    a payload like ``slug='../../escape'`` would let the resolver
+    place (or worse, ``rmtree``) files outside the agent-owned root.
     """
-    install_dir = target_root / item.slug
+    if not _is_safe_segment(item.slug):
+        raise UnsafePathSegmentError(
+            f"refusing to materialise registry item with unsafe slug "
+            f"{item.slug!r} (kind={item.kind!r})",
+        )
+    install_dir = _ensure_under_root(target_root / item.slug, target_root)
     if install_dir.exists():
         shutil.rmtree(install_dir)
     _ensure_dir(install_dir)
@@ -573,6 +668,16 @@ def sync_agent_scope(
         desired = desired_by_kind[kind]
 
         for slug, item in desired.items():
+            if not _is_safe_segment(slug):
+                # Defence in depth — a malicious or buggy resolver
+                # payload must not be able to direct file writes outside
+                # the agent-owned root.  Logged + skipped, same posture
+                # as the malformed-item branch above.
+                log.warning(
+                    "registry sync: refusing unsafe slug %r for kind=%s",
+                    slug, kind,
+                )
+                continue
             if item.deleted_at:
                 # Tombstoned items are still resolved when a live
                 # attachment points at them (proposal §7 "Delete
@@ -684,8 +789,6 @@ def sync_task_scope(
     ``teardown`` is a no-op, so callers can blindly call it without
     branching.
     """
-    sandbox = Path(config.sandbox_root) / task_id
-
     if not feature_enabled():
         return TaskScopeSyncResult(
             task_id=task_id,
@@ -694,6 +797,23 @@ def sync_task_scope(
             teardown=_make_teardown(None),
             skipped=True,
         )
+
+    # Validate ``task_id`` before joining it onto ``sandbox_root``.  The
+    # claim flow normally produces ULID-shaped ids, but ``task_id``
+    # crosses untrusted boundaries (resolver query string + the task
+    # payload itself) — a value like ``../../escape`` would otherwise
+    # let the teardown ``rmtree`` reach outside the sandbox root.
+    if not _is_safe_segment(task_id):
+        log.warning("registry task-scope: refusing unsafe task_id %r", task_id)
+        return TaskScopeSyncResult(
+            task_id=task_id,
+            sandbox_dir=None,
+            materialised=[],
+            teardown=_make_teardown(None),
+            skipped=True,
+        )
+    sandbox_root_path = Path(config.sandbox_root)
+    sandbox = _ensure_under_root(sandbox_root_path / task_id, sandbox_root_path)
 
     resolver = client or RegistryResolverClient(
         config.base_url, config.token, timeout=config.http_timeout,
@@ -723,6 +843,12 @@ def sync_task_scope(
             log.warning("Skipping malformed registry item for task %s: %s", task_id, exc)
             continue
         if item.resolved_from_scope != "task":
+            continue
+        if item.kind not in SUPPORTED_KINDS:
+            log.warning(
+                "registry task-scope: skipping unsupported kind %r (slug=%s)",
+                item.kind, item.slug,
+            )
             continue
         if item.kind == "module":
             # Defence in depth — the server rejects module task-scope
