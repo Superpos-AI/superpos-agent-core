@@ -67,6 +67,18 @@ def test_discover_includes_bundled_superpos_issues():
     assert "superpos-issues" in issues_mod.scripts
 
 
+def test_discover_includes_bundled_superpos_knowledge():
+    """The write-capable knowledge module must ship bundled so every agent
+    flavor inherits read + bounded write without a workspace copy."""
+    modules = discover_modules(modules_dir=None)
+    names = [m.name for m in modules]
+    assert "superpos-knowledge" in names
+
+    kn = next(m for m in modules if m.name == "superpos-knowledge")
+    assert "knowledge" in kn.description.lower()
+    assert "superpos-knowledge" in kn.scripts
+
+
 def test_discover_finds_every_bundled_module_with_its_scripts():
     """Belt-and-braces guard against an installed-package regression
     where a bundled module silently loses its ``module.yaml`` or its

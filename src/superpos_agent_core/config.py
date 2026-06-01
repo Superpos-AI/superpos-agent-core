@@ -29,6 +29,13 @@ class BaseConfig:
     superpos_permissions: list[str] = field(default_factory=list)
     superpos_poll_interval: int = 5
 
+    # Knowledge retrieval injection: before dispatching a Superpos task, search
+    # the hive knowledge store for entries relevant to the task and prepend them
+    # to the prompt so the agent always starts with the hive's memory in context
+    # (instead of only seeing it if it happens to call the knowledge CLI).
+    superpos_knowledge_inject: bool = True
+    superpos_knowledge_inject_limit: int = 5
+
     # ── Telegram ──────────────────────────────────────────────────────
     telegram_bot_token: str = ""
     telegram_allowed_users: list[int] = field(default_factory=list)
@@ -90,6 +97,13 @@ class BaseConfig:
             superpos_refresh_token=os.environ.get("SUPERPOS_REFRESH_TOKEN", ""),
             superpos_capabilities=[c.strip() for c in caps.split(",") if c.strip()],
             superpos_poll_interval=int(os.environ.get("SUPERPOS_POLL_INTERVAL", "5")),
+            superpos_knowledge_inject=os.environ.get(
+                "SUPERPOS_KNOWLEDGE_INJECT", "true"
+            ).lower()
+            not in ("0", "false", "no"),
+            superpos_knowledge_inject_limit=int(
+                os.environ.get("SUPERPOS_KNOWLEDGE_INJECT_LIMIT", "5")
+            ),
             telegram_bot_token=os.environ.get("TELEGRAM_BOT_TOKEN", ""),
             telegram_allowed_users=[
                 int(u.strip()) for u in allowed.split(",") if u.strip()
