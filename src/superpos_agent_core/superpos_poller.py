@@ -85,15 +85,21 @@ def _webhook_entity_key(task: dict) -> str | None:
     return None
 
 
-def _sanitize_for_fence(text: str) -> str:
+def _sanitize_for_fence(text: object) -> str:
     """Replace runs of 3+ consecutive backticks with single-quote characters.
 
     This prevents user-controlled content from terminating a triple-backtick
     code fence and escaping into the surrounding markdown — a prompt-injection
     vector when knowledge entries contain crafted payloads.
+
+    Accepts any object and coerces to ``str`` first — knowledge entries come
+    from decoded JSON, so fields like ``id`` / ``key`` may legitimately be
+    numeric scalars rather than strings.  All values feed into a string fence
+    downstream anyway, so coercion here is safe and matches the previous
+    f-string-based behaviour.
     """
     import re
-    return re.sub(r"`{3,}", lambda m: "'" * len(m.group()), text)
+    return re.sub(r"`{3,}", lambda m: "'" * len(m.group()), str(text))
 
 
 def _format_knowledge_block(entries: list[dict]) -> str:

@@ -214,3 +214,47 @@ def test_format_block_backtick_in_snippet_does_not_break_fence():
     ])
     fence_count = block.count("```")
     assert fence_count == 2, f"Expected 2 fences, got {fence_count}: {block!r}"
+
+
+# ── non-string scalar coercion (decoded-JSON safety) ──────────────────
+
+
+def test_sanitize_for_fence_accepts_non_string_scalar():
+    """Regression: _sanitize_for_fence must coerce non-string scalars.
+
+    Knowledge entries come from decoded JSON, so id/key may legitimately be
+    numeric.  Passing an int previously raised TypeError inside re.sub.
+    """
+    assert poller._sanitize_for_fence(123) == "123"
+    assert poller._sanitize_for_fence(0) == "0"
+    assert poller._sanitize_for_fence(None) == "None"
+
+
+def test_format_block_numeric_id_does_not_raise():
+    """Regression: numeric ``id`` (e.g. JSON int) must render, not crash."""
+    block = poller._format_knowledge_block([
+        {"id": 123, "value": {"summary": "ok"}},
+    ])
+    # No TypeError, and the stringified id is rendered as the key fallback.
+    assert "123" in block
+    assert "ok" in block
+
+
+def test_format_block_numeric_key_does_not_raise():
+    """Regression: numeric ``key`` must render, not crash."""
+    block = poller._format_knowledge_block([
+        {"key": 42, "id": "abc", "value": {"summary": "hello"}},
+    ])
+    assert "42" in block
+    assert "abc" in block
+    assert "hello" in block
+
+
+def test_format_block_numeric_id_only_does_not_raise():
+    """Regression: numeric ``id`` with no key falls back to id for the label."""
+    block = poller._format_knowledge_block([
+        {"id": 999, "value": {"summary": "gist"}},
+    ])
+    # ``key`` lookup falls back to id; both must render as "999".
+    assert "999" in block
+    assert "gist" in block
