@@ -85,6 +85,23 @@ def _webhook_entity_key(task: dict) -> str | None:
     return None
 
 
+def _sanitize_for_fence(text: object) -> str:
+    """Replace runs of 3+ consecutive backticks with single-quote characters.
+
+    This prevents user-controlled content from terminating a triple-backtick
+    code fence and escaping into the surrounding markdown — a prompt-injection
+    vector when knowledge entries contain crafted payloads.
+
+    Accepts any object and coerces to ``str`` first — knowledge entries come
+    from decoded JSON, so fields like ``id`` / ``key`` may legitimately be
+    numeric scalars rather than strings.  All values feed into a string fence
+    downstream anyway, so coercion here is safe and matches the previous
+    f-string-based behaviour.
+    """
+    import re
+    return re.sub(r"`{3,}", lambda m: "'" * len(m.group()), str(text))
+
+
 def _format_knowledge_block(entries: list[dict]) -> str:
     """Render knowledge-search hits into a prompt-ready markdown block.
 
@@ -99,8 +116,8 @@ def _format_knowledge_block(entries: list[dict]) -> str:
     for entry in entries:
         if not isinstance(entry, dict):
             continue
-        key = entry.get("key") or entry.get("id") or "?"
-        entry_id = entry.get("id") or ""
+        key = _sanitize_for_fence(entry.get("key") or entry.get("id") or "?")
+        entry_id = _sanitize_for_fence(entry.get("id") or "")
         value = entry.get("value")
         # Prefer a human gist: snippet (FTS) → value.summary → value.title →
         # stringified value, then truncate so a fat entry can't dominate.
@@ -110,6 +127,7 @@ def _format_knowledge_block(entries: list[dict]) -> str:
         if not gist:
             gist = value if isinstance(value, str) else ""
         gist = " ".join(str(gist).split())  # collapse whitespace/newlines
+        gist = _sanitize_for_fence(gist)
         if len(gist) > 200:
             gist = gist[:200].rstrip() + "…"
         id_part = f" (id `{entry_id}`)" if entry_id else ""
