@@ -57,18 +57,63 @@ jobs:
 
       - name: Sanity-check that bundled modules shipped in the wheel
         run: |
-          import glob, sys, zipfile
-          whl = glob.glob("dist/*.whl")[0]
-          names = zipfile.ZipFile(whl).namelist()
-          # Every bundled module must carry its module.yaml into the wheel,
-          # otherwise discover_modules() finds nothing at runtime.
-          yamls = [n for n in names if n.endswith("module.yaml")]
-          if not yamls:
-              sys.exit("::error::No module.yaml files found in wheel — "
-                       "package-data glob for modules/** is broken.")
-          print("Bundled modules in wheel:")
-          for n in sorted(yamls):
-              print(" ", n)
+          import glob, os, sys, zipfile
+          from pathlib import Path
+
+          # Enumerate the expected set of bundled files from the source
+          # tree: every module.yaml plus every file under each module's
+          # scripts/ dir. We compare these exactly against the wheel
+          # contents so a single dropped file (e.g. a missing script, or
+          # a module that lost its yaml) fails the release — not just the
+          # "no module.yaml at all" case.
+          src_root = Path("src/superpos_agent_core/modules")
+          if not src_root.is_dir():
+              sys.exit(f"::error::Source modules dir not found: {src_root}")
+
+          expected: set[str] = set()
+          module_dirs = sorted(p for p in src_root.iterdir() if p.is_dir())
+          if not module_dirs:
+              sys.exit(f"::error::No module directories under {src_root}")
+
+          for mod_dir in module_dirs:
+              yaml_path = mod_dir / "module.yaml"
+              if not yaml_path.is_file():
+                  sys.exit(
+                      f"::error::Source module {mod_dir.name!r} is missing "
+                      f"module.yaml at {yaml_path} — fix the source tree."
+                  )
+              # Wheel paths are POSIX, rooted at the package name.
+              rel = yaml_path.relative_to("src").as_posix()
+              expected.add(rel)
+
+              scripts_dir = mod_dir / "scripts"
+              if scripts_dir.is_dir():
+                  for script in scripts_dir.iterdir():
+                      if script.is_file():
+                          expected.add(script.relative_to("src").as_posix())
+
+          whl_matches = glob.glob("dist/*.whl")
+          if not whl_matches:
+              sys.exit("::error::No wheel found in dist/")
+          whl = whl_matches[0]
+          with zipfile.ZipFile(whl) as zf:
+              names = set(zf.namelist())
+
+          missing = sorted(expected - names)
+          if missing:
+              print("::error::Wheel is missing expected bundled module files:")
+              for n in missing:
+                  print(f"  - {n}")
+              print(
+                  "Fix the [tool.setuptools.package-data] globs in "
+                  "pyproject.toml so every module.yaml and scripts/* "
+                  "ships in the wheel."
+              )
+              sys.exit(1)
+
+          print(f"OK: all {len(expected)} expected bundled files present in {os.path.basename(whl)}:")
+          for n in sorted(expected):
+              print(f"  {n}")
         shell: python
 
       - uses: actions/upload-artifact@v4

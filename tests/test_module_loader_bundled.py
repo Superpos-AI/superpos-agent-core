@@ -66,6 +66,39 @@ def test_discover_includes_bundled_superpos_issues():
     assert "superpos-issues" in issues_mod.scripts
 
 
+def test_discover_finds_every_bundled_module_with_its_scripts():
+    """Belt-and-braces guard against an installed-package regression
+    where a bundled module silently loses its ``module.yaml`` or its
+    ``scripts/*`` files (e.g. a misconfigured package-data glob in
+    ``pyproject.toml``). The wheel release workflow also enforces this
+    against the built wheel, but exercising it here lets ``pytest`` catch
+    the same class of bug locally before tagging."""
+    bundled = Path(bundled_modules_dir())
+    assert bundled.is_dir(), f"bundled root missing: {bundled}"
+
+    source_module_dirs = sorted(p for p in bundled.iterdir() if p.is_dir())
+    assert source_module_dirs, f"no bundled module dirs under {bundled}"
+
+    discovered = {m.name: m for m in discover_modules(modules_dir=None)}
+
+    for mod_dir in source_module_dirs:
+        name = mod_dir.name
+        assert name in discovered, (
+            f"bundled module {name!r} not picked up by discover_modules() "
+            f"— is its module.yaml shipped?"
+        )
+        # Every script file under scripts/ must be exposed by the loader,
+        # not just be present on disk. Mirrors the wheel release guard.
+        scripts_dir = mod_dir / "scripts"
+        if scripts_dir.is_dir():
+            for script in scripts_dir.iterdir():
+                if script.is_file():
+                    assert script.name in discovered[name].scripts, (
+                        f"bundled module {name!r} is missing script "
+                        f"{script.name!r} in discover_modules() output"
+                    )
+
+
 def test_workspace_module_does_not_evict_bundled(tmp_path: Path):
     """A workspace module with a different name must coexist with bundled ones."""
     workspace = tmp_path / "modules"
