@@ -160,9 +160,18 @@ async def _run(args: argparse.Namespace) -> int:
             ))
 
         elif args.cmd == "update":
+            existing = await client.get_knowledge(args.entry_id)
+            existing_value = existing.get("value", {}) if isinstance(existing, dict) else {}
+            if not isinstance(existing_value, dict):
+                existing_value = {}
+            partial = _build_value(args)
+            merged = {**existing_value, **partial}
+            existing_meta = existing_value.get("metadata", {})
+            if isinstance(existing_meta, dict) and isinstance(partial.get("metadata"), dict):
+                merged["metadata"] = {**existing_meta, **partial["metadata"]}
             _print(await client.update_knowledge(
                 args.entry_id,
-                value=_build_value(args),
+                value=merged,
                 visibility=args.visibility,
                 ttl=args.ttl,
             ))

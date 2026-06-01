@@ -12,6 +12,7 @@ import argparse
 import importlib.util
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -105,3 +106,86 @@ def test_parser_update_takes_entry_id_and_optional_content():
     args = parser.parse_args(["update", "01ABC", "--summary", "s"])
     assert args.cmd == "update" and args.entry_id == "01ABC"
     assert args.content is None  # not required on update
+
+
+@pytest.mark.asyncio
+async def test_update_partial_flags_preserve_existing_fields(monkeypatch):
+    """A partial update (e.g. only --summary) must not drop existing fields."""
+    mod = _load_script()
+
+    existing_entry = {
+        "id": "01ABC",
+        "value": {
+            "title": "Original title",
+            "summary": "Original summary",
+            "content": "Rule: original content",
+            "tags": ["tag1", "tag2"],
+            "confidence": "high",
+            "metadata": {
+                "source": "knowledge_fillin",
+                "auto_generated": True,
+                "custom_field": "preserved",
+            },
+        },
+    }
+
+    mock_get = AsyncMock(return_value=existing_entry)
+    mock_update = AsyncMock(return_value={"id": "01ABC", "value": {}})
+    mock_close = AsyncMock()
+
+    monkeypatch.setenv("SUPERPOS_BASE_URL", "http://fake")
+    monkeypatch.setenv("SUPERPOS_HIVE_ID", "hive1")
+    monkeypatch.setenv("SUPERPOS_API_TOKEN", "tok")
+
+    with patch.object(mod.SuperposClient, "get_knowledge", mock_get), \
+         patch.object(mod.SuperposClient, "update_knowledge", mock_update), \
+         patch.object(mod.SuperposClient, "close", mock_close):
+        args = mod._build_parser().parse_args(["update", "01ABC", "--summary", "New summary"])
+        args.sort = None
+        await mod._run(args)
+
+    sent_value = mock_update.call_args.kwargs["value"]
+    assert sent_value["summary"] == "New summary"
+    assert sent_value["title"] == "Original title"
+    assert sent_value["content"] == "Rule: original content"
+    assert sent_value["tags"] == ["tag1", "tag2"]
+    assert sent_value["confidence"] == "high"
+    assert sent_value["metadata"]["custom_field"] == "preserved"
+    # source is re-stamped to agent_inline (correct: this write IS from the CLI)
+    assert sent_value["metadata"]["source"] == "agent_inline"
+
+
+@pytest.mark.asyncio
+async def test_update_full_value_flag_replaces_all_fields(monkeypatch):
+    """When --value supplies a full JSON object, it replaces existing fields."""
+    mod = _load_script()
+
+    existing_entry = {
+        "id": "01ABC",
+        "value": {
+            "title": "Old",
+            "content": "Old content",
+            "metadata": {"source": "knowledge_fillin"},
+        },
+    }
+
+    mock_get = AsyncMock(return_value=existing_entry)
+    mock_update = AsyncMock(return_value={"id": "01ABC", "value": {}})
+    mock_close = AsyncMock()
+
+    monkeypatch.setenv("SUPERPOS_BASE_URL", "http://fake")
+    monkeypatch.setenv("SUPERPOS_HIVE_ID", "hive1")
+    monkeypatch.setenv("SUPERPOS_API_TOKEN", "tok")
+
+    full_json = '{"title": "Brand new", "content": "Brand new content", "tags": ["fresh"]}'
+    with patch.object(mod.SuperposClient, "get_knowledge", mock_get), \
+         patch.object(mod.SuperposClient, "update_knowledge", mock_update), \
+         patch.object(mod.SuperposClient, "close", mock_close):
+        args = mod._build_parser().parse_args(["update", "01ABC", "--value", full_json])
+        args.sort = None
+        await mod._run(args)
+
+    sent_value = mock_update.call_args.kwargs["value"]
+    assert sent_value["title"] == "Brand new"
+    assert sent_value["content"] == "Brand new content"
+    assert sent_value["tags"] == ["fresh"]
