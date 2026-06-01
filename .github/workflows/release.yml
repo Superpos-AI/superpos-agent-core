@@ -61,11 +61,11 @@ jobs:
           from pathlib import Path
 
           # Enumerate the expected set of bundled files from the source
-          # tree: every module.yaml plus every file under each module's
-          # scripts/ dir. We compare these exactly against the wheel
-          # contents so a single dropped file (e.g. a missing script, or
-          # a module that lost its yaml) fails the release — not just the
-          # "no module.yaml at all" case.
+          # tree: every module.yaml, SKILL.md, and every file under each
+          # module's scripts/ dir. We compare these exactly against the
+          # wheel contents so a single dropped file (e.g. a missing
+          # script, a module that lost its yaml, or a SKILL.md that
+          # generate_modules_doc() relies on) fails the release.
           src_root = Path("src/superpos_agent_core/modules")
           if not src_root.is_dir():
               sys.exit(f"::error::Source modules dir not found: {src_root}")
@@ -85,6 +85,13 @@ jobs:
               # Wheel paths are POSIX, rooted at the package name.
               rel = yaml_path.relative_to("src").as_posix()
               expected.add(rel)
+
+              # SKILL.md is runtime-significant: generate_modules_doc()
+              # only emits the bundled skill path when this file is
+              # present. If it exists in the source tree it must ship.
+              skill_path = mod_dir / "SKILL.md"
+              if skill_path.is_file():
+                  expected.add(skill_path.relative_to("src").as_posix())
 
               scripts_dir = mod_dir / "scripts"
               if scripts_dir.is_dir():
@@ -106,8 +113,8 @@ jobs:
                   print(f"  - {n}")
               print(
                   "Fix the [tool.setuptools.package-data] globs in "
-                  "pyproject.toml so every module.yaml and scripts/* "
-                  "ships in the wheel."
+                  "pyproject.toml so every module.yaml, SKILL.md, and "
+                  "scripts/* ships in the wheel."
               )
               sys.exit(1)
 
