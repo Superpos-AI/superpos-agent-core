@@ -23,7 +23,7 @@ def test_format_block_renders_key_id_and_gist():
     block = poller._format_knowledge_block([
         {"id": "01ABC", "key": "decisions:x", "value": {"summary": "we chose X"}},
     ])
-    assert "## Relevant knowledge from the hive" in block
+    assert "## Retrieved knowledge (reference only" in block
     assert "`decisions:x`" in block
     assert "(id `01ABC`)" in block
     assert "we chose X" in block
@@ -87,7 +87,7 @@ def test_inject_prepends_block_and_passes_semantic_and_limit():
     client = _FakeClient(result=[{"key": "decisions:x", "value": {"summary": "chose X"}}])
     out = _inject(client, _Cfg(), "do the auth migration", "ORIGINAL PROMPT")
     assert out.endswith("---\n\nORIGINAL PROMPT")
-    assert "Relevant knowledge from the hive" in out
+    assert "Retrieved knowledge (reference only" in out
     assert client.calls[0]["semantic"] is True
     assert client.calls[0]["limit"] == 5
     assert client.calls[0]["q"] == "do the auth migration"
@@ -125,3 +125,27 @@ def test_inject_truncates_query_to_500_chars():
     client = _FakeClient(result=[])
     _inject(client, _Cfg(), "x" * 1000, "P")
     assert len(client.calls[0]["q"]) == 500
+
+
+# ── prompt-injection regression tests ─────────────────────────────────
+
+
+def test_format_block_marks_knowledge_as_untrusted():
+    """Regression: knowledge must be fenced as untrusted to prevent prompt injection."""
+    block = poller._format_knowledge_block([
+        {"key": "k", "value": {"summary": "some content"}},
+    ])
+    lower = block.lower()
+    # Must explicitly mark as untrusted / not instructions
+    assert "untrusted" in lower or "not instructions" in lower
+    assert "do not" in lower and "follow" in lower and "instructions" in lower
+    # Content must be fenced (in a code block) so it's quoted, not inline prose
+    assert "```" in block
+
+
+def test_format_block_does_not_say_authoritative():
+    """Regression: knowledge must NOT be presented as authoritative."""
+    block = poller._format_knowledge_block([
+        {"key": "k", "value": {"summary": "content"}},
+    ])
+    assert "authoritative" not in block.lower()
