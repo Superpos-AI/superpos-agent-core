@@ -73,12 +73,17 @@ def test_build_value_raw_value_is_base_and_flags_override():
     assert value["metadata"]["source"] == "agent_inline"
 
 
-def test_build_value_preserves_caller_metadata():
+def test_build_value_enforces_provenance_over_caller():
     mod = _load_script()
-    value = mod._build_value(_ns(value='{"metadata": {"source": "custom"}}', content="c"))
-    # setdefault must not clobber an explicit source the caller provided.
-    assert value["metadata"]["source"] == "custom"
+    value = mod._build_value(_ns(
+        value='{"metadata": {"source": "custom", "auto_generated": false, "extra": "kept"}}',
+        content="c",
+    ))
+    # Provenance fields are always overwritten regardless of caller input.
+    assert value["metadata"]["source"] == "agent_inline"
     assert value["metadata"]["auto_generated"] is True
+    # Other caller-supplied metadata fields survive.
+    assert value["metadata"]["extra"] == "kept"
 
 
 def test_default_scope_precedence(monkeypatch):
@@ -157,7 +162,9 @@ async def test_update_partial_flags_preserve_existing_fields(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_update_full_value_flag_replaces_all_fields(monkeypatch):
-    """When --value supplies a full JSON object, it replaces existing fields."""
+    """When --value supplies a full JSON object without individual flags,
+    it fully replaces existing fields — old fields must disappear and
+    get_knowledge is NOT called (no read-modify-write)."""
     mod = _load_script()
 
     existing_entry = {
@@ -165,7 +172,10 @@ async def test_update_full_value_flag_replaces_all_fields(monkeypatch):
         "value": {
             "title": "Old",
             "content": "Old content",
-            "metadata": {"source": "knowledge_fillin"},
+            "summary": "Old summary",
+            "tags": ["old_tag"],
+            "custom_field": "should_disappear",
+            "metadata": {"source": "knowledge_fillin", "custom_field": "old_meta"},
         },
     }
 
@@ -185,7 +195,67 @@ async def test_update_full_value_flag_replaces_all_fields(monkeypatch):
         args.sort = None
         await mod._run(args)
 
+    # get_knowledge should NOT be called — full replacement skips read-modify-write
+    mock_get.assert_not_called()
+
     sent_value = mock_update.call_args.kwargs["value"]
     assert sent_value["title"] == "Brand new"
     assert sent_value["content"] == "Brand new content"
     assert sent_value["tags"] == ["fresh"]
+    # Old fields must be gone
+    assert "summary" not in sent_value
+    assert "custom_field" not in sent_value
+    # Provenance metadata is stamped
+    assert sent_value["metadata"]["source"] == "agent_inline"
+    assert sent_value["metadata"]["auto_generated"] is True
+    # Old metadata fields must be gone (no merge with existing)
+    assert "custom_field" not in sent_value.get("metadata", {})
+
+
+@pytest.mark.asyncio
+async def test_update_value_with_flag_overrides_still_merges(monkeypatch):
+    """When --value is combined with individual flags (e.g. --summary),
+    the read-modify-write merge path is still used."""
+    mod = _load_script()
+
+    existing_entry = {
+        "id": "01ABC",
+        "value": {
+            "title": "old",
+            "summary": "old summary",
+            "content": "old content",
+            "metadata": {"source": "knowledge_fillin"},
+        },
+    }
+
+    mock_get = AsyncMock(return_value=existing_entry)
+    mock_update = AsyncMock(return_value={"id": "01ABC", "value": {}})
+    mock_close = AsyncMock()
+
+    monkeypatch.setenv("SUPERPOS_BASE_URL", "http://fake")
+    monkeypatch.setenv("SUPERPOS_HIVE_ID", "hive1")
+    monkeypatch.setenv("SUPERPOS_API_TOKEN", "tok")
+
+    with patch.object(mod.SuperposClient, "get_knowledge", mock_get), \
+         patch.object(mod.SuperposClient, "update_knowledge", mock_update), \
+         patch.object(mod.SuperposClient, "close", mock_close):
+        args = mod._build_parser().parse_args([
+            "update", "01ABC",
+            "--value", '{"title": "base"}',
+            "--summary", "new summary",
+        ])
+        args.sort = None
+        await mod._run(args)
+
+    # get_knowledge IS called because individual flags trigger read-modify-write
+    mock_get.assert_called_once()
+
+    sent_value = mock_update.call_args.kwargs["value"]
+    # --value provides title="base", --summary overrides summary
+    assert sent_value["title"] == "base"
+    assert sent_value["summary"] == "new summary"
+    # Existing field "content" is preserved via merge
+    assert sent_value["content"] == "old content"
+    # Provenance metadata stamped
+    assert sent_value["metadata"]["source"] == "agent_inline"
+    assert sent_value["metadata"]["auto_generated"] is True

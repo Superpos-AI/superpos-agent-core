@@ -95,8 +95,8 @@ def _build_value(args: argparse.Namespace) -> dict[str, Any]:
     meta = value.get("metadata")
     if not isinstance(meta, dict):
         meta = {}
-    meta.setdefault("source", "agent_inline")
-    meta.setdefault("auto_generated", True)
+    meta["source"] = "agent_inline"
+    meta["auto_generated"] = True
     value["metadata"] = meta
     return value
 
@@ -160,18 +160,27 @@ async def _run(args: argparse.Namespace) -> int:
             ))
 
         elif args.cmd == "update":
-            existing = await client.get_knowledge(args.entry_id)
-            existing_value = existing.get("value", {}) if isinstance(existing, dict) else {}
-            if not isinstance(existing_value, dict):
-                existing_value = {}
-            partial = _build_value(args)
-            merged = {**existing_value, **partial}
-            existing_meta = existing_value.get("metadata", {})
-            if isinstance(existing_meta, dict) and isinstance(partial.get("metadata"), dict):
-                merged["metadata"] = {**existing_meta, **partial["metadata"]}
+            has_individual_flags = any(
+                getattr(args, f, None) is not None
+                for f in ("title", "summary", "content", "tags", "confidence")
+            )
+            if args.value and not has_individual_flags:
+                # Full replacement: --value without individual field flags
+                final = _build_value(args)
+            else:
+                # Partial update: read-modify-write merge
+                existing = await client.get_knowledge(args.entry_id)
+                existing_value = existing.get("value", {}) if isinstance(existing, dict) else {}
+                if not isinstance(existing_value, dict):
+                    existing_value = {}
+                partial = _build_value(args)
+                final = {**existing_value, **partial}
+                existing_meta = existing_value.get("metadata", {})
+                if isinstance(existing_meta, dict) and isinstance(partial.get("metadata"), dict):
+                    final["metadata"] = {**existing_meta, **partial["metadata"]}
             _print(await client.update_knowledge(
                 args.entry_id,
-                value=merged,
+                value=final,
                 visibility=args.visibility,
                 ttl=args.ttl,
             ))
