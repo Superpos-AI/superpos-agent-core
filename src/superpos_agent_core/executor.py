@@ -99,6 +99,18 @@ class Executor(abc.ABC):
         """
         return {"projects": 0, "session_env": 0, "bytes_freed": 0}
 
+    def model_info(self) -> dict[str, str] | None:
+        """Report the agent's *current* LLM model/effort for the heartbeat.
+
+        The poller forwards this to Superpos on every heartbeat so the
+        dashboard reflects live model state — including mid-session
+        ``/model`` / ``/effort`` switches.  Default returns ``None`` so
+        agents without a tunable model send nothing (back-compat).  Agents
+        backed by a ``RuntimeConfig`` override to return
+        ``{"model": ..., "effort": ...}``.
+        """
+        return None
+
     # ── Concrete: shared bookkeeping ───────────────────────────────────
 
     @property
