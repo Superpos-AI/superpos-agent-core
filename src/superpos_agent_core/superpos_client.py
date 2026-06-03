@@ -229,8 +229,24 @@ class SuperposClient:
         )
         return resp.json()
 
-    async def heartbeat(self) -> None:
-        await self._request("POST", "/api/v1/agents/heartbeat")
+    async def heartbeat(
+        self, *, model: str | None = None, effort: str | None = None,
+    ) -> None:
+        """Ping Superpos to stay online.
+
+        Optionally reports the agent's current model/effort so the dashboard
+        reflects live model state.  Fields are omitted when ``None`` — an
+        older backend ignores unknown keys, and an agent with no tunable
+        model sends the original empty body.
+        """
+        body: dict[str, Any] = {}
+        if model:
+            body["model"] = model
+        if effort:
+            body["effort"] = effort
+        await self._request(
+            "POST", "/api/v1/agents/heartbeat", json=body or None,
+        )
 
     async def update_status(self, status: str) -> None:
         """Update agent status (online/busy/idle/offline/error)."""

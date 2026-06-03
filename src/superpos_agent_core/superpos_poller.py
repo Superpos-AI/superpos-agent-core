@@ -254,7 +254,10 @@ async def run_superpos_poller(
     try:
         while True:
             try:
-                await superpos.heartbeat()
+                info = executor.model_info() or {}
+                await superpos.heartbeat(
+                    model=info.get("model"), effort=info.get("effort"),
+                )
             except Exception:
                 log.exception("Heartbeat failed")
 

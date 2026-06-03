@@ -19,8 +19,9 @@ class _FakeClient:
         self._persona_versions = list(persona_versions)
         self.heartbeats = 0
 
-    async def heartbeat(self):
+    async def heartbeat(self, *, model=None, effort=None):
         self.heartbeats += 1
+        self.last_heartbeat = {"model": model, "effort": effort}
 
     async def get_persona_version(self, **kwargs):
         if not self._persona_versions:
@@ -46,6 +47,9 @@ class _FakeExecutor:
 
     def update_persona(self, prompt, version=None):
         self.persona_updates.append((prompt, version))
+
+    def model_info(self):
+        return None
 
     def has_superpos_task(self, task_id):
         return task_id in self._tasks
@@ -156,3 +160,53 @@ async def test_persona_change_triggers_resync(monkeypatch):
         await task
 
     assert len(calls) == 2, f"expected 2 resync calls (first-poll + change), got {len(calls)}"
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_forwards_executor_model_info(monkeypatch):
+    """The poller forwards executor.model_info() into the heartbeat call."""
+    monkeypatch.setattr(poller, "_resync_sub_agents", lambda *a, **k: None)
+
+    client = _FakeClient(persona_versions=[{"changed": False, "version": None}])
+    executor = _FakeExecutor()
+    # Executor reports a live model/effort (as a RuntimeConfig-backed agent would).
+    executor.model_info = lambda: {"model": "claude-opus-4-6", "effort": "high"}
+    config = _FakeConfig()
+
+    task = asyncio.create_task(
+        poller.run_superpos_poller(client, executor, config)
+    )
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if client.heartbeats:
+            break
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert client.heartbeats >= 1
+    assert client.last_heartbeat == {"model": "claude-opus-4-6", "effort": "high"}
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_omits_model_when_none(monkeypatch):
+    """Agents with no tunable model send a bare heartbeat (None fields)."""
+    monkeypatch.setattr(poller, "_resync_sub_agents", lambda *a, **k: None)
+
+    client = _FakeClient(persona_versions=[{"changed": False, "version": None}])
+    executor = _FakeExecutor()  # model_info() returns None by default
+    config = _FakeConfig()
+
+    task = asyncio.create_task(
+        poller.run_superpos_poller(client, executor, config)
+    )
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if client.heartbeats:
+            break
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert client.heartbeats >= 1
+    assert client.last_heartbeat == {"model": None, "effort": None}
