@@ -174,25 +174,46 @@ def _cached_connection_id() -> str | None:
 # ── token minting (cached) ────────────────────────────────────────────
 
 
+def _cache_matches(cached: dict[str, Any] | None, conn_id: str) -> bool:
+    """A cached token is reusable only when it is fresh *and* was minted for
+    the connection we are about to use."""
+    return bool(
+        cached
+        and cached.get("connection_id") == conn_id
+        and _is_fresh(cached.get("expires_at"))
+    )
+
+
 async def _mint_token() -> str | None:
     """Return a fresh installation token, minting via the broker if needed.
 
     The broker issues an installation-wide token (it does not honour per-repo
-    scoping), so a single cached token is reused for every repository.
+    scoping), so a single cached token is reused for every repository — but
+    only while it belongs to the connection currently selected.  A token minted
+    for one ``github_app`` connection must never be reused after
+    ``SUPERPOS_GITHUB_CONNECTION_ID`` (or discovery) selects a different one.
     """
     cache_path = _token_cache_path()
     cached = _read_json(cache_path)
-    if cached and _is_fresh(cached.get("expires_at")):
-        return cached.get("token")
+
+    # Resolve the target connection first; a cached token is only valid for the
+    # connection it was minted from.  ``_cached_connection_id`` reads an env
+    # override or setup's cached resolution, so this common path stays offline.
+    conn_id = _cached_connection_id()
+    if conn_id and _cache_matches(cached, conn_id):
+        return cached["token"]
 
     client = SuperposClient(_config_from_env())
     try:
-        conn_id = _cached_connection_id()
         if not conn_id:
             conn = await _resolve_app_connection(client)
             if not conn:
                 return None
             conn_id = conn["id"]
+            # Discovery may have produced the connection the cached token
+            # already belongs to — reuse it instead of minting again.
+            if _cache_matches(cached, conn_id):
+                return cached["token"]
         result = await client.mint_github_token(conn_id)
     finally:
         await client.close()
@@ -201,7 +222,12 @@ async def _mint_token() -> str | None:
     if not token:
         return None
     _write_json_private(
-        cache_path, {"token": token, "expires_at": result.get("expires_at")}
+        cache_path,
+        {
+            "token": token,
+            "expires_at": result.get("expires_at"),
+            "connection_id": conn_id,
+        },
     )
     return token
 

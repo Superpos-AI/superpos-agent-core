@@ -42,15 +42,62 @@ def test_is_fresh_false_on_missing_or_bad(value):
 # ── token cache reuse (no minting) ──────────────────────────────────────
 
 
-async def test_mint_token_reuses_fresh_cache(tmp_path, monkeypatch):
+async def test_mint_token_reuses_cache_for_same_connection(tmp_path, monkeypatch):
     monkeypatch.setenv("SUPERPOS_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("SUPERPOS_GITHUB_CONNECTION_ID", "conn-1")
     cache = ga._token_cache_path()
-    cache.write_text(json.dumps({"token": "cached_tok", "expires_at": _iso(3600)}))
-
-    # If it tried to mint, constructing SuperposClient with no env would blow up;
-    # a clean return proves the cache short-circuited the network path.
+    cache.write_text(
+        json.dumps(
+            {"token": "cached_tok", "expires_at": _iso(3600), "connection_id": "conn-1"}
+        )
+    )
+    # No SUPERPOS_BASE_URL → constructing a client would blow up; reusing the
+    # cache must short-circuit before any network path.
     monkeypatch.delenv("SUPERPOS_BASE_URL", raising=False)
     assert await ga._mint_token() == "cached_tok"
+
+
+class _FakeMintClient:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def mint_github_token(self, conn_id):
+        return {"token": f"tok_for_{conn_id}", "expires_at": _iso(3600)}
+
+    async def close(self):
+        pass
+
+
+async def test_mint_token_skips_cache_for_other_connection(tmp_path, monkeypatch):
+    monkeypatch.setenv("SUPERPOS_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("SUPERPOS_BASE_URL", "https://hive.example")
+    monkeypatch.setenv("SUPERPOS_HIVE_ID", "hive-1")
+    monkeypatch.setenv("SUPERPOS_API_TOKEN", "api-tok")
+    monkeypatch.setenv("SUPERPOS_GITHUB_CONNECTION_ID", "conn-new")
+    cache = ga._token_cache_path()
+    cache.write_text(
+        json.dumps(
+            {"token": "stale_tok", "expires_at": _iso(3600), "connection_id": "conn-old"}
+        )
+    )
+    monkeypatch.setattr(ga, "SuperposClient", _FakeMintClient)
+
+    assert await ga._mint_token() == "tok_for_conn-new"
+    # The cache is rewritten and now belongs to the connection we actually used.
+    assert json.loads(cache.read_text())["connection_id"] == "conn-new"
+
+
+async def test_mint_token_ignores_legacy_cache_without_connection_id(tmp_path, monkeypatch):
+    monkeypatch.setenv("SUPERPOS_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("SUPERPOS_BASE_URL", "https://hive.example")
+    monkeypatch.setenv("SUPERPOS_HIVE_ID", "hive-1")
+    monkeypatch.setenv("SUPERPOS_API_TOKEN", "api-tok")
+    monkeypatch.setenv("SUPERPOS_GITHUB_CONNECTION_ID", "conn-1")
+    cache = ga._token_cache_path()
+    cache.write_text(json.dumps({"token": "legacy_tok", "expires_at": _iso(3600)}))
+    monkeypatch.setattr(ga, "SuperposClient", _FakeMintClient)
+
+    assert await ga._mint_token() == "tok_for_conn-1"
 
 
 def test_token_cache_is_installation_wide(tmp_path, monkeypatch):
