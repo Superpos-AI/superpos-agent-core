@@ -1248,6 +1248,105 @@ class SuperposClient:
             kwargs["headers"] = headers
         return await self._request(method, endpoint, **kwargs)
 
+    # ── GitHub (service catalog + token broker) ───────────────────────
+
+    async def list_github_connections(
+        self,
+        *,
+        status: str = "active",
+    ) -> list[dict[str, Any]]:
+        """``GET /hives/{hive}/services?type=github`` — GitHub service connections.
+
+        Each record carries ``id`` (the ``service_connection_id`` the token
+        broker expects), ``name`` (the key the credentialed proxy resolves on),
+        and ``metadata.auth_type`` (``github_app`` connections can be brokered
+        into short-lived installation tokens; ``token``/PAT connections cannot —
+        they must go through the proxy or the static ``GITHUB_TOKEN`` fallback).
+
+        The services catalog is paginated (Laravel's default ``per_page`` is
+        15), so a single request would silently miss GitHub connections beyond
+        the first page.  We request a large page size and walk every page,
+        following the response ``meta`` (``has_more`` / ``current_page`` /
+        ``last_page``) and falling back to the returned batch size so an absent
+        or unfamiliar ``meta`` can never loop forever.
+
+        Requires the ``services.read`` permission; returns ``[]`` if the agent
+        lacks it or no GitHub connection exists.
+        """
+        hive = self._config.superpos_hive_id
+        per_page = 100
+        items: list[dict[str, Any]] = []
+        page = 1
+        while True:
+            try:
+                resp = await self._request(
+                    "GET",
+                    f"/api/v1/hives/{hive}/services",
+                    params={
+                        "type": "github",
+                        "status": status,
+                        "page": page,
+                        "per_page": per_page,
+                    },
+                )
+            except httpx.HTTPStatusError as exc:
+                # 403 → no services.read; treat as "nothing discoverable" so
+                # callers fall back to GITHUB_TOKEN rather than crash.
+                if exc.response.status_code in (401, 403):
+                    log.info(
+                        "GitHub connection discovery unavailable (HTTP %d) — "
+                        "falling back to static credentials",
+                        exc.response.status_code,
+                    )
+                    return []
+                raise
+            data = resp.json()
+            if isinstance(data, dict):
+                batch = data.get("data", [])
+                meta = data.get("meta") or {}
+            else:
+                batch = data
+                meta = {}
+            if not isinstance(batch, list):
+                break
+            items.extend(batch)
+
+            has_more = meta.get("has_more")
+            if has_more is None:
+                current = meta.get("current_page")
+                last = meta.get("last_page") or meta.get("total_pages")
+                if current is not None and last is not None:
+                    has_more = current < last
+                else:
+                    # No usable meta — stop once a page comes back short, which
+                    # also covers the empty-page terminator.
+                    has_more = len(batch) >= per_page
+            if not has_more:
+                break
+            page += 1
+        return items
+
+    async def mint_github_token(
+        self,
+        service_connection_id: str,
+    ) -> dict[str, Any]:
+        """``POST /github/installation-token`` — mint a short-lived App token.
+
+        Returns ``{"token": "...", "expires_at": "<iso8601>", ...}``.  The
+        broker issues an **installation-wide** token — it does not scope to a
+        single repository — so the token grants access to every repo the
+        GitHub App installation can reach.  Only works for ``github_app``
+        connections; the broker fails closed for PAT-backed
+        (``auth_type=token``) connections — those must use the proxy or the
+        static ``GITHUB_TOKEN`` fallback.
+        """
+        body: dict[str, Any] = {"service_connection_id": service_connection_id}
+        resp = await self._request(
+            "POST", "/api/v1/github/installation-token", json=body,
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
     # ── Drain mode (graceful shutdown) ────────────────────────────────
 
     async def enter_drain(
