@@ -78,6 +78,12 @@ async def _resolve_or_create_thread(client: SuperposClient, issue_id: str) -> st
     with no thread transparently creates a thread and links it back to the
     issue (``update_issue(thread_id=...)``) before the message is appended —
     mirroring the dashboard's lazy ``start-discussion`` behaviour.
+
+    Two agents can race here: both read ``thread_id=None``, each create a
+    thread, and the later ``update_issue`` overwrites the earlier link. To
+    avoid appending into an orphaned thread (and silently losing the message
+    from the issue's ``discussion``), re-fetch after linking and return
+    whichever thread the issue now authoritatively points to.
     """
     issue = await client.get_issue(issue_id)
     thread_id = issue.get("thread_id")
@@ -85,9 +91,13 @@ async def _resolve_or_create_thread(client: SuperposClient, issue_id: str) -> st
         return thread_id
 
     thread = await client.create_thread(title=f"Discussion: {issue.get('title', issue_id)}")
-    thread_id = thread["id"]
-    await client.update_issue(issue_id, thread_id=thread_id)
-    return thread_id
+    new_thread_id = thread["id"]
+    await client.update_issue(issue_id, thread_id=new_thread_id)
+
+    # Re-read the issue so a concurrent first-comment writer that won the link
+    # is respected: append into the issue's current thread, not our local one.
+    issue = await client.get_issue(issue_id)
+    return issue.get("thread_id") or new_thread_id
 
 
 async def _run(args: argparse.Namespace) -> int:
@@ -187,6 +197,7 @@ async def _run(args: argparse.Namespace) -> int:
         elif args.cmd == "attachments":
             _print(await client.list_attachments(
                 issue_id=args.issue_id,
+                page=args.page,
                 per_page=args.per_page,
             ))
 
@@ -316,6 +327,7 @@ def _build_parser() -> argparse.ArgumentParser:
     # attachments
     p_atts = sub.add_parser("attachments", help="List files attached to an issue")
     p_atts.add_argument("--issue-id", required=True, help="Issue whose attachments to list")
+    p_atts.add_argument("--page", type=int, help="1-based page index (see meta.current_page / meta.last_page)")
     p_atts.add_argument("--per-page", type=int, help="Page size (server caps at 100)")
 
     # detach

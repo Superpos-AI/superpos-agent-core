@@ -65,6 +65,9 @@ def test_parser_attachments_requires_issue_id():
         parser.parse_args(["attachments"])
     args = parser.parse_args(["attachments", "--issue-id", "i1", "--per-page", "10"])
     assert args.cmd == "attachments" and args.issue_id == "i1" and args.per_page == 10
+    assert args.page is None
+    paged = parser.parse_args(["attachments", "--issue-id", "i1", "--page", "2", "--per-page", "10"])
+    assert paged.page == 2 and paged.per_page == 10
 
 
 def test_parser_detach_takes_positional_id():
@@ -114,7 +117,24 @@ async def test_attachments_calls_list_attachments(monkeypatch):
         rc = await mod._run(args)
 
     assert rc == 0
-    mock_list.assert_awaited_once_with(issue_id="i1", per_page=None)
+    mock_list.assert_awaited_once_with(issue_id="i1", page=None, per_page=None)
+
+
+@pytest.mark.asyncio
+async def test_attachments_forwards_page(monkeypatch):
+    mod = _load_script()
+    _set_env(monkeypatch)
+
+    mock_list = AsyncMock(return_value={"data": [], "meta": {"current_page": 2}})
+    with patch.object(mod.SuperposClient, "list_attachments", mock_list), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        args = mod._build_parser().parse_args(
+            ["attachments", "--issue-id", "i1", "--page", "2", "--per-page", "25"],
+        )
+        rc = await mod._run(args)
+
+    assert rc == 0
+    mock_list.assert_awaited_once_with(issue_id="i1", page=2, per_page=25)
 
 
 @pytest.mark.asyncio
@@ -156,12 +176,46 @@ async def test_comment_creates_and_links_thread_when_none(monkeypatch):
         rc = await mod._run(args)
 
     assert rc == 0
-    mock_get.assert_awaited_once_with("i1")
+    # fetched once to discover no thread, then re-fetched after linking
+    assert mock_get.await_count == 2
+    mock_get.assert_awaited_with("i1")
     mock_create_thread.assert_awaited_once()
     # thread linked back onto the issue
     mock_update.assert_awaited_once_with("i1", thread_id="th-1")
     # message appended to the newly created thread
     mock_append.assert_awaited_once_with("th-1", "hi")
+
+
+@pytest.mark.asyncio
+async def test_comment_reuses_winning_thread_on_concurrent_first_comment(monkeypatch):
+    """Concurrent first comments: we create + link our own thread, but a
+    racing caller's link won. The re-fetch must make us append into the
+    issue's authoritative thread, not our orphaned local one — otherwise the
+    message is lost from the issue's discussion."""
+    mod = _load_script()
+    _set_env(monkeypatch)
+
+    # 1st get: no thread yet. 2nd get (post-link): a different thread won.
+    mock_get = AsyncMock(side_effect=[
+        {"id": "i1", "title": "Bug", "thread_id": None},
+        {"id": "i1", "title": "Bug", "thread_id": "th-winner"},
+    ])
+    mock_create_thread = AsyncMock(return_value={"id": "th-mine"})
+    mock_update = AsyncMock(return_value={"id": "i1", "thread_id": "th-mine"})
+    mock_append = AsyncMock(return_value={"id": "msg-9"})
+
+    with patch.object(mod.SuperposClient, "get_issue", mock_get), \
+         patch.object(mod.SuperposClient, "create_thread", mock_create_thread), \
+         patch.object(mod.SuperposClient, "update_issue", mock_update), \
+         patch.object(mod.SuperposClient, "append_thread_message", mock_append), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        args = mod._build_parser().parse_args(["comment", "--issue-id", "i1", "--message", "hi"])
+        rc = await mod._run(args)
+
+    assert rc == 0
+    assert mock_get.await_count == 2
+    # appended into the winning thread, NOT our locally created th-mine
+    mock_append.assert_awaited_once_with("th-winner", "hi")
 
 
 @pytest.mark.asyncio

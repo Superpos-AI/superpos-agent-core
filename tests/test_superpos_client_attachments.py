@@ -118,6 +118,26 @@ async def test_list_attachments_filters_by_issue_id():
     await client.close()
 
 
+async def test_list_attachments_forwards_page():
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return _envelope(
+            [{"id": "att-3", "issue_id": "i1"}],
+            meta={"total": 120, "current_page": 2, "last_page": 3},
+        )
+
+    client = _make_client(handler)
+    result = await client.list_attachments(issue_id="i1", page=2, per_page=50)
+
+    req = captured[0]
+    assert req.url.params["page"] == "2"
+    assert req.url.params["per_page"] == "50"
+    assert result["meta"]["current_page"] == 2
+    await client.close()
+
+
 async def test_list_attachments_no_filters_sends_no_params():
     captured: list[httpx.Request] = []
 

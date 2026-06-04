@@ -915,11 +915,14 @@ class SuperposClient:
         issue_id: str | None = None,
         task_id: str | None = None,
         search: str | None = None,
+        page: int | None = None,
         per_page: int | None = None,
     ) -> dict[str, Any]:
         """``GET /attachments`` — list attachments, optionally filtered.
 
         Returns the full envelope (callers need ``meta`` for pagination).
+        Use ``page`` to walk past the first page (see ``meta.current_page`` /
+        ``meta.last_page``).
         """
         hive = self._config.superpos_hive_id
         params: dict[str, Any] = {}
@@ -929,6 +932,8 @@ class SuperposClient:
             params["task_id"] = task_id
         if search is not None:
             params["search"] = search
+        if page is not None:
+            params["page"] = page
         if per_page is not None:
             params["per_page"] = per_page
         resp = await self._request(

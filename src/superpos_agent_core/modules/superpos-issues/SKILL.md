@@ -178,6 +178,7 @@ get `meta` for pagination).
 ```bash
 superpos-issues attachments --issue-id 01HXYZ
 superpos-issues attachments --issue-id 01HXYZ --per-page 50
+superpos-issues attachments --issue-id 01HXYZ --page 2 --per-page 50   # advance past the first page
 ```
 
 ### `superpos-issues detach <attachment-id>`
