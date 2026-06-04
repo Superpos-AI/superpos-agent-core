@@ -1,0 +1,207 @@
+#!/usr/bin/env python3
+"""CLI for the GitHub REST API through Superpos's credential proxy.
+
+Every request is forwarded by ``POST/GET/... /api/v1/proxy/{service}/{path}``;
+Superpos injects the connection's stored credentials server-side, so this
+agent never sees a GitHub token.  This is the "Path B" complement to direct
+``git``/``gh`` (which authenticates with GITHUB_TOKEN or a broker-minted
+installation token — see ``superpos_agent_core.github_auth``).
+
+Subcommands:
+  connections                 List GitHub service connections in the hive.
+  api METHOD PATH             Raw GitHub REST call (e.g. api GET /user).
+  pr-list OWNER REPO          List pull requests.
+  pr-create OWNER REPO ...    Open a pull request.
+  issue-create OWNER REPO ... Open an issue.
+
+Prints JSON to stdout, errors to stderr.  Pipe through ``jq`` for follow-ups.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import sys
+from typing import Any
+
+# ``superpos_agent_core`` is pip-installed via the container's requirements.txt.
+from superpos_agent_core import BaseConfig, SuperposClient
+
+
+def _config_from_env() -> BaseConfig:
+    base_url = os.environ.get("SUPERPOS_BASE_URL", "").rstrip("/")
+    hive_id = os.environ.get("SUPERPOS_HIVE_ID", "")
+    token = os.environ.get("SUPERPOS_API_TOKEN", "")
+    if not (base_url and hive_id and token):
+        print(
+            "Error: SUPERPOS_BASE_URL, SUPERPOS_HIVE_ID, and "
+            "SUPERPOS_API_TOKEN must be set in the environment.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    return BaseConfig(
+        superpos_base_url=base_url,
+        superpos_hive_id=hive_id,
+        superpos_agent_id=os.environ.get("SUPERPOS_AGENT_ID", ""),
+        superpos_api_token=token,
+        superpos_refresh_token=os.environ.get("SUPERPOS_REFRESH_TOKEN", ""),
+    )
+
+
+def _print(value: Any) -> None:
+    print(json.dumps(value, indent=2, default=str))
+
+
+def _parse_json_arg(label: str, raw: str | None) -> Any:
+    if raw is None:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        print(f"Error: --{label} must be valid JSON ({e})", file=sys.stderr)
+        sys.exit(2)
+
+
+async def _resolve_service(client: SuperposClient, override: str | None) -> str:
+    """Pick the GitHub connection *name* the proxy resolves on.
+
+    Precedence: ``--service`` / ``SUPERPOS_GITHUB_SERVICE`` env, else the first
+    active GitHub connection discovered in the hive.
+    """
+    name = override or os.environ.get("SUPERPOS_GITHUB_SERVICE")
+    if name:
+        return name
+    conns = await client.list_github_connections()
+    if not conns:
+        print(
+            "Error: no active GitHub service connection found in this hive, "
+            "and no --service / SUPERPOS_GITHUB_SERVICE given.",
+            file=sys.stderr,
+        )
+        sys.exit(3)
+    return conns[0]["name"]
+
+
+async def _proxy(
+    client: SuperposClient,
+    service: str,
+    method: str,
+    path: str,
+    *,
+    params: dict[str, Any] | None = None,
+    body: Any = None,
+) -> Any:
+    resp = await client.service_request(
+        method, service, path.lstrip("/"), params=params, json=body
+    )
+    # GitHub always answers JSON for the REST API; fall back to text otherwise.
+    try:
+        return resp.json()
+    except ValueError:
+        return {"status_code": resp.status_code, "body": resp.text}
+
+
+async def _run(args: argparse.Namespace) -> int:
+    client = SuperposClient(_config_from_env())
+    try:
+        if args.cmd == "connections":
+            _print(await client.list_github_connections(status=args.status))
+            return 0
+
+        service = await _resolve_service(client, args.service)
+
+        if args.cmd == "api":
+            _print(await _proxy(
+                client, service, args.method.upper(), args.path,
+                params=_parse_json_arg("query", args.query),
+                body=_parse_json_arg("body", args.body),
+            ))
+
+        elif args.cmd == "pr-list":
+            params: dict[str, Any] = {"state": args.state}
+            if args.base:
+                params["base"] = args.base
+            _print(await _proxy(
+                client, service, "GET",
+                f"/repos/{args.owner}/{args.repo}/pulls", params=params,
+            ))
+
+        elif args.cmd == "pr-create":
+            _print(await _proxy(
+                client, service, "POST",
+                f"/repos/{args.owner}/{args.repo}/pulls",
+                body={
+                    "title": args.title,
+                    "head": args.head,
+                    "base": args.base,
+                    "body": args.body,
+                    "draft": args.draft,
+                },
+            ))
+
+        elif args.cmd == "issue-create":
+            _print(await _proxy(
+                client, service, "POST",
+                f"/repos/{args.owner}/{args.repo}/issues",
+                body={"title": args.title, "body": args.body},
+            ))
+        else:  # pragma: no cover
+            print(f"Unknown command: {args.cmd}", file=sys.stderr)
+            return 2
+    finally:
+        await client.close()
+    return 0
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="superpos-github", description=__doc__)
+    p.add_argument(
+        "--service",
+        default=None,
+        help="GitHub connection name (default: auto-discover; "
+        "or set SUPERPOS_GITHUB_SERVICE).",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    c = sub.add_parser("connections", help="List GitHub service connections.")
+    c.add_argument("--status", default="active", choices=["active", "inactive", "all"])
+
+    a = sub.add_parser("api", help="Raw GitHub REST call through the proxy.")
+    a.add_argument("method", help="HTTP method (GET, POST, PATCH, ...).")
+    a.add_argument("path", help="API path, e.g. /repos/o/r/pulls.")
+    a.add_argument("--query", default=None, help="Query params as a JSON object.")
+    a.add_argument("--body", default=None, help="Request body as JSON.")
+
+    pl = sub.add_parser("pr-list", help="List pull requests.")
+    pl.add_argument("owner")
+    pl.add_argument("repo")
+    pl.add_argument("--state", default="open", choices=["open", "closed", "all"])
+    pl.add_argument("--base", default=None, help="Filter by base branch.")
+
+    pc = sub.add_parser("pr-create", help="Open a pull request.")
+    pc.add_argument("owner")
+    pc.add_argument("repo")
+    pc.add_argument("--title", required=True)
+    pc.add_argument("--head", required=True, help="Source branch.")
+    pc.add_argument("--base", required=True, help="Target branch.")
+    pc.add_argument("--body", default="")
+    pc.add_argument("--draft", action="store_true")
+
+    ic = sub.add_parser("issue-create", help="Open an issue.")
+    ic.add_argument("owner")
+    ic.add_argument("repo")
+    ic.add_argument("--title", required=True)
+    ic.add_argument("--body", default="")
+
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
+    return asyncio.run(_run(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

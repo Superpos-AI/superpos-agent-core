@@ -1248,6 +1248,69 @@ class SuperposClient:
             kwargs["headers"] = headers
         return await self._request(method, endpoint, **kwargs)
 
+    # ── GitHub (service catalog + token broker) ───────────────────────
+
+    async def list_github_connections(
+        self,
+        *,
+        status: str = "active",
+    ) -> list[dict[str, Any]]:
+        """``GET /hives/{hive}/services?type=github`` — GitHub service connections.
+
+        Each record carries ``id`` (the ``service_connection_id`` the token
+        broker expects), ``name`` (the key the credentialed proxy resolves on),
+        and ``metadata.auth_type`` (``github_app`` connections can be brokered
+        into short-lived installation tokens; ``token``/PAT connections cannot —
+        they must go through the proxy or the static ``GITHUB_TOKEN`` fallback).
+
+        Requires the ``services.read`` permission; returns ``[]`` if the agent
+        lacks it or no GitHub connection exists.
+        """
+        hive = self._config.superpos_hive_id
+        try:
+            resp = await self._request(
+                "GET",
+                f"/api/v1/hives/{hive}/services",
+                params={"type": "github", "status": status},
+            )
+        except httpx.HTTPStatusError as exc:
+            # 403 → no services.read; treat as "nothing discoverable" so callers
+            # fall back to GITHUB_TOKEN rather than crash.
+            if exc.response.status_code in (401, 403):
+                log.info(
+                    "GitHub connection discovery unavailable (HTTP %d) — "
+                    "falling back to static credentials",
+                    exc.response.status_code,
+                )
+                return []
+            raise
+        data = resp.json()
+        items = data.get("data", data) if isinstance(data, dict) else data
+        return items if isinstance(items, list) else []
+
+    async def mint_github_token(
+        self,
+        service_connection_id: str,
+        *,
+        repo: str | None = None,
+    ) -> dict[str, Any]:
+        """``POST /github/installation-token`` — mint a short-lived App token.
+
+        Returns ``{"token": "...", "expires_at": "<iso8601>", ...}``.  Only
+        works for ``github_app`` connections; the broker fails closed for
+        PAT-backed (``auth_type=token``) connections — those must use the proxy
+        or the static ``GITHUB_TOKEN`` fallback.  Pass ``repo`` (``owner/name``)
+        to scope the installation token to a single repository when supported.
+        """
+        body: dict[str, Any] = {"service_connection_id": service_connection_id}
+        if repo is not None:
+            body["repo"] = repo
+        resp = await self._request(
+            "POST", "/api/v1/github/installation-token", json=body,
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
     # ── Drain mode (graceful shutdown) ────────────────────────────────
 
     async def enter_drain(
