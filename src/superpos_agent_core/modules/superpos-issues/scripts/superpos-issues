@@ -5,7 +5,9 @@ Subcommands mirror the client API:
   list, show, create, update, transition, close,
   link-task, link-channel, request-approval,
   add-dependency, remove-dependency,
-  types
+  types,
+  attach, attachments, detach,
+  comment, discussion
 
 Prints JSON to stdout, errors to stderr.  Designed for the LLM to call
 via Bash and pipe through ``jq`` for follow-up queries.
@@ -67,6 +69,25 @@ def _parse_json_arg(label: str, raw: str | None) -> dict[str, Any] | None:
               file=sys.stderr)
         sys.exit(2)
     return parsed
+
+
+async def _resolve_or_create_thread(client: SuperposClient, issue_id: str) -> str:
+    """Return the issue's discussion thread id, creating + linking one on demand.
+
+    Issues carry an optional ``thread_id``.  The first ``comment`` on an issue
+    with no thread transparently creates a thread and links it back to the
+    issue (``update_issue(thread_id=...)``) before the message is appended —
+    mirroring the dashboard's lazy ``start-discussion`` behaviour.
+    """
+    issue = await client.get_issue(issue_id)
+    thread_id = issue.get("thread_id")
+    if thread_id:
+        return thread_id
+
+    thread = await client.create_thread(title=f"Discussion: {issue.get('title', issue_id)}")
+    thread_id = thread["id"]
+    await client.update_issue(issue_id, thread_id=thread_id)
+    return thread_id
 
 
 async def _run(args: argparse.Namespace) -> int:
@@ -155,6 +176,35 @@ async def _run(args: argparse.Namespace) -> int:
 
         elif args.cmd == "types":
             _print(await client.list_issue_types())
+
+        elif args.cmd == "attach":
+            _print(await client.upload_attachment(
+                file_path=args.file,
+                issue_id=args.issue_id,
+                description=args.description,
+            ))
+
+        elif args.cmd == "attachments":
+            _print(await client.list_attachments(
+                issue_id=args.issue_id,
+                per_page=args.per_page,
+            ))
+
+        elif args.cmd == "detach":
+            await client.delete_attachment(args.attachment_id)
+            _print({"ok": True})
+
+        elif args.cmd == "comment":
+            thread_id = await _resolve_or_create_thread(client, args.issue_id)
+            _print(await client.append_thread_message(thread_id, args.message))
+
+        elif args.cmd == "discussion":
+            issue = await client.get_issue(args.issue_id)
+            thread_id = issue.get("thread_id")
+            if not thread_id:
+                _print({"thread_id": None, "messages": [], "note": "No discussion yet."})
+            else:
+                _print(await client.get_thread(thread_id))
 
         else:
             print(f"Unknown subcommand: {args.cmd}", file=sys.stderr)
@@ -256,6 +306,33 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # types
     sub.add_parser("types", help="List the hive's issue-type catalogue")
+
+    # attach
+    p_attach = sub.add_parser("attach", help="Upload a file and attach it to an issue")
+    p_attach.add_argument("--issue-id", required=True, help="Issue to attach the file to")
+    p_attach.add_argument("--file", required=True, help="Path to the local file to upload")
+    p_attach.add_argument("--description", help="Optional human-readable description")
+
+    # attachments
+    p_atts = sub.add_parser("attachments", help="List files attached to an issue")
+    p_atts.add_argument("--issue-id", required=True, help="Issue whose attachments to list")
+    p_atts.add_argument("--per-page", type=int, help="Page size (server caps at 100)")
+
+    # detach
+    p_detach = sub.add_parser("detach", help="Delete an attachment by id")
+    p_detach.add_argument("attachment_id")
+
+    # comment
+    p_comment = sub.add_parser(
+        "comment",
+        help="Post a discussion comment on an issue (auto-creates the thread on first comment)",
+    )
+    p_comment.add_argument("--issue-id", required=True)
+    p_comment.add_argument("--message", required=True, help="Comment body")
+
+    # discussion
+    p_disc = sub.add_parser("discussion", help="Print an issue's discussion history")
+    p_disc.add_argument("--issue-id", required=True)
 
     return parser
 

@@ -1,6 +1,6 @@
 ---
 name: superpos-issues
-description: Work with Superpos issues — open, triage, transition state, link to tasks/channels, request approval, and close them. Use when a task references an issue ID or asks you to file/resolve one.
+description: Work with Superpos issues — open, triage, transition state, link to tasks/channels, attach files, post/read discussion comments, request approval, and close them. Use when a task references an issue ID or asks you to file/resolve one.
 ---
 
 # Superpos Issues
@@ -155,6 +155,63 @@ List the hive's issue-type catalogue (id, key, label,
 `closure_policy`). Run this once when you need to `create` — you need
 the `issue_type_id`.
 
+## Attachments (files)
+
+Attach **files** to an issue — screenshots, logs, diffs, repro
+artifacts. Files only; there is no URL/link form. Requires the
+`attachments.read` / `attachments.write` permissions on the hive.
+
+### `superpos-issues attach --issue-id <id> --file <path>`
+
+Upload a local file and link it to the issue.
+
+```bash
+superpos-issues attach --issue-id 01HXYZ --file ./repro.png
+superpos-issues attach --issue-id 01HXYZ --file ./error.log --description "stack trace from the 502"
+```
+
+### `superpos-issues attachments --issue-id <id>`
+
+List the files attached to an issue (returns the full envelope, so you
+get `meta` for pagination).
+
+```bash
+superpos-issues attachments --issue-id 01HXYZ
+superpos-issues attachments --issue-id 01HXYZ --per-page 50
+```
+
+### `superpos-issues detach <attachment-id>`
+
+Delete an attachment (removes the file from storage and its record).
+
+```bash
+superpos-issues detach 01HATTACHMENTXYZ
+```
+
+## Discussion (comments)
+
+Post and read threaded discussion on an issue. Backed by the hive's
+thread API; requires the `threads.read` / `threads.write` permissions.
+The first comment on an issue with no thread **transparently creates and
+links** a discussion thread — you never manage `thread_id` by hand.
+
+### `superpos-issues comment --issue-id <id> --message <text>`
+
+Append a comment. Auto-creates + links the thread on first use.
+
+```bash
+superpos-issues comment --issue-id 01HXYZ --message "Confirmed the repro — patch incoming."
+```
+
+### `superpos-issues discussion --issue-id <id>`
+
+Print the issue's full comment history (or a "No discussion yet."
+marker if no thread exists).
+
+```bash
+superpos-issues discussion --issue-id 01HXYZ
+```
+
 ## Tips
 
 - **Read before you write.** `show` is cheap and tells you the current
@@ -172,3 +229,5 @@ the `issue_type_id`.
 
 - `SUPERPOS_*` env vars (already set in the container)
 - `issues.read` and/or `issues.manage` permission on the hive
+- `attachments.read` / `attachments.write` for `attach` / `attachments` / `detach`
+- `threads.read` / `threads.write` for `comment` / `discussion`

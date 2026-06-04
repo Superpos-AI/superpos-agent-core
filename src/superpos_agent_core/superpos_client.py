@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import warnings
 from typing import Any, Mapping
 
@@ -871,6 +872,76 @@ class SuperposClient:
         )
         data = resp.json()
         return data.get("data", data) if isinstance(data, dict) else data
+
+    # ── Attachments (file uploads) ────────────────────────────────────
+
+    async def upload_attachment(
+        self,
+        *,
+        file_path: str,
+        issue_id: str | None = None,
+        task_id: str | None = None,
+        description: str | None = None,
+    ) -> dict[str, Any]:
+        """``POST /attachments`` — multipart upload of a file.
+
+        Optionally associate the file with an issue (``issue_id``) and/or a
+        task (``task_id``); both must live in this hive or the server returns
+        422.  Only file attachments are supported — there is no URL/link form.
+        """
+        hive = self._config.superpos_hive_id
+        data: dict[str, Any] = {}
+        if issue_id is not None:
+            data["issue_id"] = issue_id
+        if task_id is not None:
+            data["task_id"] = task_id
+        if description is not None:
+            data["description"] = description
+
+        # httpx closes the handle when the request body is consumed.
+        with open(file_path, "rb") as fh:
+            resp = await self._request(
+                "POST",
+                f"/api/v1/hives/{hive}/attachments",
+                data=data or None,
+                files={"file": (os.path.basename(file_path), fh)},
+            )
+        body = resp.json()
+        return body.get("data", body) if isinstance(body, dict) else body
+
+    async def list_attachments(
+        self,
+        *,
+        issue_id: str | None = None,
+        task_id: str | None = None,
+        search: str | None = None,
+        per_page: int | None = None,
+    ) -> dict[str, Any]:
+        """``GET /attachments`` — list attachments, optionally filtered.
+
+        Returns the full envelope (callers need ``meta`` for pagination).
+        """
+        hive = self._config.superpos_hive_id
+        params: dict[str, Any] = {}
+        if issue_id is not None:
+            params["issue_id"] = issue_id
+        if task_id is not None:
+            params["task_id"] = task_id
+        if search is not None:
+            params["search"] = search
+        if per_page is not None:
+            params["per_page"] = per_page
+        resp = await self._request(
+            "GET", f"/api/v1/hives/{hive}/attachments", params=params or None,
+        )
+        return resp.json()
+
+    async def delete_attachment(self, attachment_id: str) -> None:
+        """``DELETE /attachments/{attachment}`` — remove a file + its record."""
+        hive = self._config.superpos_hive_id
+        await self._request(
+            "DELETE", f"/api/v1/hives/{hive}/attachments/{attachment_id}",
+        )
 
     # ── Workflows ─────────────────────────────────────────────────────
 

@@ -1,4 +1,4 @@
-description: "Superpos issue tracker — list, create, transition, close, and link issues in the hive's issue board."
+description: "Superpos issue tracker — list, create, transition, close, and link issues; attach files; and post/read discussion comments on the hive's issue board."
 env:
   - SUPERPOS_BASE_URL
   - SUPERPOS_HIVE_ID
