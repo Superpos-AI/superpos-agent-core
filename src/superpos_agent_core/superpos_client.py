@@ -1291,20 +1291,18 @@ class SuperposClient:
     async def mint_github_token(
         self,
         service_connection_id: str,
-        *,
-        repo: str | None = None,
     ) -> dict[str, Any]:
         """``POST /github/installation-token`` — mint a short-lived App token.
 
-        Returns ``{"token": "...", "expires_at": "<iso8601>", ...}``.  Only
-        works for ``github_app`` connections; the broker fails closed for
-        PAT-backed (``auth_type=token``) connections — those must use the proxy
-        or the static ``GITHUB_TOKEN`` fallback.  Pass ``repo`` (``owner/name``)
-        to scope the installation token to a single repository when supported.
+        Returns ``{"token": "...", "expires_at": "<iso8601>", ...}``.  The
+        broker issues an **installation-wide** token — it does not scope to a
+        single repository — so the token grants access to every repo the
+        GitHub App installation can reach.  Only works for ``github_app``
+        connections; the broker fails closed for PAT-backed
+        (``auth_type=token``) connections — those must use the proxy or the
+        static ``GITHUB_TOKEN`` fallback.
         """
         body: dict[str, Any] = {"service_connection_id": service_connection_id}
-        if repo is not None:
-            body["repo"] = repo
         resp = await self._request(
             "POST", "/api/v1/github/installation-token", json=body,
         )

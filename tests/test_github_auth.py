@@ -44,13 +44,20 @@ def test_is_fresh_false_on_missing_or_bad(value):
 
 async def test_mint_token_reuses_fresh_cache(tmp_path, monkeypatch):
     monkeypatch.setenv("SUPERPOS_STATE_DIR", str(tmp_path))
-    cache = ga._token_cache_path(None)
+    cache = ga._token_cache_path()
     cache.write_text(json.dumps({"token": "cached_tok", "expires_at": _iso(3600)}))
 
     # If it tried to mint, constructing SuperposClient with no env would blow up;
     # a clean return proves the cache short-circuited the network path.
     monkeypatch.delenv("SUPERPOS_BASE_URL", raising=False)
-    assert await ga._mint_token(None) == "cached_tok"
+    assert await ga._mint_token() == "cached_tok"
+
+
+def test_token_cache_is_installation_wide(tmp_path, monkeypatch):
+    monkeypatch.setenv("SUPERPOS_STATE_DIR", str(tmp_path))
+    # A single installation-wide cache file — no per-repo variants, because the
+    # broker issues installation-wide tokens rather than repo-scoped ones.
+    assert ga._token_cache_path().name == "token.json"
 
 
 # ── credential helper protocol ──────────────────────────────────────────
@@ -65,13 +72,15 @@ def _run_credential(monkeypatch, stdin_text):
 
 
 def test_credential_get_emits_token_for_github(monkeypatch):
-    seen = {}
+    calls = {"n": 0}
 
-    async def fake_mint(repo):
-        seen["repo"] = repo
+    async def fake_mint():
+        calls["n"] += 1
         return "TKN123"
 
     monkeypatch.setattr(ga, "_mint_token", fake_mint)
+    # A repo path is supplied, but the helper must ignore it: the broker token
+    # is installation-wide, so minting takes no repo argument.
     rc, out = _run_credential(
         monkeypatch, "protocol=https\nhost=github.com\npath=acme/widgets.git\n\n"
     )
@@ -79,12 +88,11 @@ def test_credential_get_emits_token_for_github(monkeypatch):
     assert rc == 0
     assert "username=x-access-token" in out
     assert "password=TKN123" in out
-    # useHttpPath gives us owner/repo with the .git stripped → repo-scoped mint.
-    assert seen["repo"] == "acme/widgets"
+    assert calls["n"] == 1
 
 
 def test_credential_get_ignores_other_hosts(monkeypatch):
-    async def fake_mint(repo):  # pragma: no cover - must not be called
+    async def fake_mint():  # pragma: no cover - must not be called
         raise AssertionError("should not mint for non-github host")
 
     monkeypatch.setattr(ga, "_mint_token", fake_mint)
@@ -103,7 +111,7 @@ def test_credential_store_and_erase_are_noops():
 
 def test_token_command_prefers_static(monkeypatch, capsys):
     monkeypatch.setenv("GITHUB_TOKEN", "ghp_static")
-    assert ga.cmd_token(None) == 0
+    assert ga.cmd_token() == 0
     assert capsys.readouterr().out == "ghp_static"
 
 

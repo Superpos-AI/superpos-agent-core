@@ -78,27 +78,15 @@ async def test_mint_github_token_posts_and_unwraps():
         )
 
     client = _make_client(handler)
-    result = await client.mint_github_token("c1", repo="acme/widgets")
+    result = await client.mint_github_token("c1")
 
     req = captured[0]
     assert req.method == "POST"
     assert req.url.path == "/api/v1/github/installation-token"
     import json as _json
     body = _json.loads(req.content)
-    assert body == {"service_connection_id": "c1", "repo": "acme/widgets"}
+    # The broker mints an installation-wide token; the request carries only the
+    # connection id (no repo scope, which the broker does not honour).
+    assert body == {"service_connection_id": "c1"}
     assert result["token"] == "ghs_minted"
-    await client.close()
-
-
-async def test_mint_github_token_omits_repo_when_absent():
-    captured: list[httpx.Request] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        captured.append(request)
-        return httpx.Response(200, json={"data": {"token": "t", "expires_at": "x"}})
-
-    client = _make_client(handler)
-    await client.mint_github_token("c1")
-    import json as _json
-    assert _json.loads(captured[0].content) == {"service_connection_id": "c1"}
     await client.close()

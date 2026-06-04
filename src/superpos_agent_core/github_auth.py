@@ -95,11 +95,11 @@ def _connection_cache_path() -> Path:
     return _state_dir() / "connection.json"
 
 
-def _token_cache_path(repo: str | None) -> Path:
-    # One cache file per repo scope (or "_org" for an unscoped token), so a
-    # repo-scoped token for A is never reused for repo B.
-    slug = repo.replace("/", "__") if repo else "_org"
-    return _state_dir() / f"token-{slug}.json"
+def _token_cache_path() -> Path:
+    # Single installation-wide token cache: the broker mints installation
+    # tokens that are not scoped to a single repo, so one cached token serves
+    # every repository the App installation can reach.
+    return _state_dir() / "token.json"
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
@@ -174,9 +174,13 @@ def _cached_connection_id() -> str | None:
 # ── token minting (cached) ────────────────────────────────────────────
 
 
-async def _mint_token(repo: str | None) -> str | None:
-    """Return a fresh installation token, minting via the broker if needed."""
-    cache_path = _token_cache_path(repo)
+async def _mint_token() -> str | None:
+    """Return a fresh installation token, minting via the broker if needed.
+
+    The broker issues an installation-wide token (it does not honour per-repo
+    scoping), so a single cached token is reused for every repository.
+    """
+    cache_path = _token_cache_path()
     cached = _read_json(cache_path)
     if cached and _is_fresh(cached.get("expires_at")):
         return cached.get("token")
@@ -189,7 +193,7 @@ async def _mint_token(repo: str | None) -> str | None:
             if not conn:
                 return None
             conn_id = conn["id"]
-        result = await client.mint_github_token(conn_id, repo=repo)
+        result = await client.mint_github_token(conn_id)
     finally:
         await client.close()
 
@@ -230,9 +234,9 @@ def _gh_login_with_token(token: str) -> None:
 def _configure_app_credential_helper() -> None:
     """Point git at this module's credential helper for github.com only.
 
-    ``useHttpPath`` makes git pass ``owner/repo`` to the helper so tokens can
-    be repo-scoped.  We replace (not append) any existing helper for the host
-    to avoid stacking a stale one from a previous boot.
+    The broker mints installation-wide tokens, so the helper does not vary by
+    repository.  We replace (not append) any existing helper for the host to
+    avoid stacking a stale one from a previous boot.
     """
     helper = f"!{sys.executable} -m superpos_agent_core.github_auth credential"
     key = f"credential.https://{_GITHUB_HOST}.helper"
@@ -242,7 +246,15 @@ def _configure_app_credential_helper() -> None:
         check=False,
     )
     _git_config("--add", key, helper)
-    _git_config(f"credential.https://{_GITHUB_HOST}.useHttpPath", "true")
+    # Tokens are installation-wide; drop any stale useHttpPath from a previous
+    # boot so git does not needlessly vary credential lookups by repo path.
+    subprocess.run(
+        [
+            "git", "config", "--global", "--unset-all",
+            f"credential.https://{_GITHUB_HOST}.useHttpPath",
+        ],
+        check=False,
+    )
 
 
 def cmd_setup() -> int:
@@ -322,13 +334,9 @@ def cmd_credential(action: str) -> int:
     if attrs.get("host") != _GITHUB_HOST:
         return 0  # not ours — let git try other helpers
 
-    # With useHttpPath=true, git supplies ``owner/repo(.git)``; scope to it.
-    repo = None
-    raw_path = attrs.get("path")
-    if raw_path:
-        repo = raw_path[:-4] if raw_path.endswith(".git") else raw_path
-
-    token = asyncio.run(_mint_token(repo))
+    # The minted token is installation-wide, so any ``path`` git supplies is
+    # irrelevant — one token serves every repo.
+    token = asyncio.run(_mint_token())
     if not token:
         return 0  # fall through to any other helper / fail naturally
 
@@ -339,13 +347,13 @@ def cmd_credential(action: str) -> int:
     return 0
 
 
-def cmd_token(repo: str | None) -> int:
+def cmd_token() -> int:
     """Print a fresh token (static or broker-minted) for ``gh`` invocations."""
     static = os.environ.get("GITHUB_TOKEN")
     if static:
         sys.stdout.write(static)
         return 0
-    token = asyncio.run(_mint_token(repo))
+    token = asyncio.run(_mint_token())
     if not token:
         print("github_auth: no GitHub credential available.", file=sys.stderr)
         return 1
@@ -362,8 +370,7 @@ def main(argv: list[str] | None = None) -> int:
     cred = sub.add_parser("credential", help="git credential helper protocol.")
     cred.add_argument("action", choices=["get", "store", "erase"])
 
-    tok = sub.add_parser("token", help="Print a fresh GitHub token to stdout.")
-    tok.add_argument("--repo", default=None, help="owner/name to scope the token.")
+    sub.add_parser("token", help="Print a fresh GitHub token to stdout.")
 
     args = parser.parse_args(argv)
     if args.command == "setup":
@@ -371,7 +378,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "credential":
         return cmd_credential(args.action)
     if args.command == "token":
-        return cmd_token(args.repo)
+        return cmd_token()
     return 2
 
 
