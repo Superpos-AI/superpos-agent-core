@@ -277,14 +277,23 @@ def cmd_setup() -> int:
         log.info("GitHub: no GITHUB_TOKEN and Superpos env incomplete — skipping.")
         return 0
 
-    async def _resolve() -> dict[str, Any] | None:
-        client = SuperposClient(config)
-        try:
-            return await _resolve_app_connection(client)
-        finally:
-            await client.close()
+    override = os.environ.get("SUPERPOS_GITHUB_CONNECTION_ID")
+    if override:
+        # An explicit override beats catalog discovery: the broker can still
+        # mint from it even when discovery is unavailable (e.g. the agent holds
+        # ``services:{id}`` but lacks ``services.read``, or the catalog is down).
+        # Honour it *before* discovery so setup never bails at the ``if not
+        # conn`` branch when ``_resolve_app_connection`` would return ``None``.
+        conn: dict[str, Any] | None = {"id": override, "name": override}
+    else:
+        async def _resolve() -> dict[str, Any] | None:
+            client = SuperposClient(config)
+            try:
+                return await _resolve_app_connection(client)
+            finally:
+                await client.close()
 
-    conn = asyncio.run(_resolve())
+        conn = asyncio.run(_resolve())
 
     if not conn:
         log.info(

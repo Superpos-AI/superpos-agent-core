@@ -1263,30 +1263,68 @@ class SuperposClient:
         into short-lived installation tokens; ``token``/PAT connections cannot —
         they must go through the proxy or the static ``GITHUB_TOKEN`` fallback).
 
+        The services catalog is paginated (Laravel's default ``per_page`` is
+        15), so a single request would silently miss GitHub connections beyond
+        the first page.  We request a large page size and walk every page,
+        following the response ``meta`` (``has_more`` / ``current_page`` /
+        ``last_page``) and falling back to the returned batch size so an absent
+        or unfamiliar ``meta`` can never loop forever.
+
         Requires the ``services.read`` permission; returns ``[]`` if the agent
         lacks it or no GitHub connection exists.
         """
         hive = self._config.superpos_hive_id
-        try:
-            resp = await self._request(
-                "GET",
-                f"/api/v1/hives/{hive}/services",
-                params={"type": "github", "status": status},
-            )
-        except httpx.HTTPStatusError as exc:
-            # 403 → no services.read; treat as "nothing discoverable" so callers
-            # fall back to GITHUB_TOKEN rather than crash.
-            if exc.response.status_code in (401, 403):
-                log.info(
-                    "GitHub connection discovery unavailable (HTTP %d) — "
-                    "falling back to static credentials",
-                    exc.response.status_code,
+        per_page = 100
+        items: list[dict[str, Any]] = []
+        page = 1
+        while True:
+            try:
+                resp = await self._request(
+                    "GET",
+                    f"/api/v1/hives/{hive}/services",
+                    params={
+                        "type": "github",
+                        "status": status,
+                        "page": page,
+                        "per_page": per_page,
+                    },
                 )
-                return []
-            raise
-        data = resp.json()
-        items = data.get("data", data) if isinstance(data, dict) else data
-        return items if isinstance(items, list) else []
+            except httpx.HTTPStatusError as exc:
+                # 403 → no services.read; treat as "nothing discoverable" so
+                # callers fall back to GITHUB_TOKEN rather than crash.
+                if exc.response.status_code in (401, 403):
+                    log.info(
+                        "GitHub connection discovery unavailable (HTTP %d) — "
+                        "falling back to static credentials",
+                        exc.response.status_code,
+                    )
+                    return []
+                raise
+            data = resp.json()
+            if isinstance(data, dict):
+                batch = data.get("data", [])
+                meta = data.get("meta") or {}
+            else:
+                batch = data
+                meta = {}
+            if not isinstance(batch, list):
+                break
+            items.extend(batch)
+
+            has_more = meta.get("has_more")
+            if has_more is None:
+                current = meta.get("current_page")
+                last = meta.get("last_page") or meta.get("total_pages")
+                if current is not None and last is not None:
+                    has_more = current < last
+                else:
+                    # No usable meta — stop once a page comes back short, which
+                    # also covers the empty-page terminator.
+                    has_more = len(batch) >= per_page
+            if not has_more:
+                break
+            page += 1
+        return items
 
     async def mint_github_token(
         self,

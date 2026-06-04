@@ -48,8 +48,49 @@ async def test_list_github_connections_filters_and_unwraps():
     req = captured[0]
     assert req.method == "GET"
     assert req.url.path == "/api/v1/hives/hive-x/services"
-    assert dict(req.url.params) == {"type": "github", "status": "active"}
+    assert dict(req.url.params) == {
+        "type": "github",
+        "status": "active",
+        "page": "1",
+        "per_page": "100",
+    }
     assert result[0]["name"] == "github-bot"
+    # A short first page (no meta) must not trigger a second request.
+    assert len(captured) == 1
+    await client.close()
+
+
+async def test_list_github_connections_paginates_until_last_page():
+    # The GitHub App connection lives on page 2, behind a full first page.
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        page = int(dict(request.url.params).get("page", "1"))
+        if page == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "data": [{"id": "noise", "name": "other"}],
+                    "meta": {"current_page": 1, "last_page": 2, "has_more": True},
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {"id": "c2", "name": "github-app-pg2",
+                     "metadata": {"auth_type": "github_app"}},
+                ],
+                "meta": {"current_page": 2, "last_page": 2, "has_more": False},
+            },
+        )
+
+    client = _make_client(handler)
+    result = await client.list_github_connections()
+
+    assert [dict(r.url.params).get("page") for r in captured] == ["1", "2"]
+    assert {c["name"] for c in result} == {"other", "github-app-pg2"}
     await client.close()
 
 

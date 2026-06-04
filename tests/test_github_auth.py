@@ -172,6 +172,35 @@ def test_setup_app_path_authenticates_gh_with_minted_token(monkeypatch):
     assert all(c["cmd"][:3] != ["gh", "auth", "setup-git"] for c in calls)
 
 
+def test_setup_honours_connection_id_override_when_discovery_fails(monkeypatch):
+    # No static token; catalog discovery yields nothing (e.g. the agent lacks
+    # services.read), but SUPERPOS_GITHUB_CONNECTION_ID pins a connection the
+    # broker can still mint from. Setup must configure auth from the override
+    # rather than bailing at the ``if not conn`` branch.
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.setenv("SUPERPOS_BASE_URL", "https://hive.example")
+    monkeypatch.setenv("SUPERPOS_HIVE_ID", "hive-1")
+    monkeypatch.setenv("SUPERPOS_API_TOKEN", "api-tok")
+    monkeypatch.setenv("SUPERPOS_GITHUB_CONNECTION_ID", "conn-override")
+
+    async def fail_resolve(client):  # pragma: no cover - must not be called
+        raise AssertionError("override must short-circuit discovery")
+
+    async def fake_mint():
+        return "brokered_tok"
+
+    monkeypatch.setattr(ga, "_resolve_app_connection", fail_resolve)
+    monkeypatch.setattr(ga, "_mint_token", fake_mint)
+    monkeypatch.setattr(ga, "_configure_app_credential_helper", lambda: None)
+    calls = _record_subprocess(monkeypatch)
+
+    assert ga.cmd_setup() == 0
+
+    login = [c for c in calls if c["cmd"][:4] == ["gh", "auth", "login", "--with-token"]]
+    assert len(login) == 1
+    assert login[0]["input"] == "brokered_tok"
+
+
 def test_setup_app_path_warns_when_mint_fails(monkeypatch):
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     monkeypatch.setenv("SUPERPOS_BASE_URL", "https://hive.example")
