@@ -12,8 +12,10 @@ personal access tokens):
      ``gh auth login --with-token`` + ``gh auth setup-git``.  Nothing expires.
   2. else a ``github_app`` service connection is discoverable → register a git
      credential helper that mints a short-lived installation token from the
-     Superpos broker *on demand* (so git/gh always see a fresh, ~1h token
-     without a long-lived secret living in the container).
+     Superpos broker *on demand* (so ``git`` always sees a fresh, ~1h token
+     without a long-lived secret living in the container).  ``gh`` does *not*
+     consult git's credential helper, so ``setup`` additionally logs ``gh`` in
+     with a freshly minted token; long-lived sessions re-mint via ``token``.
   3. else → no direct GitHub auth; the agent can still reach GitHub through the
      Superpos proxy (``superpos-github``).
 
@@ -207,6 +209,24 @@ def _git_config(*args: str) -> None:
     subprocess.run(["git", "config", "--global", *args], check=False)
 
 
+def _gh_login_with_token(token: str) -> None:
+    """Authenticate ``gh`` with a token via ``gh auth login --with-token``.
+
+    ``gh`` ignores git's credential helper for its own API calls (it reads
+    ``GH_TOKEN``/``GITHUB_TOKEN`` or credentials stored by ``gh auth login``),
+    so the brokered git helper alone leaves ``gh pr create``/``gh api``
+    unauthenticated.  We do *not* run ``gh auth setup-git`` here — git is
+    already wired to our on-demand credential helper and must not be handed
+    back to ``gh``'s static credentials.
+    """
+    subprocess.run(
+        ["gh", "auth", "login", "--with-token"],
+        input=token,
+        text=True,
+        check=False,
+    )
+
+
 def _configure_app_credential_helper() -> None:
     """Point git at this module's credential helper for github.com only.
 
@@ -262,11 +282,24 @@ def cmd_setup() -> int:
         return 0
 
     _configure_app_credential_helper()
-    log.info(
-        "GitHub: git/gh will mint short-lived App tokens on demand via "
-        "connection %r (no static credential stored).",
-        conn.get("name"),
-    )
+
+    # git now mints on demand via the helper, but gh won't — log it in with a
+    # freshly minted token so direct ``gh`` calls work right after setup.
+    token = asyncio.run(_mint_token(None))
+    if token:
+        _gh_login_with_token(token)
+        log.info(
+            "GitHub: git mints short-lived App tokens on demand via connection "
+            "%r; gh authenticated with a freshly minted token.",
+            conn.get("name"),
+        )
+    else:
+        log.warning(
+            "GitHub: configured git credential helper for connection %r, but "
+            "could not mint a token to authenticate gh; gh calls may fail until "
+            "a token is available.",
+            conn.get("name"),
+        )
     return 0
 
 

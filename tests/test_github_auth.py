@@ -105,3 +105,83 @@ def test_token_command_prefers_static(monkeypatch, capsys):
     monkeypatch.setenv("GITHUB_TOKEN", "ghp_static")
     assert ga.cmd_token(None) == 0
     assert capsys.readouterr().out == "ghp_static"
+
+
+# ── setup wires gh in the github_app path ───────────────────────────────
+
+
+def _record_subprocess(monkeypatch):
+    """Capture subprocess.run invocations without touching the system."""
+    calls = []
+
+    def fake_run(cmd, *args, **kwargs):
+        calls.append({"cmd": cmd, "input": kwargs.get("input")})
+
+        class _R:
+            returncode = 0
+
+        return _R()
+
+    monkeypatch.setattr(ga.subprocess, "run", fake_run)
+    return calls
+
+
+def test_setup_static_token_logs_in_gh_and_sets_up_git(monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_static")
+    calls = _record_subprocess(monkeypatch)
+
+    assert ga.cmd_setup() == 0
+
+    joined = [" ".join(c["cmd"]) for c in calls]
+    assert any("gh auth login --with-token" in j for j in joined)
+    assert any("gh auth setup-git" in j for j in joined)
+
+
+def test_setup_app_path_authenticates_gh_with_minted_token(monkeypatch):
+    # No static token, but a github_app connection resolves and mints a token.
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.setenv("SUPERPOS_BASE_URL", "https://hive.example")
+    monkeypatch.setenv("SUPERPOS_HIVE_ID", "hive-1")
+    monkeypatch.setenv("SUPERPOS_API_TOKEN", "api-tok")
+
+    async def fake_resolve(client):
+        return {"id": "conn-1", "name": "acme-app"}
+
+    async def fake_mint(repo):
+        assert repo is None  # gh login uses an org-scoped token
+        return "brokered_tok"
+
+    monkeypatch.setattr(ga, "_resolve_app_connection", fake_resolve)
+    monkeypatch.setattr(ga, "_mint_token", fake_mint)
+    monkeypatch.setattr(ga, "_configure_app_credential_helper", lambda: None)
+    calls = _record_subprocess(monkeypatch)
+
+    assert ga.cmd_setup() == 0
+
+    login = [c for c in calls if c["cmd"][:4] == ["gh", "auth", "login", "--with-token"]]
+    assert len(login) == 1
+    assert login[0]["input"] == "brokered_tok"
+    # git stays on our credential helper — gh must not reclaim it.
+    assert all(c["cmd"][:3] != ["gh", "auth", "setup-git"] for c in calls)
+
+
+def test_setup_app_path_warns_when_mint_fails(monkeypatch):
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.setenv("SUPERPOS_BASE_URL", "https://hive.example")
+    monkeypatch.setenv("SUPERPOS_HIVE_ID", "hive-1")
+    monkeypatch.setenv("SUPERPOS_API_TOKEN", "api-tok")
+
+    async def fake_resolve(client):
+        return {"id": "conn-1", "name": "acme-app"}
+
+    async def fake_mint(repo):
+        return None
+
+    monkeypatch.setattr(ga, "_resolve_app_connection", fake_resolve)
+    monkeypatch.setattr(ga, "_mint_token", fake_mint)
+    monkeypatch.setattr(ga, "_configure_app_credential_helper", lambda: None)
+    calls = _record_subprocess(monkeypatch)
+
+    assert ga.cmd_setup() == 0
+    # No gh login attempted when there is no token to hand it.
+    assert all(c["cmd"][:3] != ["gh", "auth", "login"] for c in calls)
