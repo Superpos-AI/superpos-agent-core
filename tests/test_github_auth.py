@@ -155,8 +155,7 @@ def test_setup_app_path_authenticates_gh_with_minted_token(monkeypatch):
     async def fake_resolve(client):
         return {"id": "conn-1", "name": "acme-app"}
 
-    async def fake_mint(repo):
-        assert repo is None  # gh login uses an org-scoped token
+    async def fake_mint():
         return "brokered_tok"
 
     monkeypatch.setattr(ga, "_resolve_app_connection", fake_resolve)
@@ -182,7 +181,7 @@ def test_setup_app_path_warns_when_mint_fails(monkeypatch):
     async def fake_resolve(client):
         return {"id": "conn-1", "name": "acme-app"}
 
-    async def fake_mint(repo):
+    async def fake_mint():
         return None
 
     monkeypatch.setattr(ga, "_resolve_app_connection", fake_resolve)

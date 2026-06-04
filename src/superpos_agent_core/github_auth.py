@@ -297,7 +297,7 @@ def cmd_setup() -> int:
 
     # git now mints on demand via the helper, but gh won't — log it in with a
     # freshly minted token so direct ``gh`` calls work right after setup.
-    token = asyncio.run(_mint_token(None))
+    token = asyncio.run(_mint_token())
     if token:
         _gh_login_with_token(token)
         log.info(
