@@ -22,6 +22,8 @@ import os
 import sys
 from typing import Any
 
+import httpx
+
 # ``superpos_agent_core`` is pip-installed via the container's requirements.txt.
 from superpos_agent_core import BaseConfig, SuperposClient
 
@@ -71,6 +73,11 @@ def _parse_json_arg(label: str, raw: str | None) -> dict[str, Any] | None:
     return parsed
 
 
+# Bounded so a pathological flip-flop on the issue's ``thread_id`` can never
+# spin forever; the real later-overwrite race converges in two iterations.
+_MAX_COMMENT_THREAD_RETRIES = 4
+
+
 async def _resolve_or_create_thread(client: SuperposClient, issue_id: str) -> str:
     """Return the issue's discussion thread id, creating + linking one on demand.
 
@@ -80,10 +87,15 @@ async def _resolve_or_create_thread(client: SuperposClient, issue_id: str) -> st
     mirroring the dashboard's lazy ``start-discussion`` behaviour.
 
     Two agents can race here: both read ``thread_id=None``, each create a
-    thread, and the later ``update_issue`` overwrites the earlier link. To
-    avoid appending into an orphaned thread (and silently losing the message
-    from the issue's ``discussion``), re-fetch after linking and return
-    whichever thread the issue now authoritatively points to.
+    thread, and the later ``update_issue`` overwrites the earlier link. Two
+    defences keep the message out of an orphaned thread:
+
+    1. If the backend atomically rejects replacing an already-claimed
+       ``thread_id`` (409/422 — the start-discussion claim contract), the
+       loser catches the conflict and defers to the issue's winning thread.
+    2. Otherwise (no backend claim yet) the link is a last-write-wins PATCH,
+       so we re-read the issue afterwards and return whichever thread it now
+       authoritatively points to rather than our local one.
     """
     issue = await client.get_issue(issue_id)
     thread_id = issue.get("thread_id")
@@ -92,12 +104,47 @@ async def _resolve_or_create_thread(client: SuperposClient, issue_id: str) -> st
 
     thread = await client.create_thread(title=f"Discussion: {issue.get('title', issue_id)}")
     new_thread_id = thread["id"]
-    await client.update_issue(issue_id, thread_id=new_thread_id)
+    try:
+        await client.update_issue(issue_id, thread_id=new_thread_id)
+    except httpx.HTTPStatusError as exc:
+        response = exc.response
+        if response is not None and response.status_code in (409, 422):
+            # Backend refused to overwrite an existing claim: a concurrent
+            # first-comment writer won. Use the issue's authoritative thread.
+            issue = await client.get_issue(issue_id)
+            winner = issue.get("thread_id")
+            if winner:
+                return winner
+        raise
 
     # Re-read the issue so a concurrent first-comment writer that won the link
     # is respected: append into the issue's current thread, not our local one.
     issue = await client.get_issue(issue_id)
     return issue.get("thread_id") or new_thread_id
+
+
+async def _post_comment(
+    client: SuperposClient, issue_id: str, message: str,
+) -> dict[str, Any]:
+    """Append a discussion comment so it stays visible in ``discussion``.
+
+    Resolving the thread closes the race where a concurrent writer's link is
+    visible *before* we append. It cannot close the later-overwrite window: a
+    second writer can replace the issue's ``thread_id`` *after* we resolved and
+    appended, stranding our message in a now-orphaned thread. Without a backend
+    atomic claim the only client-side guard is to verify the issue still points
+    at the thread we wrote to and, when it does not, append again into the new
+    winner. The extra copy lands in the orphaned thread (never shown), so the
+    message is preserved exactly once in the issue's discussion.
+    """
+    result: dict[str, Any] = {}
+    for _ in range(_MAX_COMMENT_THREAD_RETRIES):
+        thread_id = await _resolve_or_create_thread(client, issue_id)
+        result = await client.append_thread_message(thread_id, message)
+        issue = await client.get_issue(issue_id)
+        if issue.get("thread_id") == thread_id:
+            return result
+    return result
 
 
 async def _run(args: argparse.Namespace) -> int:
@@ -206,8 +253,7 @@ async def _run(args: argparse.Namespace) -> int:
             _print({"ok": True})
 
         elif args.cmd == "comment":
-            thread_id = await _resolve_or_create_thread(client, args.issue_id)
-            _print(await client.append_thread_message(thread_id, args.message))
+            _print(await _post_comment(client, args.issue_id, args.message))
 
         elif args.cmd == "discussion":
             issue = await client.get_issue(args.issue_id)
