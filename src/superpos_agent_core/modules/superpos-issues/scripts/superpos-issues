@@ -377,7 +377,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p_atts.add_argument("--per-page", type=int, help="Page size (server caps at 100)")
 
     # detach
-    p_detach = sub.add_parser("detach", help="Delete an attachment by id")
+    p_detach = sub.add_parser(
+        "detach",
+        help="Delete an attachment by id (destructive; requires the attachments.manage scope, not in hosted-agent defaults)",
+    )
     p_detach.add_argument("attachment_id")
 
     # comment

@@ -158,8 +158,11 @@ the `issue_type_id`.
 ## Attachments (files)
 
 Attach **files** to an issue — screenshots, logs, diffs, repro
-artifacts. Files only; there is no URL/link form. Requires the
-`attachments.read` / `attachments.write` permissions on the hive.
+artifacts. Files only; there is no URL/link form. `attach` /
+`attachments` require the `attachments.read` / `attachments.write`
+permissions on the hive. `detach` is destructive and requires the
+stronger `attachments.manage` scope, which hosted-agent defaults do
+**not** include — without it `detach` returns `403`.
 
 ### `superpos-issues attach --issue-id <id> --file <path>`
 
@@ -184,6 +187,10 @@ superpos-issues attachments --issue-id 01HXYZ --page 2 --per-page 50   # advance
 ### `superpos-issues detach <attachment-id>`
 
 Delete an attachment (removes the file from storage and its record).
+Destructive — requires the `attachments.manage` scope. Hosted-agent
+defaults grant only `attachments.read` / `attachments.write`, so this
+command returns `403` for those agents unless `attachments.manage` has
+been granted explicitly.
 
 ```bash
 superpos-issues detach 01HATTACHMENTXYZ
@@ -230,5 +237,6 @@ superpos-issues discussion --issue-id 01HXYZ
 
 - `SUPERPOS_*` env vars (already set in the container)
 - `issues.read` and/or `issues.manage` permission on the hive
-- `attachments.read` / `attachments.write` for `attach` / `attachments` / `detach`
+- `attachments.read` / `attachments.write` for `attach` / `attachments`
+- `attachments.manage` (destructive scope) for `detach` — not in hosted-agent defaults
 - `threads.read` / `threads.write` for `comment` / `discussion`

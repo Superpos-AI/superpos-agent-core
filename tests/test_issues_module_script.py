@@ -9,6 +9,7 @@ no network.  Mirrors ``test_knowledge_module_script.py``.
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -75,6 +76,21 @@ def test_parser_detach_takes_positional_id():
     mod = _load_script()
     args = mod._build_parser().parse_args(["detach", "att-1"])
     assert args.cmd == "detach" and args.attachment_id == "att-1"
+
+
+def test_detach_help_documents_manage_scope():
+    # detach hits DELETE /attachments, gated behind attachments.manage in the
+    # backend; hosted-agent defaults only grant read/write, so the CLI must
+    # advertise the stronger scope rather than implying detach works for them.
+    mod = _load_script()
+    parser = mod._build_parser()
+    subparsers = next(
+        a for a in parser._actions if isinstance(a, argparse._SubParsersAction)
+    )
+    detach_help = next(
+        c.help for c in subparsers._choices_actions if c.dest == "detach"
+    )
+    assert "attachments.manage" in detach_help
 
 
 def test_parser_comment_and_discussion():
