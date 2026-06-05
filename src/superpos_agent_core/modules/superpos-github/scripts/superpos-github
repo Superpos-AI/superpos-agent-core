@@ -114,6 +114,35 @@ async def _proxy(
         return {"status_code": resp.status_code, "body": resp.text}
 
 
+def _apply_agent_tag(title: str, body: str) -> tuple[str, str]:
+    """Tag a PR title and body with the running agent's name.
+
+    Triggered when ``SUPERPOS_AGENT_NAME`` is set in the environment and the
+    user has not passed ``--no-agent-tag``. The tag is prepended to the title
+    (``[agent-name] existing title``) and appended to the body as a footer
+    block, so the agent's identity is visible in the GitHub UI even though
+    the GitHub App author is shared across all agents in the hive.
+
+    For commit-level tagging (so commit authors also show the agent name
+    rather than the bare app bot), set ``GIT_AUTHOR_NAME`` and
+    ``GIT_AUTHOR_EMAIL`` in the environment before running ``git commit``.
+    """
+    name = os.environ.get("SUPERPOS_AGENT_NAME", "").strip()
+    if not name:
+        return title, body
+    if not title.startswith(f"[{name}]"):
+        tagged_title = f"[{name}] {title}" if title else f"[{name}]"
+    else:
+        tagged_title = title
+    footer = (
+        f"\n\n---\n"
+        f"> 🤖 **Authored by:** `{name}` "
+        f"(via `superpos-agent-app[bot]`)\n"
+    )
+    tagged_body = (body or "") + footer
+    return tagged_title, tagged_body
+
+
 async def _run(args: argparse.Namespace) -> int:
     client = SuperposClient(_config_from_env())
     try:
@@ -151,14 +180,18 @@ async def _run(args: argparse.Namespace) -> int:
             ))
 
         elif args.cmd == "pr-create":
+            if args.no_agent_tag:
+                title, body = args.title, args.body
+            else:
+                title, body = _apply_agent_tag(args.title, args.body)
             _print(await _proxy(
                 client, service, "POST",
                 f"/repos/{args.owner}/{args.repo}/pulls",
                 body={
-                    "title": args.title,
+                    "title": title,
                     "head": args.head,
                     "base": args.base,
-                    "body": args.body,
+                    "body": body,
                     "draft": args.draft,
                 },
             ))
@@ -210,6 +243,11 @@ def _build_parser() -> argparse.ArgumentParser:
     pc.add_argument("--base", required=True, help="Target branch.")
     pc.add_argument("--body", default="")
     pc.add_argument("--draft", action="store_true")
+    pc.add_argument(
+        "--no-agent-tag",
+        action="store_true",
+        help="Skip auto-tagging the PR with the SUPERPOS_AGENT_NAME env var.",
+    )
 
     ic = sub.add_parser("issue-create", help="Open an issue.")
     ic.add_argument("owner")
