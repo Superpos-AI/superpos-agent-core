@@ -12,7 +12,7 @@ from __future__ import annotations
 import importlib.util
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -124,7 +124,7 @@ async def test_pr_create_tags_title_and_body_when_env_set(monkeypatch):
 
     # service_request is awaited once for the pr-create POST.
     fake_resp = AsyncMock()
-    fake_resp.json.return_value = {"number": 42, "html_url": "https://gh/x"}
+    fake_resp.json = Mock(return_value={"number": 42, "html_url": "https://gh/x"})
     fake_resp.status_code = 201
     mock_service_request = AsyncMock(return_value=fake_resp)
 
@@ -154,7 +154,7 @@ async def test_pr_create_respects_no_agent_tag_flag(monkeypatch):
     monkeypatch.setenv("SUPERPOS_AGENT_NAME", "claude-agent")
 
     fake_resp = AsyncMock()
-    fake_resp.json.return_value = {"number": 42}
+    fake_resp.json = Mock(return_value={"number": 42})
     fake_resp.status_code = 201
     mock_service_request = AsyncMock(return_value=fake_resp)
 
@@ -180,7 +180,7 @@ async def test_pr_create_no_tag_when_env_unset(monkeypatch):
     monkeypatch.delenv("SUPERPOS_AGENT_NAME", raising=False)
 
     fake_resp = AsyncMock()
-    fake_resp.json.return_value = {"number": 42}
+    fake_resp.json = Mock(return_value={"number": 42})
     fake_resp.status_code = 201
     mock_service_request = AsyncMock(return_value=fake_resp)
 
