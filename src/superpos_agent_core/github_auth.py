@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import BaseConfig
-from .superpos_client import SuperposClient
+from .superpos_client import GitHubDiscoveryForbidden, SuperposClient
 
 log = logging.getLogger(__name__)
 
@@ -140,8 +140,23 @@ async def _resolve_app_connection(client: SuperposClient) -> dict[str, Any] | No
     PAT (``auth_type=token``) connections are skipped here: the broker can't
     mint from them, so the direct git/gh path falls through to the static
     ``GITHUB_TOKEN`` rule.  They remain usable via the proxy (Path B).
+
+    A ``GitHubDiscoveryForbidden`` (HTTP 401/403, typically missing
+    ``services.read``) is treated the same as "no connection exists": we
+    return ``None`` and the caller falls through to the static
+    ``GITHUB_TOKEN`` rule or the proxy.  Logged at debug level so the
+    permission problem is not silently conflated with an empty catalog.
     """
-    connections = await client.list_github_connections()
+    try:
+        connections = await client.list_github_connections()
+    except GitHubDiscoveryForbidden as exc:
+        log.debug(
+            "GitHub discovery denied (HTTP %d); falling back to static "
+            "GITHUB_TOKEN: %s",
+            exc.status_code,
+            exc,
+        )
+        return None
     app_conns = [
         c
         for c in connections

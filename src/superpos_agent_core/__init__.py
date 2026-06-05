@@ -29,7 +29,7 @@ from .recent_tasks import RecentTasksLog, TaskSummary
 from .redactor import redact
 from .runtime_config import RuntimeConfig
 from .session_store import SessionStore
-from .superpos_client import SuperposClient
+from .superpos_client import GitHubDiscoveryForbidden, SuperposClient
 from .superpos_poller import run_superpos_poller
 from .telegram_bot import build_telegram_app, run_telegram_bot
 from .telegram_gateway import Priority, TelegramGateway
@@ -49,6 +49,7 @@ __all__ = [
     "Executor",
     "ExecutionRequest",
     "ExecutorFactory",
+    "GitHubDiscoveryForbidden",
     "Priority",
     "RecentTasksLog",
     "RegistryFetchError",
