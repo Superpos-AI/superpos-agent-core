@@ -25,6 +25,23 @@ def _redact_summary(summary: dict[str, Any] | None) -> dict[str, Any] | None:
 log = logging.getLogger(__name__)
 
 
+class GitHubDiscoveryForbidden(Exception):
+    """Raised when GitHub connection discovery is denied by the Superpos API.
+
+    ``list_github_connections`` raises this on HTTP 401/403 (typically when the
+    agent lacks the ``services.read`` permission) so callers can distinguish
+    "no connection exists" from "we are not allowed to ask".  Callers that
+    have a sensible fallback (e.g. the static ``GITHUB_TOKEN``) should catch
+    it; callers that surface the result to the user (e.g. ``superpos-github
+    connections``) should let it propagate so the user sees a clear
+    permission error instead of an empty list.
+    """
+
+    def __init__(self, status_code: int, message: str) -> None:
+        self.status_code = status_code
+        super().__init__(message)
+
+
 class SuperposClient:
     def __init__(self, config: BaseConfig) -> None:
         self._config = config
@@ -1346,8 +1363,13 @@ class SuperposClient:
         ``last_page``) and falling back to the returned batch size so an absent
         or unfamiliar ``meta`` can never loop forever.
 
-        Requires the ``services.read`` permission; returns ``[]`` if the agent
-        lacks it or no GitHub connection exists.
+        Requires the ``services.read`` permission.  If the agent lacks it (HTTP
+        401/403) this raises :class:`GitHubDiscoveryForbidden` so callers can
+        distinguish "no connection exists" (returns ``[]``) from "we are not
+        allowed to ask" (raise).  Callers with a static-credential fallback
+        (e.g. ``GITHUB_TOKEN``) should catch the exception and fall through;
+        callers that surface the result to the user should let it propagate
+        so the user sees a clear permission error.
         """
         hive = self._config.superpos_hive_id
         per_page = 100
@@ -1366,15 +1388,19 @@ class SuperposClient:
                     },
                 )
             except httpx.HTTPStatusError as exc:
-                # 403 → no services.read; treat as "nothing discoverable" so
-                # callers fall back to GITHUB_TOKEN rather than crash.
+                # 401/403 → likely missing services.read.  Raise a typed
+                # exception so callers (CLI vs. auth fallback) can decide
+                # whether to fall through or surface the permission error.
                 if exc.response.status_code in (401, 403):
                     log.info(
-                        "GitHub connection discovery unavailable (HTTP %d) — "
-                        "falling back to static credentials",
+                        "GitHub connection discovery denied (HTTP %d)",
                         exc.response.status_code,
                     )
-                    return []
+                    raise GitHubDiscoveryForbidden(
+                        exc.response.status_code,
+                        "Agent lacks `services.read` permission — cannot "
+                        "list GitHub service connections",
+                    ) from exc
                 raise
             data = resp.json()
             if isinstance(data, dict):

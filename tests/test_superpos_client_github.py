@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import httpx
 
-from superpos_agent_core import BaseConfig, SuperposClient
+from superpos_agent_core import BaseConfig, GitHubDiscoveryForbidden, SuperposClient
 
 
 def _make_client(handler):
@@ -94,14 +94,55 @@ async def test_list_github_connections_paginates_until_last_page():
     await client.close()
 
 
-async def test_list_github_connections_returns_empty_on_forbidden():
+async def test_list_github_connections_raises_on_forbidden():
     def handler(request: httpx.Request) -> httpx.Response:
-        # No services.read permission → must not raise; callers fall back to
-        # the static GITHUB_TOKEN path.
+        # No services.read permission → must raise a typed exception so
+        # callers can distinguish "denied" from "no connection exists".
         return httpx.Response(403, json={"message": "forbidden"})
 
     client = _make_client(handler)
-    assert await client.list_github_connections() == []
+    try:
+        await client.list_github_connections()
+    except GitHubDiscoveryForbidden as exc:
+        assert exc.status_code == 403
+        assert "services.read" in str(exc)
+        # The original HTTPStatusError must be preserved as __cause__ for
+        # traceback-style debugging.
+        assert isinstance(exc.__cause__, httpx.HTTPStatusError)
+    else:  # pragma: no cover
+        raise AssertionError("expected GitHubDiscoveryForbidden")
+    await client.close()
+
+
+async def test_list_github_connections_raises_on_unauthorized():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"message": "unauthenticated"})
+
+    client = _make_client(handler)
+    try:
+        await client.list_github_connections()
+    except GitHubDiscoveryForbidden as exc:
+        assert exc.status_code == 401
+    else:  # pragma: no cover
+        raise AssertionError("expected GitHubDiscoveryForbidden")
+    await client.close()
+
+
+async def test_list_github_connections_propagates_other_http_errors():
+    def handler(request: httpx.Request) -> httpx.Response:
+        # 500s and other 4xx must propagate as httpx errors, not be
+        # silently swallowed.
+        return httpx.Response(500, json={"message": "boom"})
+
+    client = _make_client(handler)
+    try:
+        await client.list_github_connections()
+    except GitHubDiscoveryForbidden:  # pragma: no cover
+        raise AssertionError("500 must not be turned into a discovery error")
+    except httpx.HTTPStatusError as exc:
+        assert exc.response.status_code == 500
+    else:  # pragma: no cover
+        raise AssertionError("expected httpx.HTTPStatusError")
     await client.close()
 
 

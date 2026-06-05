@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from superpos_agent_core import github_auth as ga
+from superpos_agent_core import GitHubDiscoveryForbidden, github_auth as ga
 
 
 def _iso(delta_seconds: int) -> str:
@@ -268,3 +268,29 @@ def test_setup_app_path_warns_when_mint_fails(monkeypatch):
     assert ga.cmd_setup() == 0
     # No gh login attempted when there is no token to hand it.
     assert all(c["cmd"][:3] != ["gh", "auth", "login"] for c in calls)
+
+
+# ── _resolve_app_connection on permission denial ────────────────────────
+
+
+async def test_resolve_app_connection_returns_none_on_forbidden(monkeypatch):
+    # A permission denial must not propagate — callers fall through to the
+    # static GITHUB_TOKEN path, and setup logs the "no connection" message.
+    class _ForbiddenClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def list_github_connections(self):
+            raise GitHubDiscoveryForbidden(
+                403,
+                "Agent lacks `services.read` permission — cannot list "
+                "GitHub service connections",
+            )
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(ga, "SuperposClient", _ForbiddenClient)
+
+    result = await ga._resolve_app_connection(_ForbiddenClient())  # type: ignore[arg-type]
+    assert result is None
