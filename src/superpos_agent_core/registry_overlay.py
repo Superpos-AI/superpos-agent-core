@@ -210,14 +210,19 @@ def _materialise_module(module: dict, modules_dir: Path) -> Path:
     - ``SKILL.md`` — from the module's ``skill`` field, if present.
 
     The new version is built in a sibling staging directory and only
-    swapped into ``<modules_dir>/<slug>/`` once every write has succeeded:
-    we ``shutil.rmtree`` any prior install and ``os.replace`` the staging
-    dir into place (an atomic rename — same parent dir).  If *any* write
-    raises, the staging dir is removed and the error re-raised, leaving the
-    existing install **untouched** — so the caller's retry/skip fallback
-    never loses a previously-working module to a transient write error or a
-    malformed registry payload.  Raises on any IO error so the caller's
-    retry/skip loop can react.
+    swapped into ``<modules_dir>/<slug>/`` once every write has succeeded.
+    The swap preserves the previously-working install until the new one is
+    actually active: any prior install is first moved aside to a sibling
+    backup dir (``os.replace`` — atomic, same parent), then the staging dir
+    is renamed into place.  On success the backup is removed; if the final
+    rename fails the backup is restored to ``install_dir`` and the staging
+    dir discarded, so a failed swap never loses a working module nor leaves
+    stray staging/backup dirs behind.  If *any* write raises, the staging
+    dir is removed and the error re-raised, leaving the existing install
+    **untouched** — so the caller's retry/skip fallback never loses a
+    previously-working module to a transient write error or a malformed
+    registry payload.  Raises on any IO error so the caller's retry/skip
+    loop can react.
     """
     slug = module["slug"]
     if not _is_safe_slug(slug):
@@ -257,10 +262,35 @@ def _materialise_module(module: dict, modules_dir: Path) -> Path:
         shutil.rmtree(staging_dir, ignore_errors=True)
         raise
 
-    # New version fully materialised — atomically swap it into place.
+    # New version fully materialised — swap it into place while keeping the
+    # previously-working install recoverable until the new one is active.
     if install_dir.exists():
-        shutil.rmtree(install_dir)
-    os.replace(staging_dir, install_dir)
+        # Move the old install aside first so a failed final rename never
+        # leaves us with *no* install.  Same parent dir keeps both renames
+        # atomic.
+        backup_dir = Path(
+            tempfile.mkdtemp(prefix=f".{slug}.bak-", dir=modules_dir)
+        )
+        # mkdtemp created an empty dir; os.replace needs the target absent.
+        os.rmdir(backup_dir)
+        os.replace(install_dir, backup_dir)
+        try:
+            os.replace(staging_dir, install_dir)
+        except BaseException:
+            # Final swap failed — restore the previously-working install and
+            # discard the staging dir so nothing is left behind.
+            os.replace(backup_dir, install_dir)
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            raise
+        # New version is live — drop the backup of the old install.
+        shutil.rmtree(backup_dir, ignore_errors=True)
+    else:
+        # First install — no prior version to preserve.
+        try:
+            os.replace(staging_dir, install_dir)
+        except BaseException:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            raise
 
     return install_dir
 

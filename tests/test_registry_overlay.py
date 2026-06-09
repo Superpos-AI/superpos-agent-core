@@ -517,6 +517,92 @@ def test_failed_update_preserves_existing_install(tmp_path: Path, caplog):
     assert any("upgradable" in r.message for r in records)
 
 
+def test_failed_final_swap_preserves_existing_install(tmp_path: Path, caplog):
+    """An UPDATE whose staging writes all succeed but whose FINAL
+    staging→install rename fails must NOT destroy the previously-working
+    install.  Reproduces the swap-path bug: if the final ``os.replace`` of
+    the staging dir into ``install_dir`` raises, the old v1 module must
+    still be present and intact, the slug reported failed (not installed),
+    and no staging/backup dirs left behind."""
+    modules_dir = tmp_path / "modules"
+
+    # Install a working v1 that must survive a failed swap.
+    v1 = {
+        "slug": "upgradable",
+        "name": "Upgradable",
+        "manifest": {"description": "v1-keep-me", "env_keys": ["KEEP_KEY"]},
+        "files": [
+            {"path": "scripts/cli", "content": "echo v1\n", "mode": "+x"},
+            {"path": "SKILL.md", "content": "# v1 skill\n"},
+        ],
+    }
+    overlay_modules([v1], str(modules_dir))
+    install_dir = modules_dir / "upgradable"
+    assert install_dir.is_dir()
+    script = install_dir / "scripts" / "cli"
+    assert script.is_file()
+
+    # A v2 update whose writes all succeed but whose final swap blows up.
+    v2 = {
+        "slug": "upgradable",
+        "name": "Upgradable",
+        "manifest": {"description": "v2-broken", "env_keys": []},
+        "files": [{"path": "scripts/cli", "content": "echo v2\n", "mode": "+x"}],
+    }
+
+    import os as _os
+    import unittest.mock as mock
+
+    real_replace = _os.replace
+    install_dir_str = str(install_dir)
+    staging_prefix = ".upgradable.tmp-"
+    failed = {"count": 0}
+
+    def flaky_replace(src, dst, *args, **kwargs):
+        # Fail only on the final staging→install swap — i.e. a rename whose
+        # *source* is the staging dir and whose *target* is install_dir,
+        # after the old install has already been moved aside to its backup.
+        # The subsequent backup→install restore (source = backup dir) must
+        # still succeed so the previously-working module is recovered.
+        if str(dst) == install_dir_str and Path(src).name.startswith(staging_prefix):
+            failed["count"] += 1
+            raise OSError("rename gremlin")
+        return real_replace(src, dst, *args, **kwargs)
+
+    with mock.patch.object(
+        _os, "replace", flaky_replace
+    ), caplog.at_level("WARNING"):
+        result = overlay_modules([v2], str(modules_dir), backoff_seconds=0.0)
+
+    # The injected fault actually fired on the final swap (guards the test
+    # against silently never exercising the swap path).
+    assert failed["count"] >= 1
+
+    # The slug is reported failed, never installed.
+    assert "upgradable" in result.failed
+    assert "upgradable" not in result.installed
+
+    # The OLD install survives intact — directory, manifest, and script.
+    assert install_dir.is_dir()
+    assert "v1-keep-me" in (install_dir / "module.yaml").read_text()
+    assert script.is_file()
+    assert script.read_text() == "echo v1\n"
+    assert os.access(script, os.X_OK)
+    assert (install_dir / "SKILL.md").read_text() == "# v1 skill\n"
+
+    # No leftover staging OR backup directory pollutes the modules dir.
+    leftovers = [
+        p
+        for p in modules_dir.iterdir()
+        if p.name.startswith((".upgradable.tmp-", ".upgradable.bak-"))
+    ]
+    assert leftovers == [], f"leftover staging/backup dirs: {leftovers}"
+
+    # Structured failure record emitted for the slug.
+    records = [r for r in caplog.records if MODULE_INSTALL_FAILED_EVENT in r.message]
+    assert any("upgradable" in r.message for r in records)
+
+
 def test_skipped_module_not_symlinked(tmp_path: Path, monkeypatch):
     """A module that fails to install must not have its scripts symlinked
     onto PATH (it was never materialised)."""
