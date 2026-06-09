@@ -347,7 +347,7 @@ def apply_registry_overlay(
     resolved: dict | None,
     *,
     modules_dir: str,
-    skills_dir: str,
+    skills_dir: str | None = None,
     agents_md_path: str | None = None,
     bin_dir: str | None = None,
     env: dict[str, str] | None = None,
@@ -364,9 +364,14 @@ def apply_registry_overlay(
             ``skills`` / ``modules`` keys), or ``None`` if the fetch
             failed.  ``None`` → degraded fall-back to baked-in.
         modules_dir: workspace modules root (registry modules land here,
-            shadowing bundled ones of the same slug).
+            shadowing bundled ones of the same slug).  Modules are
+            **always** overlaid when the flag is on — they target this
+            workspace dir and don't depend on ``skills_dir``.
         skills_dir: workspace skills root (``<slug>.md`` files written
-            here).
+            here).  Optional — when ``None`` the **skills** portion of the
+            overlay is skipped (a structured warning is logged) but modules
+            are still overlaid.  This decouples module rollout from a
+            startup command that doesn't pass a skills dir.
         agents_md_path: optional system-prompt file to re-render the
             module doc block into after installing registry modules.
         bin_dir: optional PATH dir to (re-)symlink module scripts into.
@@ -395,7 +400,24 @@ def apply_registry_overlay(
     skill_items = resolved.get("skills") or []
     module_items = resolved.get("modules") or []
 
-    skills_result = overlay_skills(skill_items, skills_dir)
+    # Skills need a target dir; modules don't (they land in modules_dir).
+    # Decoupling the two means a flag-on startup command without a skills
+    # dir still gets its registry modules — only the skills half is skipped.
+    if skills_dir is not None:
+        skills_result = overlay_skills(skill_items, skills_dir)
+    else:
+        skills_result = SkillOverlayResult(skipped=[s.get("slug") for s in skill_items])
+        if skill_items:
+            log.warning(
+                "registry.skills_overlay_skipped reason=no_skills_dir count=%d; "
+                "modules still overlaid",
+                len(skill_items),
+                extra={
+                    "event": "registry.skills_overlay_skipped",
+                    "reason": "no_skills_dir",
+                    "skill_count": len(skill_items),
+                },
+            )
     modules_result = overlay_modules(module_items, modules_dir)
 
     # Re-run the existing install side effects so registry modules become

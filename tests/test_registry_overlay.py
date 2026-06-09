@@ -551,3 +551,138 @@ def test_skipped_module_not_symlinked(tmp_path: Path, monkeypatch):
     assert not (bin_dir / "evil").exists()
     # Nothing escaped the modules dir either.
     assert not (tmp_path / "escape").exists()
+
+
+# ── Modules overlay decoupled from skills_dir ────────────────────────
+
+
+def test_flag_on_no_skills_dir_still_overlays_modules(tmp_path: Path, monkeypatch):
+    """Flag ON with ``skills_dir`` omitted → registry MODULES are still
+    overlaid (materialised, scripts symlinked, doc rendered) and the result
+    is NOT skipped.  Regression for: the overlay used to be gated on a
+    skills dir, so a flag-on startup command without one did nothing."""
+    monkeypatch.setenv(FEATURE_FLAG_ENV, "true")
+    modules_dir = tmp_path / "modules"
+    bin_dir = tmp_path / "bin"
+
+    result = apply_registry_overlay(
+        _resolved_payload(),
+        modules_dir=str(modules_dir),
+        # skills_dir intentionally omitted (None)
+        bin_dir=str(bin_dir),
+    )
+
+    assert result.skipped is False
+    assert result.fetch_failed is False
+    # Module materialised even though no skills dir was supplied.
+    assert (modules_dir / "registry-only-mod" / "module.yaml").is_file()
+    assert "registry-only-mod" in result.modules.installed
+    # Its script is symlinked onto PATH + executable.
+    link = bin_dir / "regmod-cli"
+    assert link.is_symlink()
+    assert os.access(link.resolve(), os.X_OK)
+    # The skill from the payload was cleanly skipped, not written anywhere.
+    assert "deep-research" in result.skills.skipped
+    assert result.skills.written == []
+
+
+def test_run_setup_flag_on_no_skills_dir_renders_module_doc(
+    tmp_path: Path, monkeypatch
+):
+    """run_setup with the flag ON and ``skills_dir=None`` still overlays the
+    registry module and renders it into the agent doc."""
+    monkeypatch.setenv(FEATURE_FLAG_ENV, "true")
+    modules_dir = tmp_path / "modules"
+    bin_dir = tmp_path / "bin"
+    agents_md = _agents_md(tmp_path)
+
+    module_setup.run_setup(
+        str(modules_dir),
+        str(agents_md),
+        bin_dir=str(bin_dir),
+        registry_resolved=_resolved_payload(),
+        skills_dir=None,
+    )
+
+    doc = agents_md.read_text()
+    assert "registry-only-mod" in doc  # registry module documented
+    assert "superpos-github" in doc  # baked-in still present
+    assert (modules_dir / "registry-only-mod" / "module.yaml").is_file()
+
+
+def test_flag_on_no_skills_dir_does_not_raise_on_skills(tmp_path: Path, monkeypatch):
+    """A payload carrying skills overlaid with no skills_dir must skip the
+    skills portion cleanly (no exception) while still installing modules."""
+    monkeypatch.setenv(FEATURE_FLAG_ENV, "true")
+    modules_dir = tmp_path / "modules"
+
+    # Should not raise even though there are skills to write and no dir.
+    result = apply_registry_overlay(
+        {"skills": _resolved_payload()["skills"], "modules": _resolved_payload()["modules"]},
+        modules_dir=str(modules_dir),
+        skills_dir=None,
+    )
+
+    assert result.skipped is False
+    assert "registry-only-mod" in result.modules.installed
+    assert "deep-research" in result.skills.skipped
+
+
+def test_cli_main_fetches_resolved_when_flag_on_without_skills_dir(
+    tmp_path: Path, monkeypatch
+):
+    """CLI ``main()`` must fetch the resolved set whenever the flag is ON,
+    even when ``--skills-dir`` is not passed.  Regression for the reviewer's
+    finding that the CLI never fetched without ``--skills-dir``."""
+    monkeypatch.setenv(FEATURE_FLAG_ENV, "true")
+    modules_dir = tmp_path / "modules"
+    agents_md = _agents_md(tmp_path)
+
+    called = {"fetch": 0}
+
+    def _fake_fetch():
+        called["fetch"] += 1
+        return _resolved_payload()
+
+    monkeypatch.setattr(module_setup, "_fetch_registry_resolved", _fake_fetch)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "module_setup",
+            "--modules-dir", str(modules_dir),
+            "--agents-md", str(agents_md),
+            # NOTE: no --skills-dir
+        ],
+    )
+
+    module_setup.main()
+
+    assert called["fetch"] == 1, "CLI must fetch the resolved set with flag on"
+    # And the module was actually overlaid.
+    assert (modules_dir / "registry-only-mod" / "module.yaml").is_file()
+
+
+def test_cli_main_does_not_fetch_when_flag_off(tmp_path: Path, monkeypatch):
+    """Flag OFF → CLI ``main()`` makes zero registry fetches regardless of
+    whether ``--skills-dir`` is passed."""
+    monkeypatch.delenv(FEATURE_FLAG_ENV, raising=False)
+    modules_dir = tmp_path / "modules"
+    agents_md = _agents_md(tmp_path)
+
+    def _boom():
+        raise AssertionError("must not fetch when flag off")
+
+    monkeypatch.setattr(module_setup, "_fetch_registry_resolved", _boom)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "module_setup",
+            "--modules-dir", str(modules_dir),
+            "--agents-md", str(agents_md),
+        ],
+    )
+
+    module_setup.main()  # must not raise
+
+    # No registry module installed.
+    assert not (modules_dir / "registry-only-mod").exists()

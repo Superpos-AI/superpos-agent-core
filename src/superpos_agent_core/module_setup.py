@@ -192,7 +192,13 @@ def run_setup(
     # nothing above changed, preserving the baked-in-only path bit-for-bit.
     from .registry_overlay import apply_registry_overlay, feature_enabled
 
-    if feature_enabled() and skills_dir is not None:
+    # Modules are overlaid into the workspace modules dir and do NOT need a
+    # skills_dir; only the skills half of the overlay does.  So gate the
+    # overlay solely on the flag — ``apply_registry_overlay`` skips just the
+    # skills portion when ``skills_dir`` is missing and still installs
+    # modules.  (Previously this whole call was gated on ``skills_dir``, so a
+    # flag-on startup command without a skills dir silently overlaid nothing.)
+    if feature_enabled():
         apply_registry_overlay(
             registry_resolved,
             modules_dir=modules_dir,
@@ -268,7 +274,8 @@ def main() -> None:
         "--skills-dir",
         help=(
             "Optional skills directory (e.g. /workspace/.claude/skills). "
-            "Required for the Beat 2b registry overlay to write skills."
+            "Required for the Beat 2b registry overlay to write skills; "
+            "registry modules are overlaid even without it."
         ),
     )
     args = parser.parse_args()
@@ -277,8 +284,14 @@ def main() -> None:
     # zero registry calls, identical to today's baked-in path).
     from .registry_overlay import feature_enabled
 
+    # Fetch the resolved set whenever the flag is on — NOT conditioned on
+    # ``--skills-dir``.  Modules are overlaid regardless of a skills dir, so
+    # gating the fetch on ``--skills-dir`` meant a flag-on rollout for a
+    # startup command without that flag never fetched and only rendered
+    # baked-in modules.  ``apply_registry_overlay`` skips only the skills
+    # half when no skills dir is available.
     registry_resolved = None
-    if feature_enabled() and args.skills_dir:
+    if feature_enabled():
         registry_resolved = _fetch_registry_resolved()
 
     run_setup(
