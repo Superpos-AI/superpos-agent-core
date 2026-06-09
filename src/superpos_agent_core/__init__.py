@@ -2,6 +2,7 @@
 
 from .config import BaseConfig
 from .executor import Executor, ExecutionRequest
+from .knowledge import KnowledgeClient, KnowledgeNotFound
 from .main import ExecutorFactory, run_agent, setup_logging
 from .module_loader import (
     bundled_modules_dir,
@@ -43,6 +44,8 @@ __all__ = [
     "ExecutionRequest",
     "ExecutorFactory",
     "GitHubDiscoveryForbidden",
+    "KnowledgeClient",
+    "KnowledgeNotFound",
     "ModuleOverlayResult",
     "Priority",
     "RecentTasksLog",
