@@ -116,13 +116,13 @@ async def test_update_page_puts_only_provided_fields():
     handler, captured = _capturing(_envelope({"id": "kxe_1", "version": 4}))
     client = _make_client(handler)
 
-    result = await client.update_page("kxe_1", append_body="more")
+    result = await client.update_page("kxe_1", title="New Title")
 
     req = captured[0]
     assert req.method == "PUT"
     assert req.url.path == f"{BASE}/kxe_1"
     sent = json.loads(req.content)
-    assert sent == {"append_body": "more"}
+    assert sent == {"title": "New Title"}
     assert result == {"id": "kxe_1", "version": 4}
 
 

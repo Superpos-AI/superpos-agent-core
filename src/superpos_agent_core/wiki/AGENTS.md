@@ -116,8 +116,8 @@ bookkeeper:
    content_sha256, …}])`. Each descriptor is ingested **and** attached
    in the same transaction, satisfying the attach ACL directly.
 
-3. **Append to a page.** `update_page(entry_id, append_body="…")` adds a
-   paragraph and bumps the version without rewriting the whole body.
+3. **Update a page.** `update_page(entry_id, body="…")` replaces the page
+   body (full replacement) and bumps the version.
 
 4. **Synthesise a topic.** Given a set of source ULIDs you can read,
    `synthesize_topic(source_ids=[…], slug="topic:…")` dispatches an

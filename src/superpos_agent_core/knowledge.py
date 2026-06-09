@@ -173,7 +173,6 @@ class KnowledgeClient:
         entry_id: str,
         *,
         body: str | None = None,
-        append_body: str | None = None,
         frontmatter: Mapping[str, Any] | None = None,
         title: str | None = None,
         tags: Sequence[str] | None = None,
@@ -184,17 +183,15 @@ class KnowledgeClient:
     ) -> dict[str, Any]:
         """``PUT /knowledge/{entry}`` — update a typed wiki page.
 
-        Supports partial body updates and the "append a paragraph"
-        convenience (``append_body``); bumps the page version
-        server-side. Only the fields you pass are sent, so an update
-        that touches just ``frontmatter`` leaves ``body`` untouched.
+        Supports partial updates and bumps the page version server-side.
+        Only the fields you pass are sent, so an update that touches just
+        ``frontmatter`` leaves ``body`` untouched. ``body`` is a full
+        replacement of the page body.
         """
         hive_id = self._hive(hive)
         payload: dict[str, Any] = {}
         if body is not None:
             payload["body"] = body
-        if append_body is not None:
-            payload["append_body"] = append_body
         if frontmatter is not None:
             payload["frontmatter"] = dict(frontmatter)
         if title is not None:
