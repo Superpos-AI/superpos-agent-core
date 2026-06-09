@@ -17,18 +17,6 @@ from .registry_overlay import (
     SkillOverlayResult,
     apply_registry_overlay,
 )
-from .registry_sync import (
-    AgentScopeSyncResult,
-    RegistryFetchError,
-    RegistryResolverClient,
-    RegistrySyncConfig,
-    ResolvedItem,
-    TaskScopeSyncResult,
-    UnsafePathSegmentError,
-    resolve_path,
-    sync_agent_scope,
-    sync_task_scope,
-)
 from .sub_agent_sync import sync_sub_agents
 from .progress_reporter import report_progress
 from .recent_tasks import RecentTasksLog, TaskSummary
@@ -50,7 +38,6 @@ from .worktree_manager import (
 )
 
 __all__ = [
-    "AgentScopeSyncResult",
     "BaseConfig",
     "Executor",
     "ExecutionRequest",
@@ -59,20 +46,14 @@ __all__ = [
     "ModuleOverlayResult",
     "Priority",
     "RecentTasksLog",
-    "RegistryFetchError",
     "RegistryOverlayResult",
-    "RegistryResolverClient",
-    "RegistrySyncConfig",
-    "ResolvedItem",
     "RuntimeConfig",
     "SessionStore",
     "SkillOverlayResult",
     "SuperposClient",
-    "TaskScopeSyncResult",
     "TaskSummary",
     "TelegramGateway",
     "TelegramStreamer",
-    "UnsafePathSegmentError",
     "apply_registry_overlay",
     "build_telegram_app",
     "bundled_modules_dir",
@@ -85,16 +66,13 @@ __all__ = [
     "prune_worktrees",
     "redact",
     "report_progress",
-    "resolve_path",
     "run_agent",
     "run_module_setup",
     "run_superpos_poller",
     "run_telegram_bot",
     "setup_logging",
     "slot_key",
-    "sync_agent_scope",
     "sync_sub_agents",
-    "sync_task_scope",
     "symlink_module_scripts",
     "worktree_path",
 ]
