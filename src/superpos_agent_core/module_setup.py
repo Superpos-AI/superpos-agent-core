@@ -148,18 +148,49 @@ def run_setup(
     agents_md_path: str,
     *,
     bin_dir: str | None = None,
+    registry_resolved: dict | None = None,
+    skills_dir: str | None = None,
 ) -> None:
     """Discover modules, run setup scripts, install deps, update system prompt.
 
     ``bin_dir`` (optional) — if provided, every discovered module's
     ``scripts/`` files are symlinked here.  Set to a directory that's on
     ``$PATH`` so the agent can invoke scripts by name.
+
+    ``registry_resolved`` (optional, Beat 2b) — when the
+    ``PLATFORM_REGISTRY_SERVE_SKILLS_MODULES`` flag is ON, pass the parsed
+    ``/registry/resolved`` payload here and the registry-served skills +
+    modules are overlaid on top of the baked-in set (registry wins on slug
+    collision).  When the flag is OFF this argument is ignored entirely —
+    the baked-in path below runs exactly as before, which is the
+    instant-rollback guarantee.  Pass ``None`` (or a flag-off env) to keep
+    today's behaviour.
     """
     if not os.path.isdir(modules_dir):
         log.info(
             "No workspace modules directory at %s — proceeding with bundled modules only",
             modules_dir,
         )
+
+    # Instant-rollback: when the Beat 2b flag is OFF, purge any registry
+    # modules a prior flag-ON run materialised into the persistent
+    # ``modules_dir`` (plus their PATH symlinks) BEFORE the baked-in
+    # discover/symlink/doc steps below — otherwise those steps would still
+    # pick them up and the flag-off path would NOT be back to baked-in.
+    # Lazy import avoids a circular import (registry_overlay imports here).
+    from .registry_overlay import (
+        feature_enabled,
+        remove_registry_overlay_modules,
+    )
+
+    if not feature_enabled():
+        rolled_back = remove_registry_overlay_modules(modules_dir, bin_dir=bin_dir)
+        if rolled_back:
+            log.info(
+                "Registry overlay flag OFF: removed %d registry-managed "
+                "module(s) for instant rollback: %s",
+                len(rolled_back), rolled_back,
+            )
 
     modules = discover_modules(modules_dir if os.path.isdir(modules_dir) else None)
     log.info("Discovered %d module(s): %s", len(modules), [m.name for m in modules])
@@ -173,6 +204,71 @@ def run_setup(
 
     doc = generate_modules_doc(modules)
     update_agents_md(doc, agents_md_path)
+
+    # Beat 2b: overlay registry-served skills + modules on top of baked-in.
+    # Imported lazily to avoid a circular import (registry_overlay imports
+    # from this module).  ``feature_enabled`` is re-checked inside
+    # ``apply_registry_overlay`` — when the flag is OFF this is a no-op and
+    # nothing above changed, preserving the baked-in-only path bit-for-bit.
+    from .registry_overlay import apply_registry_overlay
+
+    # Modules are overlaid into the workspace modules dir and do NOT need a
+    # skills_dir; only the skills half of the overlay does.  So gate the
+    # overlay solely on the flag — ``apply_registry_overlay`` skips just the
+    # skills portion when ``skills_dir`` is missing and still installs
+    # modules.  (Previously this whole call was gated on ``skills_dir``, so a
+    # flag-on startup command without a skills dir silently overlaid nothing.)
+    if feature_enabled():
+        apply_registry_overlay(
+            registry_resolved,
+            modules_dir=modules_dir,
+            skills_dir=skills_dir,
+            agents_md_path=agents_md_path,
+            bin_dir=bin_dir,
+        )
+
+
+def _fetch_registry_resolved() -> dict | None:
+    """Sync fetch of ``/registry/resolved`` for the CLI entrypoint path.
+
+    Mirrors ``sub_agent_sync.fetch_runtime_bundle``'s defensive style:
+    returns ``None`` on any transport / status / parse failure so the
+    caller falls back entirely to baked-in.  Only called when the Beat 2b
+    flag is on and ``SUPERPOS_BASE_URL`` / ``SUPERPOS_API_TOKEN`` are set.
+    """
+    import httpx
+
+    base_url = os.environ.get("SUPERPOS_BASE_URL", "").rstrip("/")
+    token = os.environ.get("SUPERPOS_API_TOKEN", "")
+    if not base_url or not token:
+        log.warning(
+            "Registry overlay flag on but SUPERPOS_BASE_URL/SUPERPOS_API_TOKEN "
+            "unset; falling back to baked-in.",
+        )
+        return None
+    try:
+        with httpx.Client(
+            base_url=base_url, timeout=30.0, follow_redirects=True,
+        ) as client:
+            resp = client.get(
+                "/api/v1/registry/resolved",
+                headers={
+                    "Accept": "application/json",
+                    "Authorization": f"Bearer {token}",
+                },
+            )
+        if resp.status_code != 200:
+            log.warning(
+                "Registry resolved returned %s; falling back to baked-in.",
+                resp.status_code,
+            )
+            return None
+        data = resp.json()
+    except Exception as exc:  # noqa: BLE001 — degrade to baked-in on any error
+        log.warning("Registry resolved fetch failed (%s); baked-in only.", exc)
+        return None
+    payload = data.get("data", data) if isinstance(data, dict) else None
+    return payload if isinstance(payload, dict) else None
 
 
 def main() -> None:
@@ -194,8 +290,37 @@ def main() -> None:
             "Add this directory to PATH so the agent can invoke them by name."
         ),
     )
+    parser.add_argument(
+        "--skills-dir",
+        help=(
+            "Optional skills directory (e.g. /workspace/.claude/skills). "
+            "Required for the Beat 2b registry overlay to write skills; "
+            "registry modules are overlaid even without it."
+        ),
+    )
     args = parser.parse_args()
-    run_setup(args.modules_dir, args.agents_md, bin_dir=args.bin_dir)
+
+    # Beat 2b: only touch the registry when the flag is on (default OFF →
+    # zero registry calls, identical to today's baked-in path).
+    from .registry_overlay import feature_enabled
+
+    # Fetch the resolved set whenever the flag is on — NOT conditioned on
+    # ``--skills-dir``.  Modules are overlaid regardless of a skills dir, so
+    # gating the fetch on ``--skills-dir`` meant a flag-on rollout for a
+    # startup command without that flag never fetched and only rendered
+    # baked-in modules.  ``apply_registry_overlay`` skips only the skills
+    # half when no skills dir is available.
+    registry_resolved = None
+    if feature_enabled():
+        registry_resolved = _fetch_registry_resolved()
+
+    run_setup(
+        args.modules_dir,
+        args.agents_md,
+        bin_dir=args.bin_dir,
+        registry_resolved=registry_resolved,
+        skills_dir=args.skills_dir,
+    )
 
 
 if __name__ == "__main__":

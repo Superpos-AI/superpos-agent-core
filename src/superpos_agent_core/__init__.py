@@ -12,17 +12,12 @@ from .module_loader import (
 )
 from .module_setup import run_setup as run_module_setup
 from .module_setup import symlink_module_scripts
-from .registry_sync import (
-    AgentScopeSyncResult,
-    RegistryFetchError,
-    RegistryResolverClient,
-    RegistrySyncConfig,
-    ResolvedItem,
-    TaskScopeSyncResult,
-    UnsafePathSegmentError,
-    resolve_path,
-    sync_agent_scope,
-    sync_task_scope,
+from .registry_overlay import (
+    ModuleOverlayResult,
+    RegistryOverlayResult,
+    SkillOverlayResult,
+    apply_registry_overlay,
+    remove_registry_overlay_modules,
 )
 from .sub_agent_sync import sync_sub_agents
 from .progress_reporter import report_progress
@@ -45,7 +40,6 @@ from .worktree_manager import (
 )
 
 __all__ = [
-    "AgentScopeSyncResult",
     "BaseConfig",
     "Executor",
     "ExecutionRequest",
@@ -53,20 +47,18 @@ __all__ = [
     "GitHubDiscoveryForbidden",
     "KnowledgeClient",
     "KnowledgeNotFound",
+    "ModuleOverlayResult",
     "Priority",
     "RecentTasksLog",
-    "RegistryFetchError",
-    "RegistryResolverClient",
-    "RegistrySyncConfig",
-    "ResolvedItem",
+    "RegistryOverlayResult",
     "RuntimeConfig",
     "SessionStore",
+    "SkillOverlayResult",
     "SuperposClient",
-    "TaskScopeSyncResult",
     "TaskSummary",
     "TelegramGateway",
     "TelegramStreamer",
-    "UnsafePathSegmentError",
+    "apply_registry_overlay",
     "build_telegram_app",
     "bundled_modules_dir",
     "collect_mcp_servers",
@@ -77,17 +69,15 @@ __all__ = [
     "is_git_repo",
     "prune_worktrees",
     "redact",
+    "remove_registry_overlay_modules",
     "report_progress",
-    "resolve_path",
     "run_agent",
     "run_module_setup",
     "run_superpos_poller",
     "run_telegram_bot",
     "setup_logging",
     "slot_key",
-    "sync_agent_scope",
     "sync_sub_agents",
-    "sync_task_scope",
     "symlink_module_scripts",
     "worktree_path",
 ]
