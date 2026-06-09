@@ -148,12 +148,23 @@ def run_setup(
     agents_md_path: str,
     *,
     bin_dir: str | None = None,
+    registry_resolved: dict | None = None,
+    skills_dir: str | None = None,
 ) -> None:
     """Discover modules, run setup scripts, install deps, update system prompt.
 
     ``bin_dir`` (optional) — if provided, every discovered module's
     ``scripts/`` files are symlinked here.  Set to a directory that's on
     ``$PATH`` so the agent can invoke scripts by name.
+
+    ``registry_resolved`` (optional, Beat 2b) — when the
+    ``PLATFORM_REGISTRY_SERVE_SKILLS_MODULES`` flag is ON, pass the parsed
+    ``/registry/resolved`` payload here and the registry-served skills +
+    modules are overlaid on top of the baked-in set (registry wins on slug
+    collision).  When the flag is OFF this argument is ignored entirely —
+    the baked-in path below runs exactly as before, which is the
+    instant-rollback guarantee.  Pass ``None`` (or a flag-off env) to keep
+    today's behaviour.
     """
     if not os.path.isdir(modules_dir):
         log.info(
@@ -173,6 +184,65 @@ def run_setup(
 
     doc = generate_modules_doc(modules)
     update_agents_md(doc, agents_md_path)
+
+    # Beat 2b: overlay registry-served skills + modules on top of baked-in.
+    # Imported lazily to avoid a circular import (registry_overlay imports
+    # from this module).  ``feature_enabled`` is re-checked inside
+    # ``apply_registry_overlay`` — when the flag is OFF this is a no-op and
+    # nothing above changed, preserving the baked-in-only path bit-for-bit.
+    from .registry_overlay import apply_registry_overlay, feature_enabled
+
+    if feature_enabled() and skills_dir is not None:
+        apply_registry_overlay(
+            registry_resolved,
+            modules_dir=modules_dir,
+            skills_dir=skills_dir,
+            agents_md_path=agents_md_path,
+            bin_dir=bin_dir,
+        )
+
+
+def _fetch_registry_resolved() -> dict | None:
+    """Sync fetch of ``/registry/resolved`` for the CLI entrypoint path.
+
+    Mirrors ``sub_agent_sync.fetch_runtime_bundle``'s defensive style:
+    returns ``None`` on any transport / status / parse failure so the
+    caller falls back entirely to baked-in.  Only called when the Beat 2b
+    flag is on and ``SUPERPOS_BASE_URL`` / ``SUPERPOS_API_TOKEN`` are set.
+    """
+    import httpx
+
+    base_url = os.environ.get("SUPERPOS_BASE_URL", "").rstrip("/")
+    token = os.environ.get("SUPERPOS_API_TOKEN", "")
+    if not base_url or not token:
+        log.warning(
+            "Registry overlay flag on but SUPERPOS_BASE_URL/SUPERPOS_API_TOKEN "
+            "unset; falling back to baked-in.",
+        )
+        return None
+    try:
+        with httpx.Client(
+            base_url=base_url, timeout=30.0, follow_redirects=True,
+        ) as client:
+            resp = client.get(
+                "/api/v1/registry/resolved",
+                headers={
+                    "Accept": "application/json",
+                    "Authorization": f"Bearer {token}",
+                },
+            )
+        if resp.status_code != 200:
+            log.warning(
+                "Registry resolved returned %s; falling back to baked-in.",
+                resp.status_code,
+            )
+            return None
+        data = resp.json()
+    except Exception as exc:  # noqa: BLE001 — degrade to baked-in on any error
+        log.warning("Registry resolved fetch failed (%s); baked-in only.", exc)
+        return None
+    payload = data.get("data", data) if isinstance(data, dict) else None
+    return payload if isinstance(payload, dict) else None
 
 
 def main() -> None:
@@ -194,8 +264,30 @@ def main() -> None:
             "Add this directory to PATH so the agent can invoke them by name."
         ),
     )
+    parser.add_argument(
+        "--skills-dir",
+        help=(
+            "Optional skills directory (e.g. /workspace/.claude/skills). "
+            "Required for the Beat 2b registry overlay to write skills."
+        ),
+    )
     args = parser.parse_args()
-    run_setup(args.modules_dir, args.agents_md, bin_dir=args.bin_dir)
+
+    # Beat 2b: only touch the registry when the flag is on (default OFF →
+    # zero registry calls, identical to today's baked-in path).
+    from .registry_overlay import feature_enabled
+
+    registry_resolved = None
+    if feature_enabled() and args.skills_dir:
+        registry_resolved = _fetch_registry_resolved()
+
+    run_setup(
+        args.modules_dir,
+        args.agents_md,
+        bin_dir=args.bin_dir,
+        registry_resolved=registry_resolved,
+        skills_dir=args.skills_dir,
+    )
 
 
 if __name__ == "__main__":

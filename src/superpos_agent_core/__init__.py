@@ -11,6 +11,12 @@ from .module_loader import (
 )
 from .module_setup import run_setup as run_module_setup
 from .module_setup import symlink_module_scripts
+from .registry_overlay import (
+    ModuleOverlayResult,
+    RegistryOverlayResult,
+    SkillOverlayResult,
+    apply_registry_overlay,
+)
 from .registry_sync import (
     AgentScopeSyncResult,
     RegistryFetchError,
@@ -50,20 +56,24 @@ __all__ = [
     "ExecutionRequest",
     "ExecutorFactory",
     "GitHubDiscoveryForbidden",
+    "ModuleOverlayResult",
     "Priority",
     "RecentTasksLog",
     "RegistryFetchError",
+    "RegistryOverlayResult",
     "RegistryResolverClient",
     "RegistrySyncConfig",
     "ResolvedItem",
     "RuntimeConfig",
     "SessionStore",
+    "SkillOverlayResult",
     "SuperposClient",
     "TaskScopeSyncResult",
     "TaskSummary",
     "TelegramGateway",
     "TelegramStreamer",
     "UnsafePathSegmentError",
+    "apply_registry_overlay",
     "build_telegram_app",
     "bundled_modules_dir",
     "collect_mcp_servers",

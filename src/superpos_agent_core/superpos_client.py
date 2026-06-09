@@ -1286,6 +1286,39 @@ class SuperposClient:
             return None
         return payload
 
+    async def get_registry_resolved(self) -> dict[str, Any] | None:
+        """``GET /registry/resolved`` — registry-served skills + modules (+ subagents).
+
+        Beat 2a (superpos-app) added grouped top-level keys to the resolved
+        response alongside the existing flat ``items`` list:
+
+        - ``skills``  — ``[{slug, name, revision_id, instructions, files, ...}]``
+        - ``modules`` — ``[{slug, name, revision_id, manifest, files, install, skill, ...}]``
+        - ``subagents`` — not consumed agent-side here.
+
+        Returns the parsed payload dict (already unwrapped from the
+        ``{"data": ...}`` envelope), or ``None`` if the endpoint is
+        unavailable / returns a non-200 / bad shape.  Callers treat
+        ``None`` as "fall back to baked-in" — same defensive posture as
+        :meth:`get_runtime_bundle`.
+        """
+        try:
+            resp = await self._request("GET", "/api/v1/registry/resolved")
+        except Exception:
+            log.warning("Registry resolved fetch failed", exc_info=True)
+            return None
+        if resp.status_code != 200:
+            return None
+        try:
+            data = resp.json()
+        except ValueError:
+            log.warning("Registry resolved response was not JSON")
+            return None
+        payload = data.get("data", data) if isinstance(data, dict) else None
+        if not isinstance(payload, dict):
+            return None
+        return payload
+
     # ── Service proxy ─────────────────────────────────────────────────
 
     async def discover_services(
