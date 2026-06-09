@@ -772,3 +772,194 @@ def test_cli_main_does_not_fetch_when_flag_off(tmp_path: Path, monkeypatch):
 
     # No registry module installed.
     assert not (modules_dir / "registry-only-mod").exists()
+
+
+# ── Instant-rollback: flag-ON install then flag-OFF restart ──────────
+
+
+def test_flag_on_install_then_flag_off_restart_removes_registry_module(
+    tmp_path: Path, monkeypatch
+):
+    """Reviewer regression (PR #29): a registry-only module materialised
+    during a flag-ON run must be GONE — absent from docs AND PATH — after a
+    flag-OFF restart against the *same* modules/bin dirs.  This is the
+    instant-rollback guarantee that was previously broken because the
+    baked-in discover/symlink/doc path picked up the persisted dir before
+    the flag was ever checked."""
+    modules_dir = tmp_path / "modules"
+    bin_dir = tmp_path / "bin"
+    skills_dir = tmp_path / "skills"
+    agents_md = _agents_md(tmp_path)
+
+    # 1) Flag ON — install the registry-only module.
+    monkeypatch.setenv(FEATURE_FLAG_ENV, "true")
+    module_setup.run_setup(
+        str(modules_dir),
+        str(agents_md),
+        bin_dir=str(bin_dir),
+        registry_resolved=_resolved_payload(),
+        skills_dir=str(skills_dir),
+    )
+    assert (modules_dir / "registry-only-mod" / "module.yaml").is_file()
+    assert (bin_dir / "regmod-cli").is_symlink()
+    assert "registry-only-mod" in agents_md.read_text()
+
+    # 2) Flag OFF — restart against the SAME dirs.  No payload (the CLI never
+    #    even fetches when the flag is off).
+    monkeypatch.delenv(FEATURE_FLAG_ENV, raising=False)
+    module_setup.run_setup(
+        str(modules_dir),
+        str(agents_md),
+        bin_dir=str(bin_dir),
+        registry_resolved=None,
+        skills_dir=str(skills_dir),
+    )
+
+    # The registry-only module is fully rolled back: gone from disk, gone
+    # from PATH, gone from the rendered docs.
+    assert not (modules_dir / "registry-only-mod").exists()
+    assert not (bin_dir / "regmod-cli").exists()  # symlink unlinked, not dangling
+    assert not (bin_dir / "regmod-cli").is_symlink()
+    doc = agents_md.read_text()
+    assert "registry-only-mod" not in doc
+    # Baked-in modules are unaffected by the rollback.
+    assert "superpos-github" in doc
+
+
+def test_flag_off_rollback_preserves_bundled_and_hand_authored_modules(
+    tmp_path: Path, monkeypatch
+):
+    """The rollback sweep removes ONLY registry-managed dirs (those carrying
+    the marker) — a hand-authored workspace module without the marker is
+    left untouched."""
+    from superpos_agent_core.registry_overlay import REGISTRY_MANAGED_MARKER
+
+    modules_dir = tmp_path / "modules"
+    bin_dir = tmp_path / "bin"
+    agents_md = _agents_md(tmp_path)
+
+    # A hand-authored workspace module (no marker).
+    hand = modules_dir / "hand-authored"
+    (hand / "scripts").mkdir(parents=True)
+    (hand / "module.yaml").write_text("description: hand authored\nenv: []\n")
+    (hand / "scripts" / "hand-cli").write_text("#!/bin/sh\necho hi\n")
+
+    # A registry-managed module (carries the marker).
+    reg = modules_dir / "reg-mod"
+    (reg / "scripts").mkdir(parents=True)
+    (reg / "module.yaml").write_text("description: reg\nenv: []\n")
+    (reg / "scripts" / "reg-cli").write_text("#!/bin/sh\necho reg\n")
+    (reg / REGISTRY_MANAGED_MARKER).write_text("")
+
+    monkeypatch.delenv(FEATURE_FLAG_ENV, raising=False)
+    module_setup.run_setup(
+        str(modules_dir), str(agents_md), bin_dir=str(bin_dir),
+    )
+
+    assert (modules_dir / "hand-authored").is_dir()  # untouched
+    assert not (modules_dir / "reg-mod").exists()  # rolled back
+    doc = agents_md.read_text()
+    assert "hand-authored" in doc
+    assert "reg-mod" not in doc
+
+
+def test_remove_registry_overlay_modules_unlinks_only_matching_bin_links(
+    tmp_path: Path,
+):
+    """The bin cleanup unlinks the removed module's symlinks (matched by
+    target, even once broken) and leaves an unrelated same-named link of a
+    different target alone is not required here — but a link pointing into
+    the removed module must go, and links into a surviving module stay."""
+    from superpos_agent_core.registry_overlay import (
+        REGISTRY_MANAGED_MARKER,
+        remove_registry_overlay_modules,
+    )
+
+    modules_dir = tmp_path / "modules"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+
+    reg = modules_dir / "reg-mod"
+    (reg / "scripts").mkdir(parents=True)
+    script = reg / "scripts" / "reg-cli"
+    script.write_text("#!/bin/sh\n")
+    (reg / REGISTRY_MANAGED_MARKER).write_text("")
+    (bin_dir / "reg-cli").symlink_to(script.resolve())
+
+    # A surviving (non-registry) module + its bin link must remain.
+    keep_mod = modules_dir / "keep-mod"
+    (keep_mod / "scripts").mkdir(parents=True)
+    keep_script = keep_mod / "scripts" / "keep-cli"
+    keep_script.write_text("#!/bin/sh\n")
+    (bin_dir / "keep-cli").symlink_to(keep_script.resolve())
+
+    removed = remove_registry_overlay_modules(str(modules_dir), bin_dir=str(bin_dir))
+
+    assert removed == ["reg-mod"]
+    assert not (modules_dir / "reg-mod").exists()
+    assert not (bin_dir / "reg-cli").is_symlink()  # stale link cleared
+    assert (modules_dir / "keep-mod").is_dir()  # unrelated module kept
+    assert (bin_dir / "keep-cli").is_symlink()  # unrelated link kept
+
+
+# ── Flag-ON reconcile: module disappears from the resolved set ───────
+
+
+def test_flag_on_reconcile_removes_module_absent_from_resolved(
+    tmp_path: Path, monkeypatch
+):
+    """When the flag stays ON across restarts but a registry module
+    disappears from ``/registry/resolved`` (removed / unauthorised), the
+    next overlay must drop it from disk, PATH and docs — while keeping the
+    modules the registry still serves."""
+    modules_dir = tmp_path / "modules"
+    bin_dir = tmp_path / "bin"
+    skills_dir = tmp_path / "skills"
+    agents_md = _agents_md(tmp_path)
+    monkeypatch.setenv(FEATURE_FLAG_ENV, "true")
+
+    # Round 1 — registry serves the module.
+    module_setup.run_setup(
+        str(modules_dir), str(agents_md), bin_dir=str(bin_dir),
+        registry_resolved=_resolved_payload(), skills_dir=str(skills_dir),
+    )
+    assert (modules_dir / "registry-only-mod" / "module.yaml").is_file()
+    assert (bin_dir / "regmod-cli").is_symlink()
+
+    # Round 2 — registry no longer serves it (empty module set).
+    module_setup.run_setup(
+        str(modules_dir), str(agents_md), bin_dir=str(bin_dir),
+        registry_resolved={"skills": [], "modules": []},
+        skills_dir=str(skills_dir),
+    )
+    assert not (modules_dir / "registry-only-mod").exists()
+    assert not (bin_dir / "regmod-cli").is_symlink()
+    assert "registry-only-mod" not in agents_md.read_text()
+
+
+def test_flag_on_fetch_failure_does_not_reconcile_away_existing_module(
+    tmp_path: Path, monkeypatch
+):
+    """A transient fetch failure (resolved is None) must NOT delete a
+    previously-installed registry module — the reconcile only runs against a
+    fresh, authoritative resolved set."""
+    modules_dir = tmp_path / "modules"
+    bin_dir = tmp_path / "bin"
+    skills_dir = tmp_path / "skills"
+    agents_md = _agents_md(tmp_path)
+    monkeypatch.setenv(FEATURE_FLAG_ENV, "true")
+
+    module_setup.run_setup(
+        str(modules_dir), str(agents_md), bin_dir=str(bin_dir),
+        registry_resolved=_resolved_payload(), skills_dir=str(skills_dir),
+    )
+    assert (modules_dir / "registry-only-mod" / "module.yaml").is_file()
+
+    # Flag still ON but fetch failed → resolved is None → fall back to
+    # baked-in, leave the existing registry module in place.
+    module_setup.run_setup(
+        str(modules_dir), str(agents_md), bin_dir=str(bin_dir),
+        registry_resolved=None, skills_dir=str(skills_dir),
+    )
+    assert (modules_dir / "registry-only-mod" / "module.yaml").is_file()
+    assert (bin_dir / "regmod-cli").is_symlink()

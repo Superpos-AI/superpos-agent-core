@@ -74,6 +74,21 @@ FEATURE_FLAG_ENV = "PLATFORM_REGISTRY_SERVE_SKILLS_MODULES"
 #: bounded retry.  Asserted by tests; grep-able in production logs.
 MODULE_INSTALL_FAILED_EVENT = "registry.module_install_failed"
 
+#: Sentinel file dropped into every registry-materialised module dir so a
+#: later restart can tell registry-managed installs apart from bundled /
+#: hand-authored workspace modules.  This is what makes the instant-rollback
+#: guarantee real: registry modules are written into the *persistent*
+#: workspace ``modules_dir``, so a flag-OFF restart must be able to find and
+#: remove exactly the registry-managed ones (and nothing else) before the
+#: baked-in discover/symlink/doc path runs.  Bundled and hand-authored
+#: modules never carry this marker, so they are never touched.
+REGISTRY_MANAGED_MARKER = ".registry-overlay"
+
+#: Structured log record emitted when a registry-managed module is removed
+#: on a flag-OFF rollback sweep or a flag-ON reconcile (disappeared from the
+#: resolved set).  Asserted by tests; grep-able in production logs.
+MODULE_REMOVED_EVENT = "registry.module_removed"
+
 #: Number of *extra* attempts after the first install attempt for a single
 #: module (so total attempts = 1 + _MODULE_INSTALL_RETRIES).
 _MODULE_INSTALL_RETRIES = 1
@@ -256,6 +271,11 @@ def _materialise_module(module: dict, modules_dir: Path) -> Path:
         skill_md = module.get("skill")
         if skill_md:
             (staging_dir / "SKILL.md").write_text(skill_md, encoding="utf-8")
+
+        # Provenance marker — written *inside* the atomic staging build so it
+        # is swapped into place together with the module's content.  A later
+        # flag-OFF restart removes exactly the dirs carrying this sentinel.
+        (staging_dir / REGISTRY_MANAGED_MARKER).write_text("", encoding="utf-8")
     except BaseException:
         # New version is incomplete — discard the staging dir and leave the
         # existing install (if any) exactly as it was.
@@ -355,6 +375,93 @@ def overlay_modules(
     return result
 
 
+def _unlink_module_bin_symlinks(module_dir: Path, bin_dir: Path) -> None:
+    """Unlink any ``bin_dir`` symlink that points into ``module_dir``.
+
+    Registry module scripts are symlinked onto a PATH dir by
+    :func:`module_setup.symlink_module_scripts` (target = the absolute
+    ``<module_dir>/scripts/<name>``).  When the module dir is removed those
+    links dangle, so the rollback must clear them too — otherwise a removed
+    registry module's command name stays resolvable on PATH (pointing at a
+    now-missing target).  We match by the symlink's *target* (via
+    ``realpath``, which works even once the link is broken) so we never
+    remove an unrelated link that merely shares a basename.
+    """
+    if not bin_dir.is_dir():
+        return
+    module_prefix = str(module_dir) + os.sep
+    for link in sorted(bin_dir.iterdir()):
+        if not link.is_symlink():
+            continue
+        target = os.path.realpath(link)
+        if target == str(module_dir) or target.startswith(module_prefix):
+            try:
+                link.unlink()
+            except OSError as exc:  # pragma: no cover — defensive
+                log.warning("Could not unlink stale bin symlink %s: %s", link, exc)
+
+
+def remove_registry_overlay_modules(
+    modules_dir: str,
+    *,
+    bin_dir: str | None = None,
+    keep: set[str] | None = None,
+) -> list[str]:
+    """Remove registry-materialised modules from the workspace ``modules_dir``.
+
+    Only directories carrying the :data:`REGISTRY_MANAGED_MARKER` sentinel
+    are removed — bundled and hand-authored workspace modules never carry
+    it, so they are left untouched.  Any ``bin_dir`` symlink pointing into a
+    removed module is unlinked too, so the removal also clears the module's
+    scripts from PATH.
+
+    ``keep`` — when provided, registry-managed modules whose slug is in this
+    set are retained and everything else managed is removed (the flag-ON
+    *reconcile* against the current resolved set).  When ``None`` (default)
+    **all** registry-managed modules are removed (the flag-OFF instant
+    rollback sweep).
+
+    Returns the sorted list of removed slugs.
+    """
+    root = Path(modules_dir)
+    if not root.is_dir():
+        return []
+    bin_path = Path(bin_dir) if bin_dir else None
+    removed: list[str] = []
+    for entry in sorted(root.iterdir()):
+        if not entry.is_dir() or entry.is_symlink():
+            continue
+        # Guard against a crafted dir name escaping the root before any
+        # destructive rmtree.
+        if not _is_safe_slug(entry.name):
+            continue
+        if not (entry / REGISTRY_MANAGED_MARKER).is_file():
+            continue
+        if keep is not None and entry.name in keep:
+            continue
+        module_abs = entry.resolve()
+        try:
+            shutil.rmtree(entry)
+        except OSError as exc:
+            log.warning("Failed to remove registry module %s: %s", entry.name, exc)
+            continue
+        if bin_path is not None:
+            _unlink_module_bin_symlinks(module_abs, bin_path)
+        removed.append(entry.name)
+        log.info(
+            "%s slug=%s reason=%s",
+            MODULE_REMOVED_EVENT,
+            entry.name,
+            "flag_off_rollback" if keep is None else "reconcile_absent",
+            extra={
+                "event": MODULE_REMOVED_EVENT,
+                "module_slug": entry.name,
+                "reason": "flag_off_rollback" if keep is None else "reconcile_absent",
+            },
+        )
+    return removed
+
+
 # ── Top-level overlay entry point ────────────────────────────────────
 
 
@@ -450,11 +557,28 @@ def apply_registry_overlay(
             )
     modules_result = overlay_modules(module_items, modules_dir)
 
+    # Reconcile: drop registry-managed modules that are no longer in the
+    # resolved set (removed / unauthorised upstream) so they don't linger on
+    # disk and PATH.  Only runs because we have a fresh, authoritative
+    # ``resolved`` here — a fetch failure short-circuits above, so a transient
+    # outage never wipes a previously-working registry module.  ``keep`` is
+    # every slug the registry still serves, including ones that failed to
+    # (re)install this round, so a flaky install never deletes a good module.
+    keep = {
+        m.get("slug")
+        for m in module_items
+        if isinstance(m, dict) and _is_safe_slug(m.get("slug"))
+    }
+    removed = remove_registry_overlay_modules(
+        modules_dir, bin_dir=bin_dir, keep=keep
+    )
+
     # Re-run the existing install side effects so registry modules become
     # callable + documented — reusing the baked-in helpers, not a parallel
     # path.  Only modules that installed cleanly are on disk; skipped ones
-    # were never materialised, so they're naturally excluded.
-    if modules_result.installed:
+    # were never materialised, so they're naturally excluded.  A reconcile
+    # removal also requires a re-render so the dropped module leaves the docs.
+    if modules_result.installed or removed:
         if bin_dir:
             symlink_module_scripts(modules_dir, bin_dir)
         if agents_md_path:
@@ -474,6 +598,8 @@ def apply_registry_overlay(
 __all__ = [
     "FEATURE_FLAG_ENV",
     "MODULE_INSTALL_FAILED_EVENT",
+    "MODULE_REMOVED_EVENT",
+    "REGISTRY_MANAGED_MARKER",
     "ModuleOverlayResult",
     "RegistryOverlayResult",
     "SkillOverlayResult",
@@ -481,4 +607,5 @@ __all__ = [
     "feature_enabled",
     "overlay_modules",
     "overlay_skills",
+    "remove_registry_overlay_modules",
 ]

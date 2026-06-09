@@ -17,6 +17,7 @@ from .registry_overlay import (
     RegistryOverlayResult,
     SkillOverlayResult,
     apply_registry_overlay,
+    remove_registry_overlay_modules,
 )
 from .sub_agent_sync import sync_sub_agents
 from .progress_reporter import report_progress
@@ -68,6 +69,7 @@ __all__ = [
     "is_git_repo",
     "prune_worktrees",
     "redact",
+    "remove_registry_overlay_modules",
     "report_progress",
     "run_agent",
     "run_module_setup",

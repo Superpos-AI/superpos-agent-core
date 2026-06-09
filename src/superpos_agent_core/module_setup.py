@@ -172,6 +172,26 @@ def run_setup(
             modules_dir,
         )
 
+    # Instant-rollback: when the Beat 2b flag is OFF, purge any registry
+    # modules a prior flag-ON run materialised into the persistent
+    # ``modules_dir`` (plus their PATH symlinks) BEFORE the baked-in
+    # discover/symlink/doc steps below — otherwise those steps would still
+    # pick them up and the flag-off path would NOT be back to baked-in.
+    # Lazy import avoids a circular import (registry_overlay imports here).
+    from .registry_overlay import (
+        feature_enabled,
+        remove_registry_overlay_modules,
+    )
+
+    if not feature_enabled():
+        rolled_back = remove_registry_overlay_modules(modules_dir, bin_dir=bin_dir)
+        if rolled_back:
+            log.info(
+                "Registry overlay flag OFF: removed %d registry-managed "
+                "module(s) for instant rollback: %s",
+                len(rolled_back), rolled_back,
+            )
+
     modules = discover_modules(modules_dir if os.path.isdir(modules_dir) else None)
     log.info("Discovered %d module(s): %s", len(modules), [m.name for m in modules])
 
@@ -190,7 +210,7 @@ def run_setup(
     # from this module).  ``feature_enabled`` is re-checked inside
     # ``apply_registry_overlay`` — when the flag is OFF this is a no-op and
     # nothing above changed, preserving the baked-in-only path bit-for-bit.
-    from .registry_overlay import apply_registry_overlay, feature_enabled
+    from .registry_overlay import apply_registry_overlay
 
     # Modules are overlaid into the workspace modules dir and do NOT need a
     # skills_dir; only the skills half of the overlay does.  So gate the
