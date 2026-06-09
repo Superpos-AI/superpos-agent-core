@@ -415,6 +415,108 @@ def test_module_install_failure_retried_skipped_logged_others_continue(
     assert any("bad-mod" in r.message for r in records)
 
 
+def test_successful_update_replaces_existing_module(tmp_path: Path):
+    """A successful re-install over an existing module dir replaces its
+    contents (no stale files survive the swap)."""
+    modules_dir = tmp_path / "modules"
+
+    v1 = {
+        "slug": "upgradable",
+        "name": "Upgradable",
+        "manifest": {"description": "v1", "env_keys": []},
+        "files": [
+            {"path": "scripts/cli", "content": "echo v1\n", "mode": "+x"},
+            {"path": "stale.txt", "content": "old\n"},
+        ],
+    }
+    overlay_modules([v1], str(modules_dir))
+    install_dir = modules_dir / "upgradable"
+    assert (install_dir / "stale.txt").is_file()
+
+    v2 = {
+        "slug": "upgradable",
+        "name": "Upgradable",
+        "manifest": {"description": "v2", "env_keys": []},
+        "files": [{"path": "scripts/cli", "content": "echo v2\n", "mode": "+x"}],
+    }
+    result = overlay_modules([v2], str(modules_dir))
+
+    assert "upgradable" in result.installed
+    assert "v2" in (install_dir / "module.yaml").read_text()
+    assert "echo v2" in (install_dir / "scripts" / "cli").read_text()
+    # The atomic swap means no stale file from v1 survives.
+    assert not (install_dir / "stale.txt").exists()
+
+
+def test_failed_update_preserves_existing_install(tmp_path: Path, caplog):
+    """An UPDATE over an existing installed module that fails to materialise
+    must leave the OLD module directory intact (the skip/fallback guarantee),
+    report the slug in ``.failed`` (not ``.installed``), and leave behind no
+    leftover ``.<slug>.tmp-*`` staging directory."""
+    modules_dir = tmp_path / "modules"
+
+    # Install a working v1 with a script file that must survive a failed update.
+    v1 = {
+        "slug": "upgradable",
+        "name": "Upgradable",
+        "manifest": {"description": "v1-keep-me", "env_keys": ["KEEP_KEY"]},
+        "files": [
+            {"path": "scripts/cli", "content": "echo v1\n", "mode": "+x"},
+            {"path": "SKILL.md", "content": "# v1 skill\n"},
+        ],
+    }
+    overlay_modules([v1], str(modules_dir))
+    install_dir = modules_dir / "upgradable"
+    assert install_dir.is_dir()
+    script = install_dir / "scripts" / "cli"
+    assert script.is_file()
+
+    # Now attempt a v2 update whose write raises while materialising.
+    v2 = {
+        "slug": "upgradable",
+        "name": "Upgradable",
+        "manifest": {"description": "v2-broken", "env_keys": []},
+        "files": [{"path": "scripts/cli", "content": "echo v2\n", "mode": "+x"}],
+    }
+
+    real_write = Path.write_text
+
+    def flaky_write(self, *args, **kwargs):
+        # Fail while writing the staging copy of upgradable's module.yaml.
+        if self.name == "module.yaml":
+            raise OSError("disk gremlin")
+        return real_write(self, *args, **kwargs)
+
+    import unittest.mock as mock
+
+    with mock.patch.object(Path, "write_text", flaky_write), caplog.at_level(
+        "WARNING"
+    ):
+        result = overlay_modules([v2], str(modules_dir), backoff_seconds=0.0)
+
+    # The slug is reported failed, never installed.
+    assert "upgradable" in result.failed
+    assert "upgradable" not in result.installed
+
+    # The OLD install survives intact — directory, manifest, and script.
+    assert install_dir.is_dir()
+    assert "v1-keep-me" in (install_dir / "module.yaml").read_text()
+    assert script.is_file()
+    assert script.read_text() == "echo v1\n"
+    assert os.access(script, os.X_OK)
+    assert (install_dir / "SKILL.md").read_text() == "# v1 skill\n"
+
+    # No leftover staging directory pollutes the modules dir.
+    leftovers = [
+        p for p in modules_dir.iterdir() if p.name.startswith(".upgradable.tmp-")
+    ]
+    assert leftovers == [], f"leftover staging dirs: {leftovers}"
+
+    # Structured failure record emitted for the slug.
+    records = [r for r in caplog.records if MODULE_INSTALL_FAILED_EVENT in r.message]
+    assert any("upgradable" in r.message for r in records)
+
+
 def test_skipped_module_not_symlinked(tmp_path: Path, monkeypatch):
     """A module that fails to install must not have its scripts symlinked
     onto PATH (it was never materialised)."""

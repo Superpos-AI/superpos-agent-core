@@ -51,6 +51,7 @@ import logging
 import os
 import shutil
 import stat
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -208,39 +209,58 @@ def _materialise_module(module: dict, modules_dir: Path) -> Path:
       executable).
     - ``SKILL.md`` — from the module's ``skill`` field, if present.
 
-    The directory is wiped first so a reinstall doesn't leave stale files.
-    Raises on any IO error so the caller's retry/skip loop can react.
+    The new version is built in a sibling staging directory and only
+    swapped into ``<modules_dir>/<slug>/`` once every write has succeeded:
+    we ``shutil.rmtree`` any prior install and ``os.replace`` the staging
+    dir into place (an atomic rename — same parent dir).  If *any* write
+    raises, the staging dir is removed and the error re-raised, leaving the
+    existing install **untouched** — so the caller's retry/skip fallback
+    never loses a previously-working module to a transient write error or a
+    malformed registry payload.  Raises on any IO error so the caller's
+    retry/skip loop can react.
     """
     slug = module["slug"]
     if not _is_safe_slug(slug):
         raise ValueError(f"unsafe module slug {slug!r}")
 
     install_dir = modules_dir / slug
+    # Build into a sibling staging dir so a mid-write failure can't damage
+    # an existing install; the same parent makes the final rename atomic.
+    staging_dir = Path(
+        tempfile.mkdtemp(prefix=f".{slug}.tmp-", dir=modules_dir)
+    )
+    try:
+        manifest = module.get("manifest") or {}
+        yaml_data: dict = {
+            "description": manifest.get("description") or module.get("name") or slug,
+            # env_keys are NAMES ONLY — never values.  module_loader reads this
+            # into ModuleInfo.env_vars; the runtime proxy supplies values.
+            "env": list(manifest.get("env_keys") or []),
+        }
+        mcp_cfg = manifest.get("mcp")
+        if mcp_cfg is not None:
+            yaml_data["mcp"] = mcp_cfg
+        (staging_dir / "module.yaml").write_text(
+            yaml.safe_dump(yaml_data, default_flow_style=False, sort_keys=False),
+            encoding="utf-8",
+        )
+
+        for entry in module.get("files") or []:
+            _write_file_entry(staging_dir, entry)
+
+        skill_md = module.get("skill")
+        if skill_md:
+            (staging_dir / "SKILL.md").write_text(skill_md, encoding="utf-8")
+    except BaseException:
+        # New version is incomplete — discard the staging dir and leave the
+        # existing install (if any) exactly as it was.
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        raise
+
+    # New version fully materialised — atomically swap it into place.
     if install_dir.exists():
         shutil.rmtree(install_dir)
-    install_dir.mkdir(parents=True, exist_ok=True)
-
-    manifest = module.get("manifest") or {}
-    yaml_data: dict = {
-        "description": manifest.get("description") or module.get("name") or slug,
-        # env_keys are NAMES ONLY — never values.  module_loader reads this
-        # into ModuleInfo.env_vars; the runtime proxy supplies values.
-        "env": list(manifest.get("env_keys") or []),
-    }
-    mcp_cfg = manifest.get("mcp")
-    if mcp_cfg is not None:
-        yaml_data["mcp"] = mcp_cfg
-    (install_dir / "module.yaml").write_text(
-        yaml.safe_dump(yaml_data, default_flow_style=False, sort_keys=False),
-        encoding="utf-8",
-    )
-
-    for entry in module.get("files") or []:
-        _write_file_entry(install_dir, entry)
-
-    skill_md = module.get("skill")
-    if skill_md:
-        (install_dir / "SKILL.md").write_text(skill_md, encoding="utf-8")
+    os.replace(staging_dir, install_dir)
 
     return install_dir
 
