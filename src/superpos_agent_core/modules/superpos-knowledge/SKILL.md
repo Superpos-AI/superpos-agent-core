@@ -93,26 +93,16 @@ superpos-knowledge list-by-type topic --limit 10
 superpos-knowledge list-by-type source_page --limit 50
 ```
 
-### `superpos-knowledge lint-state` / `broken-links` / `backlinks <entry_id>`
+### `superpos-knowledge backlinks <entry_id>`
 
-Hygiene tools for the typed-page graph — useful after creating a batch
-of pages to spot what needs attention:
+Find what links TO a given page (inverse of wikilink resolution) — useful
+for tracing which entries reference a page in the typed-page graph:
 
 ```bash
-# Show entries the linter has flagged (response includes a total + by_type + samples)
-superpos-knowledge lint-state
-
-# Find wiki-style [[wikilinks]] whose target slug doesn't resolve
-superpos-knowledge broken-links
-
-# Find what links TO a given page (inverse of wikilink resolution).
 # The argument is the target entry's ULID — resolve a slug to one with:
 #   superpos-knowledge search <slug> --limit 1 | jq '.[0].id'
 superpos-knowledge backlinks 01HXYZ...
 ```
-
-`lint-state` and `broken-links` surface a server-defined JSON envelope —
-the script prints it verbatim so you can `jq` over it.
 
 ### `superpos-knowledge graph <entry_id>`
 

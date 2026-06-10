@@ -459,19 +459,38 @@ class SuperposClient:
         return data.get("data", data) if isinstance(data, dict) else data
 
     async def get_knowledge_by_slug(self, slug: str) -> dict[str, Any]:
-        """``GET /knowledge/slug/{slug}`` — fetch a single entry by its slug.
+        """Fetch a single entry by its stable human-readable slug.
 
-        Mirrors :meth:`get_knowledge` but keyed on the stable human-readable
-        slug (e.g. ``proposal-knowledge-wiki``) instead of the ULID.  Returns
-        404 server-side if the slug doesn't exist; the script surfaces that
-        as an HTTP error.
+        There is no ``GET /knowledge/slug/{slug}`` route on the server, so
+        this is a two-hop over existing endpoints:
+
+        1. :meth:`search_knowledge` (``GET /knowledge/search``) resolves the
+           slug to an entry — we search with the slug as the query and prefer
+           the result whose ``slug`` field equals ``slug`` exactly, falling
+           back to the first result when none match exactly.
+        2. :meth:`get_knowledge` (``GET /knowledge/{entry}``) fetches the full
+           entry by its ULID.
+
+        Raises :class:`ValueError` if the search returns no candidate or the
+        resolved candidate carries no ``id`` — a clear "not found" rather than
+        a delayed HTTP error.
         """
-        hive = self._config.superpos_hive_id
-        resp = await self._request(
-            "GET", f"/api/v1/hives/{hive}/knowledge/slug/{slug}",
+        results = await self.search_knowledge(slug, limit=10)
+        if not results:
+            raise ValueError(f"no knowledge entry found for slug {slug!r}")
+        match = next(
+            (
+                r for r in results
+                if isinstance(r, dict) and r.get("slug") == slug
+            ),
+            results[0],
         )
-        data = resp.json()
-        return data.get("data", data) if isinstance(data, dict) else data
+        entry_id = match.get("id") if isinstance(match, dict) else None
+        if not entry_id:
+            raise ValueError(
+                f"knowledge entry for slug {slug!r} has no id to fetch by",
+            )
+        return await self.get_knowledge(str(entry_id))
 
     async def list_knowledge_by_type(
         self,
@@ -499,36 +518,6 @@ class SuperposClient:
             "GET",
             f"/api/v1/hives/{hive}/knowledge/types/{type}/list",
             params=params,
-        )
-        data = resp.json()
-        return data.get("data", data) if isinstance(data, dict) else data
-
-    async def get_knowledge_lint_state(self) -> dict[str, Any]:
-        """``GET /knowledge/lint-state`` — surface entries needing attention.
-
-        Returns a summary object the platform will define — typically
-        ``{ total, by_type: {...}, samples: [...] }`` with a few example
-        entries whose ``lint_state = "needs_attention"``.  The script just
-        prints the JSON envelope.
-        """
-        hive = self._config.superpos_hive_id
-        resp = await self._request(
-            "GET", f"/api/v1/hives/{hive}/knowledge/lint-state",
-        )
-        data = resp.json()
-        return data.get("data", data) if isinstance(data, dict) else data
-
-    async def list_knowledge_broken_links(self) -> list[dict[str, Any]]:
-        """``GET /knowledge/broken-links`` — wiki-style refs that don't resolve.
-
-        Lists double-bracket ``[[wikilinks]]`` in any hive entry whose
-        target slug doesn't exist as a typed page.  Response shape is
-        server-defined (likely ``[{ from_slug, to_slug, source_id }, ...]``);
-        the script just prints the JSON envelope.
-        """
-        hive = self._config.superpos_hive_id
-        resp = await self._request(
-            "GET", f"/api/v1/hives/{hive}/knowledge/broken-links",
         )
         data = resp.json()
         return data.get("data", data) if isinstance(data, dict) else data

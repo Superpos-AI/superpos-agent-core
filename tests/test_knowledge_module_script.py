@@ -1379,36 +1379,6 @@ async def test_list_by_type_rejects_unknown_type(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_lint_state_routes_to_get_knowledge_lint_state(monkeypatch):
-    """`lint-state` (no args) must call get_knowledge_lint_state()."""
-    mod = _load_script()
-    _env_for_run(monkeypatch)
-    mock = AsyncMock(return_value={"total": 0, "by_type": {}, "samples": []})
-    mock_close = AsyncMock()
-    with patch.object(mod.SuperposClient, "get_knowledge_lint_state", mock), \
-         patch.object(mod.SuperposClient, "close", mock_close):
-        args = mod._build_parser().parse_args(["lint-state"])
-        args.sort = None
-        await mod._run(args)
-    mock.assert_awaited_once_with()
-
-
-@pytest.mark.asyncio
-async def test_broken_links_routes_to_list_knowledge_broken_links(monkeypatch):
-    """`broken-links` (no args) must call list_knowledge_broken_links()."""
-    mod = _load_script()
-    _env_for_run(monkeypatch)
-    mock = AsyncMock(return_value=[])
-    mock_close = AsyncMock()
-    with patch.object(mod.SuperposClient, "list_knowledge_broken_links", mock), \
-         patch.object(mod.SuperposClient, "close", mock_close):
-        args = mod._build_parser().parse_args(["broken-links"])
-        args.sort = None
-        await mod._run(args)
-    mock.assert_awaited_once_with()
-
-
-@pytest.mark.asyncio
 async def test_backlinks_routes_to_list_knowledge_backlinks(monkeypatch):
     """`backlinks <entry_id>` must call list_knowledge_backlinks with the ULID."""
     mod = _load_script()

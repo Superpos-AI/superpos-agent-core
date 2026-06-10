@@ -3,8 +3,7 @@
 
 Subcommands mirror the client API:
   search, get, get-by-slug, list, list-by-type,  (read)
-  graph, topics, decisions, lint-state,
-  broken-links, backlinks
+  graph, topics, decisions, backlinks
   create, update                                 (bounded write)
 
 Prints JSON to stdout, errors to stderr.  Designed for the LLM to call
@@ -508,12 +507,6 @@ async def _run(args: argparse.Namespace) -> int:
         elif args.cmd == "decisions":
             _print(await client.knowledge_decisions())
 
-        elif args.cmd == "lint-state":
-            _print(await client.get_knowledge_lint_state())
-
-        elif args.cmd == "broken-links":
-            _print(await client.list_knowledge_broken_links())
-
         elif args.cmd == "backlinks":
             _print(await client.list_knowledge_backlinks(args.entry_id))
 
@@ -746,13 +739,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sub.add_parser("topics", help="Convenience index of topic clusters in this hive")
     sub.add_parser("decisions", help="Convenience index of recorded decisions")
 
-    # lint-state / broken-links / backlinks — typed-page hygiene
-    sub.add_parser(
-        "lint-state", help="Show entries with lint_state=needs_attention",
-    )
-    sub.add_parser(
-        "broken-links", help="List wiki-style double-bracket refs that don't resolve",
-    )
+    # backlinks — typed-page hygiene
     p_backlinks = sub.add_parser(
         "backlinks", help="Show entries that link to this entry (by ULID)",
     )

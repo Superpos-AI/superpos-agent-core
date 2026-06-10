@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "superpos-agent-core"
-version = "0.2.7"
+version = "0.2.8"
 description = "Shared runtime for Superpos slim agents (Telegram bot, Superpos poller, worktree manager, telegram streamer)."
 readme = "README.md"
 requires-python = ">=3.10"
