@@ -43,6 +43,29 @@ def test_script_exists_and_is_executable():
     assert _SCRIPT.stat().st_mode & 0o111  # at least one execute bit
 
 
+# ── docs/runtime contract ───────────────────────────────────────────────
+
+_SKILL = _SCRIPT.parent.parent / "SKILL.md"
+
+
+def test_skill_doc_does_not_advertise_removed_tag_flag():
+    """SKILL.md is loaded as runnable guidance; it must not present a usable
+    ``--tag`` flag (a flag bullet or a command example) that the CLI rejects.
+    A prose note that the flag does NOT exist is fine."""
+    doc = _SKILL.read_text(encoding="utf-8")
+    assert "- `--tag`" not in doc           # not listed as a flag bullet
+    assert "list --tag" not in doc          # not shown in a command example
+    assert "tracks list --tag" not in doc
+
+
+def test_skill_doc_describes_status_as_client_side_not_noop():
+    """``list --status`` is enforced client-side, not a no-op pass-through.
+    Guard against the stale wording the docs used to carry."""
+    doc = _SKILL.read_text(encoding="utf-8").lower()
+    assert "no-op pass-through" not in doc
+    assert "client-side" in doc
+
+
 # ── arg parsing ─────────────────────────────────────────────────────────
 
 

@@ -50,9 +50,12 @@ superpos-tracks list --status active
 ```
 
 Flags:
-- `--status` — filter by state (currently a no-op pass-through; the
-  server-side filter is in flight)
-- `--tag` — filter by tag (currently a no-op pass-through; same)
+- `--status` — filter by state; one of `planning, active, paused,
+  done, archived`. Filtering is enforced **client-side**: the server
+  index does not yet filter, so the CLI keeps only rows whose `state`
+  matches (the value is also forwarded as a query param for
+  forward-compatibility). There is **no `--tag` flag** — the CLI
+  rejects unknown arguments.
 
 ### `superpos-tracks get <slug>`
 
@@ -197,8 +200,10 @@ archived ─→ (terminal)
 ```
 
 State is mutated through the server's `/transition` endpoint or the
-dashboard's track editor, not through the CLI. The CLI's `--status`
-flag is **create-time only** — the initial state for a new track.
+dashboard's track editor, not through the CLI. `create --status` only
+sets the **initial** state for a new track; `list --status` filters
+the index by state (client-side). Neither flag transitions an
+existing track.
 
 ## Tips
 
