@@ -458,6 +458,93 @@ class SuperposClient:
         data = resp.json()
         return data.get("data", data) if isinstance(data, dict) else data
 
+    async def get_knowledge_by_slug(self, slug: str) -> dict[str, Any]:
+        """``GET /knowledge/slug/{slug}`` — fetch a single entry by its slug.
+
+        Mirrors :meth:`get_knowledge` but keyed on the stable human-readable
+        slug (e.g. ``proposal-knowledge-wiki``) instead of the ULID.  Returns
+        404 server-side if the slug doesn't exist; the script surfaces that
+        as an HTTP error.
+        """
+        hive = self._config.superpos_hive_id
+        resp = await self._request(
+            "GET", f"/api/v1/hives/{hive}/knowledge/slug/{slug}",
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def list_knowledge_by_type(
+        self,
+        type: str,
+        *,
+        limit: int | None = None,
+        offset: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """``GET /knowledge?type={type}`` — list entries filtered by type.
+
+        Thin wrapper around the existing ``/knowledge`` listing; the server
+        already accepts ``?type=`` as a filter (verified live).  The valid
+        ``type`` values are ``entity``, ``topic``, ``trend``,
+        ``source_page``, ``log``, ``procedure`` — the script validates
+        against that set before the network round-trip.
+        """
+        hive = self._config.superpos_hive_id
+        params: dict[str, Any] = {"type": type}
+        if limit is not None:
+            params["limit"] = limit
+        if offset is not None:
+            params["offset"] = offset
+        resp = await self._request(
+            "GET",
+            f"/api/v1/hives/{hive}/knowledge",
+            params=params,
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def get_knowledge_lint_state(self) -> dict[str, Any]:
+        """``GET /knowledge/lint-state`` — surface entries needing attention.
+
+        Returns a summary object the platform will define — typically
+        ``{ total, by_type: {...}, samples: [...] }`` with a few example
+        entries whose ``lint_state = "needs_attention"``.  The script just
+        prints the JSON envelope.
+        """
+        hive = self._config.superpos_hive_id
+        resp = await self._request(
+            "GET", f"/api/v1/hives/{hive}/knowledge/lint-state",
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def list_knowledge_broken_links(self) -> list[dict[str, Any]]:
+        """``GET /knowledge/broken-links`` — wiki-style refs that don't resolve.
+
+        Lists double-bracket ``[[wikilinks]]`` in any hive entry whose
+        target slug doesn't exist as a typed page.  Response shape is
+        server-defined (likely ``[{ from_slug, to_slug, source_id }, ...]``);
+        the script just prints the JSON envelope.
+        """
+        hive = self._config.superpos_hive_id
+        resp = await self._request(
+            "GET", f"/api/v1/hives/{hive}/knowledge/broken-links",
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def list_knowledge_backlinks(self, slug: str) -> list[dict[str, Any]]:
+        """``GET /knowledge/backlinks/{slug}`` — entries that link to this slug.
+
+        Inverse of wikilink resolution: surfaces typed pages whose body
+        (or frontmatter) contains ``[[{slug}]]``.
+        """
+        hive = self._config.superpos_hive_id
+        resp = await self._request(
+            "GET", f"/api/v1/hives/{hive}/knowledge/backlinks/{slug}",
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
     async def get_knowledge_graph(
         self,
         entry_id: str,
