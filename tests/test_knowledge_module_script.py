@@ -1009,6 +1009,78 @@ async def test_typed_update_slug_only_no_content_rejected(monkeypatch):
     mock_update.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_typed_update_id_with_type_rejected(monkeypatch):
+    """``update --id X --type entity`` is a re-type attempt: a page's type is
+    immutable on update (re-typing is a migration), and update_page has no type
+    param, so --type was silently ignored (exit 0). It must now fail fast and
+    never call update_page — --type is only valid alongside --slug."""
+    mod = _load_script()
+    _set_env(monkeypatch)
+    mock_update = AsyncMock()
+    mock_list = AsyncMock()
+    with patch.object(mod.KnowledgeClient, "update_page", mock_update), \
+         patch.object(mod.KnowledgeClient, "list_by_type", mock_list), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        args = mod._build_parser().parse_args([
+            "update", "--id", "kxe_1", "--type", "entity", "--body", "new",
+        ])
+        args.sort = None
+        with pytest.raises(SystemExit) as exc:
+            await mod._run(args)
+
+    assert exc.value.code == 2
+    mock_update.assert_not_called()
+    mock_list.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_typed_update_positional_entry_id_with_type_rejected(monkeypatch):
+    """Same re-type rejection via the positional entry_id alias:
+    ``update <id> --type entity --body new`` must fail fast with no API call."""
+    mod = _load_script()
+    _set_env(monkeypatch)
+    mock_update = AsyncMock()
+    mock_list = AsyncMock()
+    with patch.object(mod.KnowledgeClient, "update_page", mock_update), \
+         patch.object(mod.KnowledgeClient, "list_by_type", mock_list), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        args = mod._build_parser().parse_args([
+            "update", "01ABC", "--type", "entity", "--body", "new",
+        ])
+        args.sort = None
+        with pytest.raises(SystemExit) as exc:
+            await mod._run(args)
+
+    assert exc.value.code == 2
+    mock_update.assert_not_called()
+    mock_list.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_typed_update_type_without_id_or_slug_rejected(monkeypatch):
+    """``update --type entity --body new`` with neither an id nor a --slug has
+    no page to resolve and no slug to use --type for — reject before any API
+    call rather than silently ignore --type."""
+    mod = _load_script()
+    _set_env(monkeypatch)
+    mock_update = AsyncMock()
+    mock_list = AsyncMock()
+    with patch.object(mod.KnowledgeClient, "update_page", mock_update), \
+         patch.object(mod.KnowledgeClient, "list_by_type", mock_list), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        args = mod._build_parser().parse_args([
+            "update", "--type", "entity", "--body", "new",
+        ])
+        args.sort = None
+        with pytest.raises(SystemExit) as exc:
+            await mod._run(args)
+
+    assert exc.value.code == 2
+    mock_update.assert_not_called()
+    mock_list.assert_not_called()
+
+
 def test_guard_shape_xor_treats_id_as_typed_selector(capsys):
     """``--id`` selects the typed path, so it must not be mixed with legacy
     flags (regression: ``--id`` was previously not seen by the guard, letting

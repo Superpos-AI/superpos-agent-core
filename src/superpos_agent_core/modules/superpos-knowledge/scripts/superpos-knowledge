@@ -368,6 +368,19 @@ async def _run_typed_update(kclient: KnowledgeClient, args: argparse.Namespace) 
             file=sys.stderr,
         )
         sys.exit(2)
+    # --type is immutable on update: a page's type is fixed once created, so
+    # re-typing is a migration, not an edit. The only legitimate use of --type
+    # here is alongside --slug, where it selects the type to resolve the slug to
+    # an id. Provided without --slug it's either a retype attempt (combined with
+    # an entry id) or has nothing to resolve — reject before any API call.
+    if args.type is not None and not args.slug:
+        print(
+            "Error: --type cannot be changed on an update — a page's type is "
+            "immutable (re-typing is a migration, not an edit). --type is only "
+            "accepted alongside --slug to resolve the page id.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
     body = _resolve_body(args)
     frontmatter = _parse_json_arg("frontmatter", args.frontmatter)
     tags = _split_tags(args.tags)
