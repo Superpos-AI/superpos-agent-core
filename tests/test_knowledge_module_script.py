@@ -47,6 +47,7 @@ def _ns(**kw) -> argparse.Namespace:
         tags=None, confidence=None,
         # typed-shape attrs
         type=None, slug=None, body=None, body_file=None, frontmatter=None,
+        source_ids=None,
         id=None, visibility=None, ttl=None, scope=None, key=None,
         entry_id=None,
     )
@@ -364,6 +365,94 @@ async def test_typed_create_forwards_ttl(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_typed_create_forwards_source_ids(monkeypatch):
+    """``--source-ids 01SRC1,01SRC2`` is parsed and forwarded verbatim to
+    create_page (restores the main-branch typed source attach interface that
+    the merge dropped)."""
+    mod = _load_script()
+    _set_env(monkeypatch)
+    mock_create = AsyncMock(return_value={"id": "kxe_1", "type": "topic"})
+    with patch.object(mod.KnowledgeClient, "create_page", mock_create), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        args = mod._build_parser().parse_args([
+            "create", "--type", "topic", "--slug", "topic:x",
+            "--body", "# body", "--source-ids", "01SRC1,01SRC2",
+        ])
+        args.sort = None
+        rc = await mod._run(args)
+
+    assert rc == 0
+    assert mock_create.call_args.kwargs["source_ids"] == ["01SRC1", "01SRC2"]
+
+
+@pytest.mark.asyncio
+async def test_typed_create_absent_source_ids_is_none(monkeypatch):
+    """No ``--source-ids`` → source_ids=None (omitted from the payload, not
+    auto-stamped from SUPERPOS_AGENT_ID — auto-stamp would 403 per §6.8)."""
+    mod = _load_script()
+    _set_env(monkeypatch)
+    mock_create = AsyncMock(return_value={"id": "kxe_1"})
+    with patch.object(mod.KnowledgeClient, "create_page", mock_create), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        args = mod._build_parser().parse_args([
+            "create", "--type", "topic", "--slug", "topic:x", "--body", "# body",
+        ])
+        args.sort = None
+        await mod._run(args)
+    assert mock_create.call_args.kwargs["source_ids"] is None
+
+
+@pytest.mark.asyncio
+async def test_typed_update_forwards_source_ids(monkeypatch):
+    """``update --id X --source-ids 01SRC`` forwards source_ids to update_page
+    (source_ids is itself a content field, so no cross-cutting guard fires)."""
+    mod = _load_script()
+    _set_env(monkeypatch)
+    mock_update = AsyncMock(return_value={"id": "kxe_1", "version": 2})
+    with patch.object(mod.KnowledgeClient, "update_page", mock_update), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        args = mod._build_parser().parse_args([
+            "update", "--id", "kxe_1", "--source-ids", "01SRC",
+        ])
+        args.sort = None
+        rc = await mod._run(args)
+
+    assert rc == 0
+    assert mock_update.call_args.kwargs["source_ids"] == ["01SRC"]
+
+
+@pytest.mark.asyncio
+async def test_typed_update_empty_source_ids_clears_citations(monkeypatch):
+    """``update --id X --source-ids ""`` sends source_ids=[] to clear citations
+    (presence-vs-truthiness: an explicit empty value detaches all sources,
+    while an absent flag would be None / omitted)."""
+    mod = _load_script()
+    _set_env(monkeypatch)
+    mock_update = AsyncMock(return_value={"id": "kxe_1", "version": 2})
+    with patch.object(mod.KnowledgeClient, "update_page", mock_update), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        args = mod._build_parser().parse_args([
+            "update", "--id", "kxe_1", "--source-ids", "",
+        ])
+        args.sort = None
+        rc = await mod._run(args)
+
+    assert rc == 0
+    assert mock_update.call_args.kwargs["source_ids"] == []
+
+
+def test_source_ids_is_a_typed_flag(capsys):
+    """``--source-ids`` selects the typed path and must not be mixed with legacy
+    flags (regression: the merge dropped the flag entirely, so a valid main
+    command failed argparse with 'unrecognized arguments')."""
+    mod = _load_script()
+    assert mod._guard_shape_xor(_ns(source_ids="01SRC")) is True
+    with pytest.raises(SystemExit):
+        mod._guard_shape_xor(_ns(source_ids="01SRC", content="Rule: ..."))
+    assert "cannot mix" in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
 async def test_typed_create_body_file(monkeypatch, tmp_path):
     mod = _load_script()
     _set_env(monkeypatch)
@@ -481,7 +570,12 @@ async def test_typed_update_by_id_routes_to_update_page(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_typed_update_forwards_ttl(monkeypatch):
+async def test_typed_update_forwards_ttl_with_content(monkeypatch):
+    """``--ttl`` is forwarded when it accompanies a real content field.
+
+    (Regression: ttl alone routed a cross-cutting-only payload the server
+    rejects with "value required"; see test_typed_update_ttl_only_rejected.)
+    """
     mod = _load_script()
     _set_env(monkeypatch)
     mock_update = AsyncMock(return_value={"id": "kxe_1", "version": 2})
@@ -490,7 +584,8 @@ async def test_typed_update_forwards_ttl(monkeypatch):
          patch.object(mod.KnowledgeClient, "list_by_type", mock_list), \
          patch.object(mod.SuperposClient, "close", AsyncMock()):
         args = mod._build_parser().parse_args([
-            "update", "--id", "kxe_1", "--ttl", "2026-06-11T00:00:00Z",
+            "update", "--id", "kxe_1", "--summary", "s",
+            "--ttl", "2026-06-11T00:00:00Z",
         ])
         args.sort = None
         rc = await mod._run(args)
@@ -499,6 +594,53 @@ async def test_typed_update_forwards_ttl(monkeypatch):
     mock_list.assert_not_called()
     assert mock_update.call_args.args[0] == "kxe_1"
     assert mock_update.call_args.kwargs["ttl"] == "2026-06-11T00:00:00Z"
+    assert mock_update.call_args.kwargs["summary"] == "s"
+
+
+@pytest.mark.asyncio
+async def test_typed_update_ttl_only_rejected(monkeypatch):
+    """``update --id X --ttl <future>`` with NO content field must fail fast and
+    never call update_page: a typed payload of only {"ttl": …} is rejected by
+    the server's UpdateKnowledgeRequest (its writable-shape guard excludes the
+    cross-cutting ttl/visibility fields, so "value" is required)."""
+    mod = _load_script()
+    _set_env(monkeypatch)
+    mock_update = AsyncMock()
+    mock_list = AsyncMock()
+    with patch.object(mod.KnowledgeClient, "update_page", mock_update), \
+         patch.object(mod.KnowledgeClient, "list_by_type", mock_list), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        args = mod._build_parser().parse_args([
+            "update", "--id", "kxe_1", "--ttl", "2026-06-11T00:00:00Z",
+        ])
+        args.sort = None
+        with pytest.raises(SystemExit) as exc:
+            await mod._run(args)
+
+    assert exc.value.code == 2
+    mock_update.assert_not_called()
+    mock_list.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_typed_update_ttl_and_visibility_only_rejected(monkeypatch):
+    """ttl + visibility together (still no content) is also cross-cutting-only
+    and must be rejected before any API call."""
+    mod = _load_script()
+    _set_env(monkeypatch)
+    mock_update = AsyncMock()
+    with patch.object(mod.KnowledgeClient, "update_page", mock_update), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        args = mod._build_parser().parse_args([
+            "update", "--id", "kxe_1",
+            "--ttl", "2026-06-11T00:00:00Z", "--visibility", "private",
+        ])
+        args.sort = None
+        with pytest.raises(SystemExit) as exc:
+            await mod._run(args)
+
+    assert exc.value.code == 2
+    mock_update.assert_not_called()
 
 
 def test_guard_shape_xor_treats_id_as_typed_selector(capsys):

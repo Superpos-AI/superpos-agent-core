@@ -34,7 +34,7 @@ _KNOWLEDGE_TYPES = ("entity", "topic", "trend", "source_page", "log", "procedure
 # Typed-shape flags. Presence of any of these (on create/update) routes the
 # command through KnowledgeClient.create_page / update_page instead of the
 # legacy key/value path. Mirrors the server's dual-shape XOR.
-_TYPED_FLAGS = ("type", "slug", "body", "body_file", "frontmatter")
+_TYPED_FLAGS = ("type", "slug", "body", "body_file", "frontmatter", "source_ids")
 
 # Typed-shape selectors. On update, ``--id`` directly identifies an existing
 # typed page (``--slug`` is already a typed flag above). Like the typed content
@@ -150,8 +150,8 @@ def _guard_shape_xor(args: argparse.Namespace) -> bool:
     if typed and legacy:
         print(
             "Error: cannot mix typed flags (--type/--slug/--body/--body-file/"
-            "--frontmatter/--id) with legacy flags (--key/--value/--content/"
-            "--confidence). Use one shape. See SKILL.md.",
+            "--frontmatter/--source-ids/--id) with legacy flags (--key/--value/"
+            "--content/--confidence). Use one shape. See SKILL.md.",
             file=sys.stderr,
         )
         sys.exit(2)
@@ -276,6 +276,7 @@ async def _run_typed_create(kclient: KnowledgeClient, args: argparse.Namespace) 
         slug=args.slug,
         body=body,
         frontmatter=frontmatter,
+        source_ids=_split_tags(args.source_ids),
         title=args.title,
         summary=args.summary,
         tags=_split_tags(args.tags),
@@ -304,21 +305,28 @@ async def _run_typed_update(kclient: KnowledgeClient, args: argparse.Namespace) 
     body = _resolve_body(args)
     frontmatter = _parse_json_arg("frontmatter", args.frontmatter)
     tags = _split_tags(args.tags)
-    # The server's UpdateKnowledgeRequest does not treat `visibility` as a
-    # typed/legacy/source update field, so a payload of only {"visibility": …}
+    source_ids = _split_tags(args.source_ids)
+    # The server's UpdateKnowledgeRequest treats `visibility` and `ttl` as
+    # cross-cutting fields: its writable-shape guard EXCLUDES them, so a payload
+    # carrying only cross-cutting fields (e.g. {"visibility": …} or {"ttl": …})
     # fails server-side validation ("value required"). --id/--slug/--type are
-    # selectors/routing, not content, so reject the visibility-only case
-    # before any API call: --visibility must accompany a real content field.
+    # selectors/routing, not content, so reject the cross-cutting-only case
+    # before any API call: --visibility/--ttl must accompany a real content
+    # field (a body/frontmatter/title/summary/tags/source_ids change).
     has_content = any(
         v is not None for v in (
-            body, frontmatter, args.title, args.summary, tags,
+            body, frontmatter, args.title, args.summary, tags, source_ids,
         )
     )
-    if args.visibility is not None and not has_content:
+    is_cross_cutting_only = (
+        args.visibility is not None or args.ttl is not None
+    ) and not has_content
+    if is_cross_cutting_only:
         print(
-            "Error: --visibility cannot be the only updated field on a typed "
-            "update; it must accompany at least one of --body/--body-file/"
-            "--frontmatter/--title/--summary/--tags.",
+            "Error: --visibility/--ttl cannot be the only updated field(s) on a "
+            "typed update; they must accompany at least one content field "
+            "(--body/--body-file/--frontmatter/--title/--summary/--tags/"
+            "--source-ids).",
             file=sys.stderr,
         )
         sys.exit(2)
@@ -329,6 +337,7 @@ async def _run_typed_update(kclient: KnowledgeClient, args: argparse.Namespace) 
         title=args.title,
         summary=args.summary,
         tags=tags,
+        source_ids=source_ids,
         visibility=args.visibility,
         ttl=args.ttl,
     ))
@@ -458,7 +467,8 @@ def _add_value_flags(p: argparse.ArgumentParser) -> None:
     ``--body``/``--body-file`` instead. Flags fall into three groups:
 
     - Typed shape: ``--type``, ``--slug``, ``--body``, ``--body-file``,
-      ``--frontmatter`` → KnowledgeClient.create_page / update_page.
+      ``--frontmatter``, ``--source-ids`` → KnowledgeClient.create_page /
+      update_page.
     - Legacy shape (deprecated): ``--key`` (create only), ``--content``,
       ``--value``, ``--confidence``.
     - Shared: ``--title``, ``--summary``, ``--tags``, ``--visibility``,
@@ -485,6 +495,14 @@ def _add_value_flags(p: argparse.ArgumentParser) -> None:
         "--frontmatter",
         help="Typed page frontmatter as a JSON object string. "
              "(--type entity requires frontmatter.kind.)",
+    )
+    p.add_argument(
+        "--source-ids", dest="source_ids",
+        help="Comma-separated source entry ULIDs / agent IDs to attach as "
+             "citations (curator audit trail). Optional and not auto-stamped: "
+             "source_ids is sent only when you pass this flag (auto-stamping "
+             "SUPERPOS_AGENT_ID would 403 per proposal §6.8). An explicit empty "
+             "value (--source-ids \"\") clears existing citations on update.",
     )
     # ── legacy shape (deprecated) ──
     p.add_argument(
