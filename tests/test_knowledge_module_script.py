@@ -1420,4 +1420,3 @@ def test_parser_backlinks_requires_entry_id_arg():
     with pytest.raises(SystemExit) as exc:
         parser.parse_args(["backlinks"])
     assert exc.value.code == 2
-
