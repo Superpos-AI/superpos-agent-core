@@ -63,19 +63,50 @@ async def test_list_tracks_hits_tracks_index():
     await client.close()
 
 
-async def test_list_tracks_passes_status_and_tag_filters():
+async def test_list_tracks_forwards_status_filter():
     captured: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured.append(request)
-        return _envelope([])
+        # Return rows that already match so client-side filtering keeps them.
+        return _envelope([
+            {"id": "t1", "slug": "k1", "name": "Active", "state": "active"},
+        ])
 
     client = _make_client(handler)
-    await client.list_tracks(status="active", tag="infra")
+    tracks = await client.list_tracks(status="active")
 
     req = captured[0]
+    # status is forwarded (forward-compatible), tag no longer exists.
     assert req.url.params["status"] == "active"
-    assert req.url.params["tag"] == "infra"
+    assert "tag" not in req.url.params
+    assert tracks == [
+        {"id": "t1", "slug": "k1", "name": "Active", "state": "active"},
+    ]
+    await client.close()
+
+
+async def test_list_tracks_filters_state_client_side():
+    """The real server index ignores query params and returns all tracks.
+    The client must filter by ``state`` so ``status=active`` never leaks
+    paused/done/archived rows. This MUST fail if filtering is removed."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        # Mixed states, ignoring any query params (mirrors the real server).
+        return _envelope([
+            {"id": "t1", "slug": "k1", "name": "A", "state": "active"},
+            {"id": "t2", "slug": "k2", "name": "B", "state": "paused"},
+            {"id": "t3", "slug": "k3", "name": "C", "state": "done"},
+            {"id": "t4", "slug": "k4", "name": "D", "state": "archived"},
+            {"id": "t5", "slug": "k5", "name": "E", "state": "active"},
+            {"id": "t6", "slug": "k6", "name": "F"},  # no state → excluded
+        ])
+
+    client = _make_client(handler)
+    tracks = await client.list_tracks(status="active")
+
+    assert [t["id"] for t in tracks] == ["t1", "t5"]
+    assert all(t["state"] == "active" for t in tracks)
     await client.close()
 
 
@@ -90,9 +121,8 @@ async def test_list_tracks_omits_unset_filters():
     await client.list_tracks()
 
     # Verified by the previous test; this one ensures the contract holds
-    # when only one filter is set.
+    # when the status filter is set.
     await client.list_tracks(status="active")
-    await client.list_tracks(tag="infra")
     await client.close()
 
 

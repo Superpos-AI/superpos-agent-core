@@ -46,13 +46,19 @@ def test_script_exists_and_is_executable():
 # ── arg parsing ─────────────────────────────────────────────────────────
 
 
-def test_parser_list_accepts_status_and_tag():
+def test_parser_list_accepts_status():
     mod = _load_script()
     parser = mod._build_parser()
-    args = parser.parse_args(["list", "--status", "active", "--tag", "infra"])
+    args = parser.parse_args(["list", "--status", "active"])
     assert args.cmd == "list"
     assert args.status == "active"
-    assert args.tag == "infra"
+
+
+def test_parser_list_rejects_removed_tag_flag():
+    mod = _load_script()
+    parser = mod._build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["list", "--tag", "infra"])
 
 
 def test_parser_list_rejects_unknown_status():
@@ -126,12 +132,12 @@ async def test_list_dispatches_to_list_tracks(monkeypatch, capsys):
 
     assert rc == 0
     assert mock_list.await_count == 1
-    assert mock_list.await_args.kwargs == {"status": None, "tag": None}
+    assert mock_list.await_args.kwargs == {"status": None}
     out = json.loads(capsys.readouterr().out)
     assert out == [{"slug": "k1"}]
 
 
-async def test_list_dispatches_status_and_tag_filters(monkeypatch):
+async def test_list_dispatches_status_filter(monkeypatch):
     _set_env(monkeypatch)
     mod = _load_script()
     mock_list = AsyncMock(return_value=[])
@@ -139,10 +145,10 @@ async def test_list_dispatches_status_and_tag_filters(monkeypatch):
     with patch.object(mod.SuperposClient, "list_tracks", mock_list), \
          patch.object(mod.SuperposClient, "close", AsyncMock()):
         await mod._run(mod._build_parser().parse_args(
-            ["list", "--status", "active", "--tag", "infra"],
+            ["list", "--status", "active"],
         ))
 
-    assert mock_list.await_args.kwargs == {"status": "active", "tag": "infra"}
+    assert mock_list.await_args.kwargs == {"status": "active"}
 
 
 async def test_get_dispatches_to_get_track_by_slug(monkeypatch, capsys):

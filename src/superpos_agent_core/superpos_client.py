@@ -989,20 +989,29 @@ class SuperposClient:
         self,
         *,
         status: str | None = None,
-        tag: str | None = None,
     ) -> list[dict[str, Any]]:
-        """``GET /tracks`` — list tracks in the hive. ``spec`` is omitted."""
+        """``GET /tracks`` — list tracks in the hive. ``spec`` is omitted.
+
+        ``status`` is forwarded to the server as a query param (forward-
+        compatible if the index gains support later), but state filtering is
+        ALSO enforced client-side because the server index does not filter:
+        ``TrackController::index`` only scopes by hive and orders by
+        ``updated_at``, ignoring query params. Rows are kept only when their
+        ``state`` equals ``status``; rows missing a ``state`` field are
+        excluded while a filter is active so unknown-state rows never leak.
+        """
         hive = self._config.superpos_hive_id
         params: dict[str, str] = {}
         if status is not None:
             params["status"] = status
-        if tag is not None:
-            params["tag"] = tag
         resp = await self._request(
             "GET", f"/api/v1/hives/{hive}/tracks", params=params or None,
         )
         data = resp.json()
-        return data.get("data", data) if isinstance(data, dict) else data
+        rows = data.get("data", data) if isinstance(data, dict) else data
+        if status is None:
+            return rows
+        return [row for row in rows if row.get("state") == status]
 
     async def get_track_by_slug(self, slug: str) -> dict[str, Any]:
         """``GET /tracks/{slug}`` — fetch a single track including ``spec``."""

@@ -75,7 +75,7 @@ async def _run(args: argparse.Namespace) -> int:
     client = SuperposClient(config)
     try:
         if args.cmd == "list":
-            _print(await client.list_tracks(status=args.status, tag=args.tag))
+            _print(await client.list_tracks(status=args.status))
 
         elif args.cmd == "get":
             _print(await client.get_track_by_slug(args.slug))
@@ -139,11 +139,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_list = sub.add_parser("list", help="List tracks in the hive")
     p_list.add_argument(
         "--status", choices=sorted(_TRACK_STATES),
-        help="Filter by track state (server-side filter, currently a no-op pass-through)",
-    )
-    p_list.add_argument(
-        "--tag",
-        help="Filter by tag (server-side filter, currently a no-op pass-through)",
+        help="Filter by track state (enforced client-side)",
     )
 
     # get
