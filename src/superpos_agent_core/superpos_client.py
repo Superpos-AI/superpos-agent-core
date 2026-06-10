@@ -547,6 +547,93 @@ class SuperposClient:
         data = resp.json()
         return data.get("data", data) if isinstance(data, dict) else data
 
+    async def create_knowledge_page(
+        self,
+        *,
+        type: str,
+        slug: str,
+        body: str,
+        title: str | None = None,
+        summary: str | None = None,
+        frontmatter: dict[str, Any] | None = None,
+        tags: list[str] | None = None,
+        source_ids: list[str] | None = None,
+        scope: str | None = None,
+        visibility: str | None = None,
+        ttl: str | None = None,
+    ) -> dict[str, Any]:
+        """``POST /knowledge`` with the typed `type`+`slug`+`body` shape (TASK-297).
+
+        Mirrors ``create_knowledge`` (the legacy ``key``+``value`` shape) but sends
+        the typed-page payload the platform has shipped server-side.  Same
+        envelope/response contract.
+        """
+        hive = self._config.superpos_hive_id
+        payload: dict[str, Any] = {"type": type, "slug": slug, "body": body}
+        if title is not None:
+            payload["title"] = title
+        if summary is not None:
+            payload["summary"] = summary
+        if frontmatter is not None:
+            payload["frontmatter"] = frontmatter
+        if tags is not None:
+            payload["tags"] = tags
+        if source_ids is not None:
+            payload["source_ids"] = source_ids
+        if scope is not None:
+            payload["scope"] = scope
+        if visibility is not None:
+            payload["visibility"] = visibility
+        if ttl is not None:
+            payload["ttl"] = ttl
+        resp = await self._request("POST", f"/api/v1/hives/{hive}/knowledge", json=payload)
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def update_knowledge_page(
+        self,
+        entry_id: str,
+        *,
+        body: str | None = None,
+        title: str | None = None,
+        summary: str | None = None,
+        frontmatter: dict[str, Any] | None = None,
+        tags: list[str] | None = None,
+        source_ids: list[str] | None = None,
+        visibility: str | None = None,
+        ttl: str | None = None,
+    ) -> dict[str, Any]:
+        """``PUT /knowledge/{entry}`` with the typed shape (TASK-297).
+
+        Partial update: only the supplied fields are sent.  ``type`` and ``slug``
+        are intentionally not accepted here — re-typing a page or changing its
+        slug would invalidate inbound wikilinks; the dedicated migration path
+        handles those, not the CLI.
+        """
+        hive = self._config.superpos_hive_id
+        payload: dict[str, Any] = {}
+        if body is not None:
+            payload["body"] = body
+        if title is not None:
+            payload["title"] = title
+        if summary is not None:
+            payload["summary"] = summary
+        if frontmatter is not None:
+            payload["frontmatter"] = frontmatter
+        if tags is not None:
+            payload["tags"] = tags
+        if source_ids is not None:
+            payload["source_ids"] = source_ids
+        if visibility is not None:
+            payload["visibility"] = visibility
+        if ttl is not None:
+            payload["ttl"] = ttl
+        resp = await self._request(
+            "PUT", f"/api/v1/hives/{hive}/knowledge/{entry_id}", json=payload,
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
     async def delete_knowledge(self, entry_id: str) -> None:
         """``DELETE /knowledge/{entry}``."""
         hive = self._config.superpos_hive_id
