@@ -106,6 +106,104 @@ def _default_scope(explicit: str | None) -> str:
     return explicit or os.environ.get("SUPERPOS_KNOWLEDGE_FILLIN_SCOPE", "hive")
 
 
+# FrontmatterSchema::TYPES — mirror server-side validation
+# (keep this list in sync with app/Knowledge/FrontmatterSchema.php)
+_KNOWLEDGE_PAGE_TYPES = frozenset({
+    "entity", "topic", "trend", "source_page", "log", "procedure",
+})
+
+
+def _resolve_body(body: str | None, body_file: str | None) -> str | None:
+    """Return the body string, preferring ``--body``; if absent, read ``--body-file``.
+
+    Exactly one of the two must be supplied on a typed create.
+    """
+    if body and body_file:
+        print("Error: pass either --body or --body-file, not both.", file=sys.stderr)
+        sys.exit(2)
+    if body is not None:
+        return body
+    if body_file is not None:
+        try:
+            with open(body_file, "r", encoding="utf-8") as fh:
+                return fh.read()
+        except OSError as e:
+            print(f"Error: cannot read --body-file {body_file!r}: {e}", file=sys.stderr)
+            sys.exit(2)
+    return None
+
+
+def _build_typed_page_kwargs(args: argparse.Namespace) -> dict[str, Any]:
+    """Assemble kwargs for ``create_knowledge_page`` from CLI flags.
+
+    Provenance metadata is stamped at the server boundary (via the legacy
+    ``value`` path); for the typed path the platform mirrors ``slug`` → ``key``
+    and the page-level fields stand on their own.  ``source_ids`` here is the
+    typed-page audit-trail field (server enforces proposal §6.8 ACL on it), so
+    we only forward it when the user explicitly opts in via ``--source-ids`` —
+    auto-stamping ``SUPERPOS_AGENT_ID`` would 403 for agents whose read scope
+    doesn't cover their own agent page.
+    """
+    body = _resolve_body(args.body, args.body_file)
+    if body is None:
+        print("Error: --type requires --body or --body-file.", file=sys.stderr)
+        sys.exit(2)
+    if args.type not in _KNOWLEDGE_PAGE_TYPES:
+        print(
+            f"Error: --type {args.type!r} is not a known page type. "
+            f"Valid types: {', '.join(sorted(_KNOWLEDGE_PAGE_TYPES))}.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    frontmatter = _parse_json_arg("frontmatter", args.frontmatter)
+    source_ids: list[str] | None = None
+    if args.source_ids:
+        source_ids = [s.strip() for s in args.source_ids.split(",") if s.strip()]
+
+    return {
+        "type": args.type,
+        "slug": args.slug,
+        "body": body,
+        "title": args.title,
+        "summary": args.summary,
+        "frontmatter": frontmatter,
+        "tags": ([t.strip() for t in args.tags.split(",") if t.strip()] if args.tags else None),
+        "source_ids": source_ids,
+    }
+
+
+def _build_typed_update_kwargs(args: argparse.Namespace) -> dict[str, Any]:
+    """Assemble kwargs for ``update_knowledge_page`` from CLI flags.
+
+    Only the supplied fields go in the payload.  ``--type`` and ``--slug``
+    are rejected on update (re-typing/changing slug is a migration, not an
+    inline edit).
+    """
+    if getattr(args, "type", None) is not None:
+        print("Error: --type cannot be changed via update; create a new page instead.",
+              file=sys.stderr)
+        sys.exit(2)
+    if getattr(args, "slug", None) is not None:
+        print("Error: --slug cannot be changed via update; create a new page instead.",
+              file=sys.stderr)
+        sys.exit(2)
+
+    body = _resolve_body(args.body, args.body_file)
+    frontmatter = _parse_json_arg("frontmatter", args.frontmatter)
+    return {
+        "body": body,
+        "title": args.title,
+        "summary": args.summary,
+        "frontmatter": frontmatter,
+        "tags": ([t.strip() for t in args.tags.split(",") if t.strip()] if args.tags else None),
+        "source_ids": (
+            [s.strip() for s in args.source_ids.split(",") if s.strip()]
+            if args.source_ids else None
+        ),
+    }
+
+
 async def _run(args: argparse.Namespace) -> int:
     config = _config_from_env()
     client = SuperposClient(config)
@@ -151,39 +249,83 @@ async def _run(args: argparse.Namespace) -> int:
             _print(await client.knowledge_decisions())
 
         elif args.cmd == "create":
-            _print(await client.create_knowledge(
-                key=args.key,
-                value=_build_value(args),
-                scope=_default_scope(args.scope),
-                visibility=args.visibility,
-                ttl=args.ttl,
-            ))
+            if args.key and args.type:
+                print(
+                    "Error: pass either --key (legacy) or --type (typed), not both.",
+                    file=sys.stderr,
+                )
+                return 2
+            if args.type:
+                kwargs = _build_typed_page_kwargs(args)
+                _print(await client.create_knowledge_page(
+                    **kwargs,
+                    scope=_default_scope(args.scope),
+                    visibility=args.visibility,
+                    ttl=args.ttl,
+                ))
+            else:
+                if not args.key:
+                    print("Error: --key is required for legacy create.", file=sys.stderr)
+                    return 2
+                if not args.content:
+                    print("Error: --content is required for legacy create.", file=sys.stderr)
+                    return 2
+                _print(await client.create_knowledge(
+                    key=args.key,
+                    value=_build_value(args),
+                    scope=_default_scope(args.scope),
+                    visibility=args.visibility,
+                    ttl=args.ttl,
+                ))
 
         elif args.cmd == "update":
-            has_individual_flags = any(
+            typed_flags_set = any(
                 getattr(args, f, None) is not None
-                for f in ("title", "summary", "content", "tags", "confidence")
+                for f in ("body", "body_file", "frontmatter", "source_ids")
             )
-            if args.value and not has_individual_flags:
-                # Full replacement: --value without individual field flags
-                final = _build_value(args)
+            if typed_flags_set:
+                kwargs = _build_typed_update_kwargs(args)
+                # Drop None entries so partial updates send only what's set
+                kwargs = {k: v for k, v in kwargs.items() if v is not None}
+                if not kwargs:
+                    print(
+                        "Error: typed update requires at least one of "
+                        "--body/--body-file, --title, --summary, --tags, "
+                        "--frontmatter, --source-ids.",
+                        file=sys.stderr,
+                    )
+                    return 2
+                _print(await client.update_knowledge_page(
+                    args.entry_id,
+                    **kwargs,
+                    visibility=args.visibility,
+                    ttl=args.ttl,
+                ))
             else:
-                # Partial update: read-modify-write merge
-                existing = await client.get_knowledge(args.entry_id)
-                existing_value = existing.get("value", {}) if isinstance(existing, dict) else {}
-                if not isinstance(existing_value, dict):
-                    existing_value = {}
-                partial = _build_value(args)
-                final = {**existing_value, **partial}
-                existing_meta = existing_value.get("metadata", {})
-                if isinstance(existing_meta, dict) and isinstance(partial.get("metadata"), dict):
-                    final["metadata"] = {**existing_meta, **partial["metadata"]}
-            _print(await client.update_knowledge(
-                args.entry_id,
-                value=final,
-                visibility=args.visibility,
-                ttl=args.ttl,
-            ))
+                has_individual_flags = any(
+                    getattr(args, f, None) is not None
+                    for f in ("title", "summary", "content", "tags", "confidence")
+                )
+                if args.value and not has_individual_flags:
+                    # Full replacement: --value without individual field flags
+                    final = _build_value(args)
+                else:
+                    # Partial update: read-modify-write merge
+                    existing = await client.get_knowledge(args.entry_id)
+                    existing_value = existing.get("value", {}) if isinstance(existing, dict) else {}
+                    if not isinstance(existing_value, dict):
+                        existing_value = {}
+                    partial = _build_value(args)
+                    final = {**existing_value, **partial}
+                    existing_meta = existing_value.get("metadata", {})
+                    if isinstance(existing_meta, dict) and isinstance(partial.get("metadata"), dict):
+                        final["metadata"] = {**existing_meta, **partial["metadata"]}
+                _print(await client.update_knowledge(
+                    args.entry_id,
+                    value=final,
+                    visibility=args.visibility,
+                    ttl=args.ttl,
+                ))
 
         else:
             print(f"Unknown subcommand: {args.cmd}", file=sys.stderr)
@@ -192,31 +334,6 @@ async def _run(args: argparse.Namespace) -> int:
         return 0
     finally:
         await client.close()
-
-
-def _add_value_flags(p: argparse.ArgumentParser, *, require_content: bool) -> None:
-    """Shared value-shaping flags for create/update."""
-    p.add_argument(
-        "--content", required=require_content,
-        help="Entry body. Prefer the shape 'Rule: …  Why: …  How to apply: …'",
-    )
-    p.add_argument("--title", help="Short headline for the entry")
-    p.add_argument("--summary", help="One-line summary (shown in search results)")
-    p.add_argument("--tags", help="Comma-separated tags")
-    p.add_argument(
-        "--confidence", choices=["high", "medium", "low"],
-        help="Confidence level for this entry",
-    )
-    p.add_argument(
-        "--visibility", choices=["public", "private"],
-        help="Override visibility (defaults server-side by scope)",
-    )
-    p.add_argument("--ttl", help="ISO8601 expiry timestamp (entry auto-expires after)")
-    p.add_argument(
-        "--value",
-        help="Raw JSON object for the full value (escape hatch; structured "
-             "flags override fields on top of it)",
-    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -274,24 +391,103 @@ def _build_parser() -> argparse.ArgumentParser:
     sub.add_parser("topics", help="Convenience index of topic clusters in this hive")
     sub.add_parser("decisions", help="Convenience index of recorded decisions")
 
+    # ── Typed-page flags (create & update) ──────────────────────────
+    def _add_typed_flags(p: argparse.ArgumentParser, *, slug_required: bool) -> None:
+        p.add_argument(
+            "--type",
+            help=(
+                "Page type for the typed create shape (TASK-297). "
+                "Mutually exclusive with --key. One of: "
+                f"{', '.join(sorted(_KNOWLEDGE_PAGE_TYPES))}."
+            ),
+        )
+        p.add_argument(
+            "--slug",
+            required=slug_required,
+            help="Stable slug for the typed page (e.g. 'proposal-knowledge-wiki'). "
+                 "Required when --type is set on create.",
+        )
+        p.add_argument("--body", help="Markdown body of the page (typed shape).")
+        p.add_argument(
+            "--body-file",
+            help="Path to a file containing the markdown body (mutually exclusive with --body).",
+        )
+        p.add_argument(
+            "--frontmatter",
+            help="JSON object string for the page frontmatter (e.g. "
+                 "'{\"summary\": \"...\"}').",
+        )
+        p.add_argument(
+            "--source-ids",
+            help="Comma-separated source entry ULIDs / agent IDs (curator audit trail). "
+                 "Defaults to SUPERPOS_AGENT_ID when set.",
+        )
+
     # create
     p_create = sub.add_parser(
         "create", help="Record a new lasting knowledge entry (bounded write)",
     )
-    p_create.add_argument("--key", required=True, help="Stable key, e.g. 'decisions:eventbus-unification'")
+    p_create.add_argument(
+        "--key",
+        help="Stable key for the LEGACY shape, e.g. 'decisions:eventbus-unification'. "
+             "Required when --type is not set; mutually exclusive with --type.",
+    )
     p_create.add_argument(
         "--scope",
         help="Scope (default: SUPERPOS_KNOWLEDGE_FILLIN_SCOPE env or 'hive'). "
              "Org scope needs the knowledge.write_organization permission.",
     )
-    _add_value_flags(p_create, require_content=True)
+    p_create.add_argument(
+        "--content",
+        help="LEGACY body. Prefer the shape 'Rule: …  Why: …  How to apply: …'. "
+             "Required when --key is set.",
+    )
+    p_create.add_argument("--title", help="Short headline for the entry")
+    p_create.add_argument("--summary", help="One-line summary (shown in search results)")
+    p_create.add_argument("--tags", help="Comma-separated tags")
+    p_create.add_argument(
+        "--confidence", choices=["high", "medium", "low"],
+        help="Confidence level for this entry (legacy shape)",
+    )
+    p_create.add_argument(
+        "--visibility", choices=["public", "private"],
+        help="Override visibility (defaults server-side by scope)",
+    )
+    p_create.add_argument("--ttl", help="ISO8601 expiry timestamp (entry auto-expires after)")
+    p_create.add_argument(
+        "--value",
+        help="LEGACY raw JSON object for the full value (escape hatch; "
+             "structured flags override fields on top of it)",
+    )
+    _add_typed_flags(p_create, slug_required=False)
 
     # update
     p_update = sub.add_parser(
-        "update", help="Replace an existing entry's value (bumps version)",
+        "update", help="Replace an existing entry's value or body (bumps version)",
     )
     p_update.add_argument("entry_id", help="Knowledge entry ULID to update")
-    _add_value_flags(p_update, require_content=False)
+    p_update.add_argument(
+        "--content",
+        help="LEGACY body. Prefer the shape 'Rule: …  Why: …  How to apply: …'",
+    )
+    p_update.add_argument("--title", help="Short headline for the entry")
+    p_update.add_argument("--summary", help="One-line summary (shown in search results)")
+    p_update.add_argument("--tags", help="Comma-separated tags")
+    p_update.add_argument(
+        "--confidence", choices=["high", "medium", "low"],
+        help="Confidence level for this entry (legacy shape)",
+    )
+    p_update.add_argument(
+        "--visibility", choices=["public", "private"],
+        help="Override visibility (defaults server-side by scope)",
+    )
+    p_update.add_argument("--ttl", help="ISO8601 expiry timestamp (entry auto-expires after)")
+    p_update.add_argument(
+        "--value",
+        help="LEGACY raw JSON object for the full value (escape hatch; "
+             "structured flags override fields on top of it)",
+    )
+    _add_typed_flags(p_update, slug_required=False)
 
     return parser
 

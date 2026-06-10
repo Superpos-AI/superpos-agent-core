@@ -147,6 +147,53 @@ How to apply: <when and where future work should invoke this>
 Before creating, **search first** — if a near-duplicate exists, `update`
 it (or link a `supersedes` relation) rather than writing a fresh entry.
 
+### Typed pages (TASK-297)
+
+The legacy `--key`+`--content` shape is for inline `Rule / Why / How` knowledge.
+For typed pages — proposals, topics, source pages, log entries, procedures,
+entity records, trends — use the `--type`+`--slug`+`--body` shape.  The two
+shapes are mutually exclusive on create.
+
+```bash
+# Inline a small typed topic
+superpos-knowledge create \
+  --type topic --slug proposal-knowledge-wiki \
+  --title "Knowledge Wiki Redesign" \
+  --summary "Karpathy-style typed pages with wikilinks." \
+  --body "# Knowledge Wiki Redesign
+
+A typed-page model for the Superpos knowledge store.
+" \
+  --frontmatter '{"summary": "Karpathy-style typed pages with wikilinks.", "related_topic_slugs": ["proposal-registry"]}' \
+  --tags proposal,track:knowledge-wiki,architecture
+
+# Or read the body from a file
+superpos-knowledge create \
+  --type topic --slug proposal-registry \
+  --body-file docs/proposals/registry.md \
+  --title "Registry: Subagents, Skills, Modules" \
+  --tags proposal,track:registry,architecture
+
+# Partial typed update — only the body changes
+superpos-knowledge update 01HXYZ... --body-file docs/proposals/registry.md
+
+# Update only the title and tags
+superpos-knowledge update 01HXYZ... --title "New title" --tags proposal,architecture
+```
+
+Flags (typed shape, create & update):
+- `--type` — one of `entity`, `topic`, `trend`, `source_page`, `log`, `procedure`
+- `--slug` — stable slug (required on create; immutable on update)
+- `--body` / `--body-file <path>` — markdown body (one of the two required on typed create)
+- `--frontmatter` — JSON object string (e.g. `'{"summary": "..."}'`)
+- `--source-ids` — comma-separated source ULIDs / agent IDs (curator audit trail;
+  server enforces proposal §6.8 ACL, so only pass entries the writing agent
+  already has read access to).  Not auto-stamped from `SUPERPOS_AGENT_ID` —
+  opt in explicitly.
+
+Legacy flags (`--key`, `--content`, `--value`, `--confidence`) remain supported
+on the same subcommand — pass `--key` (and NOT `--type`) for the legacy shape.
+
 ## Tips
 
 - **Search first, ask later.**  If the user asks about something hive-specific,

@@ -38,6 +38,8 @@ def _ns(**kw) -> argparse.Namespace:
     base = dict(
         value=None, title=None, summary=None, content=None,
         tags=None, confidence=None,
+        type=None, slug=None, body=None, body_file=None,
+        frontmatter=None, source_ids=None,
     )
     base.update(kw)
     return argparse.Namespace(**base)
@@ -95,14 +97,29 @@ def test_default_scope_precedence(monkeypatch):
     assert mod._default_scope(None) == "hive"                     # final default
 
 
-def test_parser_create_requires_key_and_content():
+@pytest.mark.asyncio
+async def test_create_legacy_without_key_or_content_returns_2(monkeypatch):
+    """Legacy create with neither --key nor --type must exit 2 (no network)."""
     mod = _load_script()
-    parser = mod._build_parser()
-    with pytest.raises(SystemExit):
-        parser.parse_args(["create"])  # missing --key and --content
-    # valid create parses
-    args = parser.parse_args(["create", "--key", "k", "--content", "c"])
-    assert args.cmd == "create" and args.key == "k" and args.content == "c"
+
+    mock_create_page = AsyncMock()
+    mock_create_legacy = AsyncMock()
+    mock_close = AsyncMock()
+
+    monkeypatch.setenv("SUPERPOS_BASE_URL", "http://fake")
+    monkeypatch.setenv("SUPERPOS_HIVE_ID", "hive1")
+    monkeypatch.setenv("SUPERPOS_API_TOKEN", "tok")
+
+    with patch.object(mod.SuperposClient, "create_knowledge_page", mock_create_page), \
+         patch.object(mod.SuperposClient, "create_knowledge", mock_create_legacy), \
+         patch.object(mod.SuperposClient, "close", mock_close):
+        # No --key and no --type: legacy validation in _run must reject
+        args = mod._build_parser().parse_args(["create"])
+        args.sort = None
+        rc = await mod._run(args)
+    assert rc == 2
+    mock_create_page.assert_not_called()
+    mock_create_legacy.assert_not_called()
 
 
 def test_parser_update_takes_entry_id_and_optional_content():
@@ -259,3 +276,392 @@ async def test_update_value_with_flag_overrides_still_merges(monkeypatch):
     # Provenance metadata stamped
     assert sent_value["metadata"]["source"] == "agent_inline"
     assert sent_value["metadata"]["auto_generated"] is True
+
+
+# ── Typed-page shape (TASK-297) ────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_create_typed_routes_to_create_knowledge_page(monkeypatch):
+    """create --type ... --slug ... --body ... must call create_knowledge_page,
+    not the legacy create_knowledge."""
+    mod = _load_script()
+
+    mock_create_page = AsyncMock(return_value={"id": "01NEW", "type": "topic", "slug": "s"})
+    mock_create_legacy = AsyncMock()
+    mock_close = AsyncMock()
+
+    monkeypatch.setenv("SUPERPOS_BASE_URL", "http://fake")
+    monkeypatch.setenv("SUPERPOS_HIVE_ID", "hive1")
+    monkeypatch.setenv("SUPERPOS_API_TOKEN", "tok")
+
+    with patch.object(mod.SuperposClient, "create_knowledge_page", mock_create_page), \
+         patch.object(mod.SuperposClient, "create_knowledge", mock_create_legacy), \
+         patch.object(mod.SuperposClient, "close", mock_close):
+        args = mod._build_parser().parse_args([
+            "create", "--type", "topic", "--slug", "s", "--body", "b",
+        ])
+        args.sort = None
+        await mod._run(args)
+
+    mock_create_page.assert_awaited_once()
+    kwargs = mock_create_page.call_args.kwargs
+    assert kwargs["type"] == "topic"
+    assert kwargs["slug"] == "s"
+    assert kwargs["body"] == "b"
+    assert kwargs["scope"] == "hive"  # default scope
+    # Legacy path must NOT be called
+    mock_create_legacy.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_create_typed_with_body_file_reads_file(monkeypatch, tmp_path):
+    mod = _load_script()
+    body_file = tmp_path / "page.md"
+    body_file.write_text("# From file\n\nMarkdown body.", encoding="utf-8")
+
+    mock_create_page = AsyncMock(return_value={"id": "01NEW"})
+    mock_close = AsyncMock()
+
+    monkeypatch.setenv("SUPERPOS_BASE_URL", "http://fake")
+    monkeypatch.setenv("SUPERPOS_HIVE_ID", "hive1")
+    monkeypatch.setenv("SUPERPOS_API_TOKEN", "tok")
+
+    with patch.object(mod.SuperposClient, "create_knowledge_page", mock_create_page), \
+         patch.object(mod.SuperposClient, "close", mock_close):
+        args = mod._build_parser().parse_args([
+            "create", "--type", "topic", "--slug", "s",
+            "--body-file", str(body_file),
+        ])
+        args.sort = None
+        await mod._run(args)
+
+    assert mock_create_page.call_args.kwargs["body"] == "# From file\n\nMarkdown body."
+
+
+@pytest.mark.asyncio
+async def test_create_typed_rejects_unknown_type(monkeypatch):
+    """Unknown --type values must exit 2 (via _build_typed_page_kwargs)."""
+    mod = _load_script()
+    monkeypatch.setenv("SUPERPOS_BASE_URL", "http://fake")
+    monkeypatch.setenv("SUPERPOS_HIVE_ID", "hive1")
+    monkeypatch.setenv("SUPERPOS_API_TOKEN", "tok")
+    mock_create_page = AsyncMock()
+    mock_close = AsyncMock()
+    with patch.object(mod.SuperposClient, "create_knowledge_page", mock_create_page), \
+         patch.object(mod.SuperposClient, "close", mock_close):
+        args = mod._build_parser().parse_args([
+            "create", "--type", "badtype", "--slug", "s", "--body", "b",
+        ])
+        args.sort = None
+        with pytest.raises(SystemExit) as exc:
+            await mod._run(args)
+    assert exc.value.code == 2
+    mock_create_page.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_create_typed_rejects_missing_body(monkeypatch):
+    """--type without --body/--body-file must exit 2."""
+    mod = _load_script()
+    monkeypatch.setenv("SUPERPOS_BASE_URL", "http://fake")
+    monkeypatch.setenv("SUPERPOS_HIVE_ID", "hive1")
+    monkeypatch.setenv("SUPERPOS_API_TOKEN", "tok")
+    mock_create_page = AsyncMock()
+    mock_close = AsyncMock()
+    with patch.object(mod.SuperposClient, "create_knowledge_page", mock_create_page), \
+         patch.object(mod.SuperposClient, "close", mock_close):
+        args = mod._build_parser().parse_args(["create", "--type", "topic", "--slug", "s"])
+        args.sort = None
+        with pytest.raises(SystemExit) as exc:
+            await mod._run(args)
+    assert exc.value.code == 2
+    mock_create_page.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_create_typed_and_legacy_are_mutually_exclusive(monkeypatch):
+    """Passing both --key (legacy) and --type (typed) must exit 2 and never
+    hit the network."""
+    mod = _load_script()
+
+    mock_create_page = AsyncMock()
+    mock_create_legacy = AsyncMock()
+    mock_close = AsyncMock()
+
+    monkeypatch.setenv("SUPERPOS_BASE_URL", "http://fake")
+    monkeypatch.setenv("SUPERPOS_HIVE_ID", "hive1")
+    monkeypatch.setenv("SUPERPOS_API_TOKEN", "tok")
+
+    with patch.object(mod.SuperposClient, "create_knowledge_page", mock_create_page), \
+         patch.object(mod.SuperposClient, "create_knowledge", mock_create_legacy), \
+         patch.object(mod.SuperposClient, "close", mock_close):
+        args = mod._build_parser().parse_args([
+            "create",
+            "--key", "k",
+            "--type", "topic", "--slug", "s", "--body", "b",
+            "--content", "c",
+        ])
+        args.sort = None
+        rc = await mod._run(args)
+    assert rc == 2
+    mock_create_page.assert_not_called()
+    mock_create_legacy.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_create_typed_with_frontmatter_parses_json(monkeypatch):
+    mod = _load_script()
+
+    mock_create_page = AsyncMock(return_value={"id": "01NEW"})
+    mock_close = AsyncMock()
+
+    monkeypatch.setenv("SUPERPOS_BASE_URL", "http://fake")
+    monkeypatch.setenv("SUPERPOS_HIVE_ID", "hive1")
+    monkeypatch.setenv("SUPERPOS_API_TOKEN", "tok")
+
+    with patch.object(mod.SuperposClient, "create_knowledge_page", mock_create_page), \
+         patch.object(mod.SuperposClient, "close", mock_close):
+        args = mod._build_parser().parse_args([
+            "create", "--type", "topic", "--slug", "s", "--body", "b",
+            "--frontmatter", '{"summary": "x"}',
+        ])
+        args.sort = None
+        await mod._run(args)
+
+    assert mock_create_page.call_args.kwargs["frontmatter"] == {"summary": "x"}
+
+
+@pytest.mark.asyncio
+async def test_create_typed_does_not_auto_stamp_source_ids(monkeypatch):
+    """``source_ids`` is gated by proposal §6.8 server-side; auto-stamping
+    ``SUPERPOS_AGENT_ID`` would 403 for agents whose read scope doesn't
+    cover their own page.  We only forward ``source_ids`` when the user
+    explicitly opts in via ``--source-ids``.
+    """
+    mod = _load_script()
+
+    mock_create_page = AsyncMock(return_value={"id": "01NEW"})
+    mock_close = AsyncMock()
+
+    monkeypatch.setenv("SUPERPOS_BASE_URL", "http://fake")
+    monkeypatch.setenv("SUPERPOS_HIVE_ID", "hive1")
+    monkeypatch.setenv("SUPERPOS_API_TOKEN", "tok")
+    monkeypatch.setenv("SUPERPOS_AGENT_ID", "01AGENT")
+
+    with patch.object(mod.SuperposClient, "create_knowledge_page", mock_create_page), \
+         patch.object(mod.SuperposClient, "close", mock_close):
+        args = mod._build_parser().parse_args([
+            "create", "--type", "topic", "--slug", "s", "--body", "b",
+        ])
+        args.sort = None
+        await mod._run(args)
+
+    # No auto-stamp — source_ids stays None unless --source-ids is given.
+    assert mock_create_page.call_args.kwargs["source_ids"] is None
+
+
+@pytest.mark.asyncio
+async def test_create_typed_with_explicit_source_ids(monkeypatch):
+    """When ``--source-ids`` is supplied, its value is forwarded verbatim."""
+    mod = _load_script()
+
+    mock_create_page = AsyncMock(return_value={"id": "01NEW"})
+    mock_close = AsyncMock()
+
+    monkeypatch.setenv("SUPERPOS_BASE_URL", "http://fake")
+    monkeypatch.setenv("SUPERPOS_HIVE_ID", "hive1")
+    monkeypatch.setenv("SUPERPOS_API_TOKEN", "tok")
+    monkeypatch.setenv("SUPERPOS_AGENT_ID", "01AGENT")  # must NOT be used
+
+    with patch.object(mod.SuperposClient, "create_knowledge_page", mock_create_page), \
+         patch.object(mod.SuperposClient, "close", mock_close):
+        args = mod._build_parser().parse_args([
+            "create", "--type", "topic", "--slug", "s", "--body", "b",
+            "--source-ids", "01SRC1,01SRC2",
+        ])
+        args.sort = None
+        await mod._run(args)
+
+    assert mock_create_page.call_args.kwargs["source_ids"] == ["01SRC1", "01SRC2"]
+
+
+@pytest.mark.asyncio
+async def test_update_typed_routes_to_update_knowledge_page(monkeypatch):
+    mod = _load_script()
+
+    mock_update_page = AsyncMock(return_value={"id": "01ABC", "body": "new"})
+    mock_update_legacy = AsyncMock()
+    mock_get = AsyncMock()
+    mock_close = AsyncMock()
+
+    monkeypatch.setenv("SUPERPOS_BASE_URL", "http://fake")
+    monkeypatch.setenv("SUPERPOS_HIVE_ID", "hive1")
+    monkeypatch.setenv("SUPERPOS_API_TOKEN", "tok")
+
+    with patch.object(mod.SuperposClient, "update_knowledge_page", mock_update_page), \
+         patch.object(mod.SuperposClient, "update_knowledge", mock_update_legacy), \
+         patch.object(mod.SuperposClient, "get_knowledge", mock_get), \
+         patch.object(mod.SuperposClient, "close", mock_close):
+        args = mod._build_parser().parse_args([
+            "update", "01ABC", "--body", "new body",
+        ])
+        args.sort = None
+        await mod._run(args)
+
+    mock_update_page.assert_awaited_once()
+    kwargs = mock_update_page.call_args
+    assert kwargs.args[0] == "01ABC"
+    assert kwargs.kwargs["body"] == "new body"
+    mock_update_legacy.assert_not_called()
+    mock_get.assert_not_called()  # no read-modify-write in typed path
+
+
+@pytest.mark.asyncio
+async def test_update_typed_with_body_file(monkeypatch, tmp_path):
+    mod = _load_script()
+    body_file = tmp_path / "body.md"
+    body_file.write_text("file body content", encoding="utf-8")
+
+    mock_update_page = AsyncMock(return_value={"id": "01ABC"})
+    mock_close = AsyncMock()
+
+    monkeypatch.setenv("SUPERPOS_BASE_URL", "http://fake")
+    monkeypatch.setenv("SUPERPOS_HIVE_ID", "hive1")
+    monkeypatch.setenv("SUPERPOS_API_TOKEN", "tok")
+
+    with patch.object(mod.SuperposClient, "update_knowledge_page", mock_update_page), \
+         patch.object(mod.SuperposClient, "close", mock_close):
+        args = mod._build_parser().parse_args([
+            "update", "01ABC", "--body-file", str(body_file),
+        ])
+        args.sort = None
+        await mod._run(args)
+
+    assert mock_update_page.call_args.kwargs["body"] == "file body content"
+
+
+@pytest.mark.asyncio
+async def test_update_typed_partial_only_sends_supplied_fields(monkeypatch):
+    """`update ID --body 'new'` must send ONLY body in the typed payload."""
+    mod = _load_script()
+
+    mock_update_page = AsyncMock(return_value={"id": "01ABC"})
+    mock_close = AsyncMock()
+
+    monkeypatch.setenv("SUPERPOS_BASE_URL", "http://fake")
+    monkeypatch.setenv("SUPERPOS_HIVE_ID", "hive1")
+    monkeypatch.setenv("SUPERPOS_API_TOKEN", "tok")
+
+    with patch.object(mod.SuperposClient, "update_knowledge_page", mock_update_page), \
+         patch.object(mod.SuperposClient, "close", mock_close):
+        args = mod._build_parser().parse_args([
+            "update", "01ABC", "--body", "new body",
+        ])
+        args.sort = None
+        await mod._run(args)
+
+    kwargs = mock_update_page.call_args.kwargs
+    assert kwargs["body"] == "new body"
+    # Only `body` carries a value; visibility/ttl are passed through as None
+    # and do not constitute a "supplied field" from the CLI's perspective.
+    assert kwargs.get("visibility") is None
+    assert kwargs.get("ttl") is None
+    # No other field is supplied.
+    for k in ("title", "summary", "frontmatter", "tags", "source_ids"):
+        assert kwargs.get(k) is None, f"unexpected field {k!r}={kwargs.get(k)!r}"
+
+
+@pytest.mark.asyncio
+async def test_update_typed_rejects_type_change(monkeypatch):
+    """--type on update must exit 2 (typed-only flag triggers the typed path)."""
+    mod = _load_script()
+    monkeypatch.setenv("SUPERPOS_BASE_URL", "http://fake")
+    monkeypatch.setenv("SUPERPOS_HIVE_ID", "hive1")
+    monkeypatch.setenv("SUPERPOS_API_TOKEN", "tok")
+    mock_update_page = AsyncMock()
+    mock_close = AsyncMock()
+    with patch.object(mod.SuperposClient, "update_knowledge_page", mock_update_page), \
+         patch.object(mod.SuperposClient, "close", mock_close):
+        args = mod._build_parser().parse_args([
+            "update", "01ABC", "--type", "procedure", "--body", "b",
+        ])
+        args.sort = None
+        with pytest.raises(SystemExit) as exc:
+            await mod._run(args)
+    assert exc.value.code == 2
+    mock_update_page.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_typed_rejects_slug_change(monkeypatch):
+    """--slug on update must exit 2 (typed-only flag triggers the typed path)."""
+    mod = _load_script()
+    monkeypatch.setenv("SUPERPOS_BASE_URL", "http://fake")
+    monkeypatch.setenv("SUPERPOS_HIVE_ID", "hive1")
+    monkeypatch.setenv("SUPERPOS_API_TOKEN", "tok")
+    mock_update_page = AsyncMock()
+    mock_close = AsyncMock()
+    with patch.object(mod.SuperposClient, "update_knowledge_page", mock_update_page), \
+         patch.object(mod.SuperposClient, "close", mock_close):
+        args = mod._build_parser().parse_args([
+            "update", "01ABC", "--slug", "new-slug", "--body", "b",
+        ])
+        args.sort = None
+        with pytest.raises(SystemExit) as exc:
+            await mod._run(args)
+    assert exc.value.code == 2
+    mock_update_page.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_legacy_still_works(monkeypatch):
+    """Regression: `update ID --content 'new'` must still call
+    update_knowledge (legacy path), not the new typed method."""
+    mod = _load_script()
+
+    existing_entry = {
+        "id": "01ABC",
+        "value": {"title": "Old", "content": "Old content"},
+    }
+    mock_get = AsyncMock(return_value=existing_entry)
+    mock_update = AsyncMock(return_value={"id": "01ABC", "value": {}})
+    mock_update_page = AsyncMock()
+    mock_close = AsyncMock()
+
+    monkeypatch.setenv("SUPERPOS_BASE_URL", "http://fake")
+    monkeypatch.setenv("SUPERPOS_HIVE_ID", "hive1")
+    monkeypatch.setenv("SUPERPOS_API_TOKEN", "tok")
+
+    with patch.object(mod.SuperposClient, "get_knowledge", mock_get), \
+         patch.object(mod.SuperposClient, "update_knowledge", mock_update), \
+         patch.object(mod.SuperposClient, "update_knowledge_page", mock_update_page), \
+         patch.object(mod.SuperposClient, "close", mock_close):
+        args = mod._build_parser().parse_args([
+            "update", "01ABC", "--content", "new content",
+        ])
+        args.sort = None
+        await mod._run(args)
+
+    mock_update.assert_awaited_once()
+    mock_update_page.assert_not_called()
+
+
+def test_parser_create_typed_minimal():
+    """The minimal typed create invocation parses cleanly."""
+    mod = _load_script()
+    parser = mod._build_parser()
+    args = parser.parse_args([
+        "create", "--type", "topic", "--slug", "s", "--body", "b",
+    ])
+    assert args.cmd == "create"
+    assert args.type == "topic"
+    assert args.slug == "s"
+    assert args.body == "b"
+    assert args.body_file is None
+    assert args.frontmatter is None
+    assert args.source_ids is None
+    assert args.title is None
+    assert args.summary is None
+    assert args.tags is None
+
