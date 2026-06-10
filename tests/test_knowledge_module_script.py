@@ -1410,21 +1410,21 @@ async def test_broken_links_routes_to_list_knowledge_broken_links(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_backlinks_routes_to_list_knowledge_backlinks(monkeypatch):
-    """`backlinks <slug>` must call list_knowledge_backlinks with the slug."""
+    """`backlinks <entry_id>` must call list_knowledge_backlinks with the ULID."""
     mod = _load_script()
     _env_for_run(monkeypatch)
     mock = AsyncMock(return_value=[{"slug": "proposal-x", "id": "01ABC"}])
     mock_close = AsyncMock()
     with patch.object(mod.SuperposClient, "list_knowledge_backlinks", mock), \
          patch.object(mod.SuperposClient, "close", mock_close):
-        args = mod._build_parser().parse_args(["backlinks", "proposal-x"])
+        args = mod._build_parser().parse_args(["backlinks", "01TARGET"])
         args.sort = None
         await mod._run(args)
-    mock.assert_awaited_once_with("proposal-x")
+    mock.assert_awaited_once_with("01TARGET")
 
 
-def test_parser_backlinks_requires_slug_arg():
-    """`backlinks` without a positional slug must exit 2."""
+def test_parser_backlinks_requires_entry_id_arg():
+    """`backlinks` without a positional entry_id must exit 2."""
     mod = _load_script()
     parser = mod._build_parser()
     with pytest.raises(SystemExit) as exc:

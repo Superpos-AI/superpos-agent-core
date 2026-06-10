@@ -515,7 +515,7 @@ async def _run(args: argparse.Namespace) -> int:
             _print(await client.list_knowledge_broken_links())
 
         elif args.cmd == "backlinks":
-            _print(await client.list_knowledge_backlinks(args.slug))
+            _print(await client.list_knowledge_backlinks(args.entry_id))
 
         elif args.cmd == "create":
             if _guard_shape_xor(args):
@@ -754,9 +754,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "broken-links", help="List wiki-style double-bracket refs that don't resolve",
     )
     p_backlinks = sub.add_parser(
-        "backlinks", help="Show entries that link to this slug",
+        "backlinks", help="Show entries that link to this entry (by ULID)",
     )
-    p_backlinks.add_argument("slug", help="Target slug to find backlinks for")
+    p_backlinks.add_argument(
+        "entry_id",
+        help=(
+            "Target entry ULID to find backlinks for. "
+            "Resolve a slug to a ULID first via `search <slug> --limit 1 | jq '.[0].id'`."
+        ),
+    )
 
     # ── Typed-page flags (create & update) ──────────────────────────
     def _add_typed_flags(p: argparse.ArgumentParser, *, slug_required: bool) -> None:

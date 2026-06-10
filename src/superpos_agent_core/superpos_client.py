@@ -480,23 +480,24 @@ class SuperposClient:
         limit: int | None = None,
         offset: int | None = None,
     ) -> list[dict[str, Any]]:
-        """``GET /knowledge?type={type}`` — list entries filtered by type.
+        """``GET /knowledge/types/{type}/list`` — list entries of a given type.
 
-        Thin wrapper around the existing ``/knowledge`` listing; the server
-        already accepts ``?type=`` as a filter (verified live).  The valid
-        ``type`` values are ``entity``, ``topic``, ``trend``,
-        ``source_page``, ``log``, ``procedure`` — the script validates
-        against that set before the network round-trip.
+        Hits the dedicated ``/types/{type}/list`` endpoint (handled by
+        ``KnowledgeController::listByType``), which validates ``type``
+        server-side against ``FrontmatterSchema::TYPES``.  The valid values
+        are ``entity``, ``topic``, ``trend``, ``source_page``, ``log``,
+        ``procedure`` — the script validates against that set before the
+        network round-trip.
         """
         hive = self._config.superpos_hive_id
-        params: dict[str, Any] = {"type": type}
+        params: dict[str, Any] = {}
         if limit is not None:
             params["limit"] = limit
         if offset is not None:
             params["offset"] = offset
         resp = await self._request(
             "GET",
-            f"/api/v1/hives/{hive}/knowledge",
+            f"/api/v1/hives/{hive}/knowledge/types/{type}/list",
             params=params,
         )
         data = resp.json()
@@ -532,15 +533,20 @@ class SuperposClient:
         data = resp.json()
         return data.get("data", data) if isinstance(data, dict) else data
 
-    async def list_knowledge_backlinks(self, slug: str) -> list[dict[str, Any]]:
-        """``GET /knowledge/backlinks/{slug}`` — entries that link to this slug.
+    async def list_knowledge_backlinks(self, entry_id: str) -> list[dict[str, Any]]:
+        """``GET /knowledge/{entry}/backlinks`` — entries that link to this entry.
+
+        ``entry_id`` is a ULID (not a slug) — the server resolves the entry
+        by primary key.  To find the ULID for a given slug, do::
+
+            search <slug> --limit 1 | jq '.[0].id'
 
         Inverse of wikilink resolution: surfaces typed pages whose body
-        (or frontmatter) contains ``[[{slug}]]``.
+        (or frontmatter) contains ``[[<slug-of-entry>]]``.
         """
         hive = self._config.superpos_hive_id
         resp = await self._request(
-            "GET", f"/api/v1/hives/{hive}/knowledge/backlinks/{slug}",
+            "GET", f"/api/v1/hives/{hive}/knowledge/{entry_id}/backlinks",
         )
         data = resp.json()
         return data.get("data", data) if isinstance(data, dict) else data

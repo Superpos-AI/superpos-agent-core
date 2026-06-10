@@ -334,3 +334,53 @@ async def test_unwrap_handles_responses_without_data_envelope():
     out = await client.search_knowledge("x")
     assert out == [{"id": "raw"}]
     await client.close()
+
+
+# ── Typed-page list_by_type / backlinks URL shapes ──────────────────────
+#
+# AG-2 originally wired these to the wrong URLs (verified by probing the
+# live server — see PR #35).  These tests pin the correct shapes:
+#   list-by-type → GET /knowledge/types/{type}/list  (NOT /knowledge?type=)
+#   backlinks    → GET /knowledge/{entry}/backlinks  (NOT /knowledge/backlinks/{slug})
+# The /knowledge?type= query-param is silently ignored on the index endpoint.
+
+
+async def test_list_knowledge_by_type_hits_types_list_endpoint():
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return _envelope([{"id": "k1", "type": "topic"}], meta={"total": 1, "type": "topic"})
+
+    client = _make_client(handler)
+    out = await client.list_knowledge_by_type("topic", limit=10)
+
+    assert len(captured) == 1
+    req = captured[0]
+    assert req.method == "GET"
+    # Correct URL: literal /types/{type}/list, NOT /knowledge?type=topic
+    assert req.url.path == "/api/v1/hives/hive-x/knowledge/types/topic/list"
+    # And the type is in the path, not the query string
+    assert "type" not in req.url.params
+    assert req.url.params["limit"] == "10"
+    assert out == [{"id": "k1", "type": "topic"}]
+    await client.close()
+
+
+async def test_list_knowledge_backlinks_hits_entry_backlinks_endpoint():
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return _envelope([{"slug": "proposal-x", "id": "01OTHER"}], meta={"total": 1})
+
+    client = _make_client(handler)
+    out = await client.list_knowledge_backlinks("01TARGET")
+
+    assert len(captured) == 1
+    req = captured[0]
+    assert req.method == "GET"
+    # Correct URL: per-entry sub-resource, NOT /knowledge/backlinks/{slug}
+    assert req.url.path == "/api/v1/hives/hive-x/knowledge/01TARGET/backlinks"
+    assert out == [{"slug": "proposal-x", "id": "01OTHER"}]
+    await client.close()
