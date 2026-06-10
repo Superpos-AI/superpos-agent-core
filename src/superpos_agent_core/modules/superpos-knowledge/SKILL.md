@@ -194,6 +194,15 @@ Flags (typed shape, create & update):
 Legacy flags (`--key`, `--content`, `--value`, `--confidence`) remain supported
 on the same subcommand — pass `--key` (and NOT `--type`) for the legacy shape.
 
+**Update routing.** On `update`, the shape is inferred from the flags you pass:
+the legacy-only flags (`--content`, `--value`, `--confidence`) pin the legacy
+`value` path; any other knowledge field — including the shared
+`--title`/`--summary`/`--tags` as well as `--body`/`--frontmatter`/`--source-ids`
+— routes to the typed page path.  So `update <id> --title ... --tags ...` updates
+a typed page's metadata, while `update <id> --content ...` does a legacy
+read-modify-write.  `--type` and `--slug` are immutable on update and always
+rejected (exit 2) — re-typing or re-slugging is a migration, not an edit.
+
 ## Tips
 
 - **Search first, ask later.**  If the user asks about something hive-specific,

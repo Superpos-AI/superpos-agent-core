@@ -279,11 +279,28 @@ async def _run(args: argparse.Namespace) -> int:
                 ))
 
         elif args.cmd == "update":
-            typed_flags_set = any(
+            # Shape detection mirrors the create path: legacy-only flags
+            # (--content/--value/--confidence) pin the legacy `value` shape;
+            # every other knowledge field (--title/--summary/--tags as well as
+            # --body/--frontmatter/--source-ids) belongs to the typed page
+            # shape. --type/--slug are immutable on update and always route to
+            # the typed path so _build_typed_update_kwargs() can reject them.
+            legacy_only_flags_set = any(
                 getattr(args, f, None) is not None
-                for f in ("body", "body_file", "frontmatter", "source_ids")
+                for f in ("content", "value", "confidence")
             )
-            if typed_flags_set:
+            typed_shape_flags_set = any(
+                getattr(args, f, None) is not None
+                for f in (
+                    "body", "body_file", "frontmatter", "source_ids",
+                    "title", "summary", "tags",
+                )
+            )
+            type_or_slug_set = args.type is not None or args.slug is not None
+            use_typed_path = type_or_slug_set or (
+                typed_shape_flags_set and not legacy_only_flags_set
+            )
+            if use_typed_path:
                 kwargs = _build_typed_update_kwargs(args)
                 # Drop None entries so partial updates send only what's set
                 kwargs = {k: v for k, v in kwargs.items() if v is not None}

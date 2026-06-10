@@ -132,7 +132,12 @@ def test_parser_update_takes_entry_id_and_optional_content():
 
 @pytest.mark.asyncio
 async def test_update_partial_flags_preserve_existing_fields(monkeypatch):
-    """A partial update (e.g. only --summary) must not drop existing fields."""
+    """A legacy partial update (e.g. only --content) must not drop existing fields.
+
+    --content is a legacy-only flag, so this stays on the read-modify-write
+    legacy path. (Shared metadata-only flags like --summary/--tags now route to
+    the typed page path — see test_update_shared_flags_route_to_typed_page.)
+    """
     mod = _load_script()
 
     existing_entry = {
@@ -162,14 +167,16 @@ async def test_update_partial_flags_preserve_existing_fields(monkeypatch):
     with patch.object(mod.SuperposClient, "get_knowledge", mock_get), \
          patch.object(mod.SuperposClient, "update_knowledge", mock_update), \
          patch.object(mod.SuperposClient, "close", mock_close):
-        args = mod._build_parser().parse_args(["update", "01ABC", "--summary", "New summary"])
+        args = mod._build_parser().parse_args(
+            ["update", "01ABC", "--content", "Rule: new content"]
+        )
         args.sort = None
         await mod._run(args)
 
     sent_value = mock_update.call_args.kwargs["value"]
-    assert sent_value["summary"] == "New summary"
+    assert sent_value["content"] == "Rule: new content"
     assert sent_value["title"] == "Original title"
-    assert sent_value["content"] == "Rule: original content"
+    assert sent_value["summary"] == "Original summary"
     assert sent_value["tags"] == ["tag1", "tag2"]
     assert sent_value["confidence"] == "high"
     assert sent_value["metadata"]["custom_field"] == "preserved"
@@ -665,3 +672,175 @@ def test_parser_create_typed_minimal():
     assert args.summary is None
     assert args.tags is None
 
+
+
+# ── Update shape-routing regression (gilfoilbot-dev review, PR #31) ──────────
+# The original dispatcher only entered the typed path on
+# --body/--body-file/--frontmatter/--source-ids, so a metadata-only update
+# (--title/--summary/--tags) silently fell through to the legacy `value` path
+# (corrupting/no-opping typed page metadata) and --type/--slug alone were never
+# rejected. These tests pin the corrected routing.
+
+
+@pytest.mark.asyncio
+async def test_update_shared_flags_route_to_typed_page(monkeypatch):
+    """`update ID --title ... --tags ...` (no legacy-only flag) must call
+    update_knowledge_page, not the legacy update_knowledge path."""
+    mod = _load_script()
+
+    mock_update_page = AsyncMock(return_value={"id": "01ABC"})
+    mock_update_legacy = AsyncMock()
+    mock_get = AsyncMock()
+    mock_close = AsyncMock()
+
+    monkeypatch.setenv("SUPERPOS_BASE_URL", "http://fake")
+    monkeypatch.setenv("SUPERPOS_HIVE_ID", "hive1")
+    monkeypatch.setenv("SUPERPOS_API_TOKEN", "tok")
+
+    with patch.object(mod.SuperposClient, "update_knowledge_page", mock_update_page), \
+         patch.object(mod.SuperposClient, "update_knowledge", mock_update_legacy), \
+         patch.object(mod.SuperposClient, "get_knowledge", mock_get), \
+         patch.object(mod.SuperposClient, "close", mock_close):
+        args = mod._build_parser().parse_args([
+            "update", "01ABC", "--title", "New title", "--tags", "proposal,architecture",
+        ])
+        args.sort = None
+        await mod._run(args)
+
+    mock_update_page.assert_awaited_once()
+    kwargs = mock_update_page.call_args
+    assert kwargs.args[0] == "01ABC"
+    assert kwargs.kwargs["title"] == "New title"
+    assert kwargs.kwargs["tags"] == ["proposal", "architecture"]
+    # No legacy value payload and no read-modify-write on the typed path.
+    mock_update_legacy.assert_not_called()
+    mock_get.assert_not_called()
+    # Typed partial update sends only the supplied fields.
+    assert "body" not in kwargs.kwargs
+    assert "summary" not in kwargs.kwargs
+
+
+@pytest.mark.asyncio
+async def test_update_summary_only_routes_to_typed_page(monkeypatch):
+    """A single shared metadata flag (--summary) is enough to take the typed
+    path — it must not silently write a legacy value payload."""
+    mod = _load_script()
+
+    mock_update_page = AsyncMock(return_value={"id": "01ABC"})
+    mock_update_legacy = AsyncMock()
+    mock_close = AsyncMock()
+
+    monkeypatch.setenv("SUPERPOS_BASE_URL", "http://fake")
+    monkeypatch.setenv("SUPERPOS_HIVE_ID", "hive1")
+    monkeypatch.setenv("SUPERPOS_API_TOKEN", "tok")
+
+    with patch.object(mod.SuperposClient, "update_knowledge_page", mock_update_page), \
+         patch.object(mod.SuperposClient, "update_knowledge", mock_update_legacy), \
+         patch.object(mod.SuperposClient, "close", mock_close):
+        args = mod._build_parser().parse_args([
+            "update", "01ABC", "--summary", "New gist",
+        ])
+        args.sort = None
+        await mod._run(args)
+
+    mock_update_page.assert_awaited_once()
+    assert mock_update_page.call_args.kwargs["summary"] == "New gist"
+    mock_update_legacy.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_type_alone_exits_2(monkeypatch):
+    """`update ID --type procedure` (no other flag) must exit 2 without
+    calling either update method — the original routing missed this."""
+    mod = _load_script()
+
+    mock_update_page = AsyncMock()
+    mock_update_legacy = AsyncMock()
+    mock_get = AsyncMock()
+    mock_close = AsyncMock()
+
+    monkeypatch.setenv("SUPERPOS_BASE_URL", "http://fake")
+    monkeypatch.setenv("SUPERPOS_HIVE_ID", "hive1")
+    monkeypatch.setenv("SUPERPOS_API_TOKEN", "tok")
+
+    with patch.object(mod.SuperposClient, "update_knowledge_page", mock_update_page), \
+         patch.object(mod.SuperposClient, "update_knowledge", mock_update_legacy), \
+         patch.object(mod.SuperposClient, "get_knowledge", mock_get), \
+         patch.object(mod.SuperposClient, "close", mock_close):
+        args = mod._build_parser().parse_args([
+            "update", "01ABC", "--type", "procedure",
+        ])
+        args.sort = None
+        with pytest.raises(SystemExit) as exc:
+            await mod._run(args)
+
+    assert exc.value.code == 2
+    mock_update_page.assert_not_called()
+    mock_update_legacy.assert_not_called()
+    mock_get.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_slug_alone_exits_2(monkeypatch):
+    """`update ID --slug new-slug` (no other flag) must exit 2 without
+    calling either update method — the original routing missed this."""
+    mod = _load_script()
+
+    mock_update_page = AsyncMock()
+    mock_update_legacy = AsyncMock()
+    mock_get = AsyncMock()
+    mock_close = AsyncMock()
+
+    monkeypatch.setenv("SUPERPOS_BASE_URL", "http://fake")
+    monkeypatch.setenv("SUPERPOS_HIVE_ID", "hive1")
+    monkeypatch.setenv("SUPERPOS_API_TOKEN", "tok")
+
+    with patch.object(mod.SuperposClient, "update_knowledge_page", mock_update_page), \
+         patch.object(mod.SuperposClient, "update_knowledge", mock_update_legacy), \
+         patch.object(mod.SuperposClient, "get_knowledge", mock_get), \
+         patch.object(mod.SuperposClient, "close", mock_close):
+        args = mod._build_parser().parse_args([
+            "update", "01ABC", "--slug", "new-slug",
+        ])
+        args.sort = None
+        with pytest.raises(SystemExit) as exc:
+            await mod._run(args)
+
+    assert exc.value.code == 2
+    mock_update_page.assert_not_called()
+    mock_update_legacy.assert_not_called()
+    mock_get.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_title_with_content_stays_legacy(monkeypatch):
+    """A legacy-only flag (--content) pins the legacy path even when a shared
+    metadata flag (--title) is also present, so existing legacy callers that
+    combine the two keep their read-modify-write behavior."""
+    mod = _load_script()
+
+    existing_entry = {"id": "01ABC", "value": {"title": "Old", "content": "Old content"}}
+    mock_get = AsyncMock(return_value=existing_entry)
+    mock_update_legacy = AsyncMock(return_value={"id": "01ABC", "value": {}})
+    mock_update_page = AsyncMock()
+    mock_close = AsyncMock()
+
+    monkeypatch.setenv("SUPERPOS_BASE_URL", "http://fake")
+    monkeypatch.setenv("SUPERPOS_HIVE_ID", "hive1")
+    monkeypatch.setenv("SUPERPOS_API_TOKEN", "tok")
+
+    with patch.object(mod.SuperposClient, "get_knowledge", mock_get), \
+         patch.object(mod.SuperposClient, "update_knowledge", mock_update_legacy), \
+         patch.object(mod.SuperposClient, "update_knowledge_page", mock_update_page), \
+         patch.object(mod.SuperposClient, "close", mock_close):
+        args = mod._build_parser().parse_args([
+            "update", "01ABC", "--title", "New title", "--content", "Rule: new",
+        ])
+        args.sort = None
+        await mod._run(args)
+
+    mock_update_legacy.assert_awaited_once()
+    mock_update_page.assert_not_called()
+    sent_value = mock_update_legacy.call_args.kwargs["value"]
+    assert sent_value["title"] == "New title"
+    assert sent_value["content"] == "Rule: new"
