@@ -1066,6 +1066,121 @@ class SuperposClient:
             f"/api/v1/hives/{hive}/issues/{issue_id}/dependencies/{dependency_id}",
         )
 
+    # ── Tracks ────────────────────────────────────────────────────────
+
+    async def list_tracks(
+        self,
+        *,
+        status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """``GET /tracks`` — list tracks in the hive. ``spec`` is omitted.
+
+        ``status`` is forwarded to the server as a query param (forward-
+        compatible if the index gains support later), but state filtering is
+        ALSO enforced client-side because the server index does not filter:
+        ``TrackController::index`` only scopes by hive and orders by
+        ``updated_at``, ignoring query params. Rows are kept only when their
+        ``state`` equals ``status``; rows missing a ``state`` field are
+        excluded while a filter is active so unknown-state rows never leak.
+        """
+        hive = self._config.superpos_hive_id
+        params: dict[str, str] = {}
+        if status is not None:
+            params["status"] = status
+        resp = await self._request(
+            "GET", f"/api/v1/hives/{hive}/tracks", params=params or None,
+        )
+        data = resp.json()
+        rows = data.get("data", data) if isinstance(data, dict) else data
+        if status is None:
+            return rows
+        return [row for row in rows if row.get("state") == status]
+
+    async def get_track_by_slug(self, slug: str) -> dict[str, Any]:
+        """``GET /tracks/{slug}`` — fetch a single track including ``spec``."""
+        hive = self._config.superpos_hive_id
+        resp = await self._request(
+            "GET", f"/api/v1/hives/{hive}/tracks/{slug}",
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def create_track(
+        self,
+        *,
+        slug: str,
+        name: str,
+        description: str | None = None,
+        spec: str | None = None,
+        state: str | None = None,
+    ) -> dict[str, Any]:
+        """``POST /tracks`` — create a track (returns 201 with full payload)."""
+        hive = self._config.superpos_hive_id
+        body: dict[str, Any] = {"slug": slug, "name": name}
+        if description is not None:
+            body["description"] = description
+        if spec is not None:
+            body["spec"] = spec
+        if state is not None:
+            body["state"] = state
+        resp = await self._request(
+            "POST", f"/api/v1/hives/{hive}/tracks", json=body,
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def patch_track(
+        self,
+        slug: str,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+        spec: str | None = None,
+    ) -> dict[str, Any]:
+        """``PATCH /tracks/{slug}`` — update name/description/spec.
+
+        ``state`` transitions go through ``POST /tracks/{slug}/transition``,
+        not this method.  Slug is immutable.
+        """
+        hive = self._config.superpos_hive_id
+        body: dict[str, Any] = {}
+        if name is not None:
+            body["name"] = name
+        if description is not None:
+            body["description"] = description
+        if spec is not None:
+            body["spec"] = spec
+        resp = await self._request(
+            "PATCH", f"/api/v1/hives/{hive}/tracks/{slug}", json=body,
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def link_track_issue(
+        self, slug: str, issue_id: str,
+    ) -> dict[str, Any]:
+        """``POST /tracks/{slug}/issues`` — link an issue to a track.
+
+        Mirrors ``link_issue_to_track`` under a track-centric name so the
+        tracks CLI has a 1:1 method-to-subcommand mapping.
+        """
+        hive = self._config.superpos_hive_id
+        resp = await self._request(
+            "POST", f"/api/v1/hives/{hive}/tracks/{slug}/issues",
+            json={"issue_id": issue_id},
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def unlink_track_issue(
+        self, slug: str, issue_id: str,
+    ) -> None:
+        """``DELETE /tracks/{slug}/issues/{issue_id}`` — unlink (204 No Content)."""
+        hive = self._config.superpos_hive_id
+        await self._request(
+            "DELETE", f"/api/v1/hives/{hive}/tracks/{slug}/issues/{issue_id}",
+        )
+
     # ── Issue types ───────────────────────────────────────────────────
 
     async def list_issue_types(self) -> list[dict[str, Any]]:
