@@ -248,10 +248,10 @@ async def test_update_value_legacy_only_flag_overrides_still_merge(monkeypatch):
     """When --value is combined with a *legacy* individual flag (e.g.
     --content), the read-modify-write merge path is still used.
 
-    (Combining --value with a *shared content* flag like --summary now mixes the
-    legacy and typed shapes and is rejected by the XOR guard; see
-    test_update_value_with_shared_content_flag_mixes_and_is_rejected. A pure
-    legacy --value/--content combination stays on the merge path.)
+    (Combining --value with a *shared content* flag like --summary also stays on
+    this merge path — the legacy flag pins the legacy shape for shared fields;
+    see test_update_value_with_shared_content_flag_routes_legacy. A pure legacy
+    --value/--content combination stays on the merge path too.)
     """
     mod = _load_script()
 
@@ -299,16 +299,22 @@ async def test_update_value_legacy_only_flag_overrides_still_merge(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_update_value_with_shared_content_flag_mixes_and_is_rejected(
+async def test_update_value_with_shared_content_flag_routes_legacy(
     monkeypatch,
 ):
-    """``update <id> --value Y --summary X`` mixes the legacy shape (--value)
-    with the typed signal (positional id + a shared content flag), so the XOR
-    guard must reject it before any API call rather than silently merging."""
+    """``update <id> --value Y --summary X`` pairs the legacy shape (--value)
+    with a *shared* content flag (--summary), which is valid legacy content. The
+    legacy flag pins the legacy read-modify-write path — it must NOT be rejected
+    as a typed/legacy mix, and the shared field is merged into the value.
+
+    Regression: the positional id + shared content flag was wrongly promoted to
+    typed even when a legacy flag was present, so the XOR guard rejected this
+    valid legacy update (exit 2) before any API call.
+    """
     mod = _load_script()
     _set_env(monkeypatch)
-    mock_get = AsyncMock()
-    mock_update_k = AsyncMock()
+    mock_get = AsyncMock(return_value={"id": "01ABC", "value": {}})
+    mock_update_k = AsyncMock(return_value={"id": "01ABC", "value": {}})
     mock_update_page = AsyncMock()
     with patch.object(mod.SuperposClient, "get_knowledge", mock_get), \
          patch.object(mod.SuperposClient, "update_knowledge", mock_update_k), \
@@ -320,13 +326,14 @@ async def test_update_value_with_shared_content_flag_mixes_and_is_rejected(
             "--summary", "new summary",
         ])
         args.sort = None
-        with pytest.raises(SystemExit) as exc:
-            await mod._run(args)
+        rc = await mod._run(args)
 
-    assert exc.value.code == 2
-    mock_get.assert_not_called()
-    mock_update_k.assert_not_called()
+    assert rc == 0
+    mock_update_k.assert_called_once()
     mock_update_page.assert_not_called()
+    sent_value = mock_update_k.call_args.kwargs["value"]
+    assert sent_value["title"] == "base"
+    assert sent_value["summary"] == "new summary"
 
 
 # ── pure helper tests (typed shape) ───────────────────────────────────
@@ -790,10 +797,80 @@ async def test_update_positional_entry_id_with_legacy_flags_routes_legacy(monkey
 
 
 @pytest.mark.asyncio
+async def test_update_positional_id_legacy_flag_with_title_routes_legacy(monkeypatch):
+    """``update <id> --content "Rule: ..." --title "New title"`` is a legacy
+    update with a shared content field, NOT a typed/legacy mix. It must route to
+    update_knowledge (read-modify-write) and merge the title into the value —
+    never raise the XOR error.
+
+    Regression: a legacy flag alongside the positional id + a shared content
+    flag was wrongly promoted to typed, so the XOR guard rejected a valid legacy
+    update before either endpoint was called (exit 2). The legacy flag must pin
+    the legacy path for shared fields.
+    """
+    mod = _load_script()
+    _set_env(monkeypatch)
+    mock_get = AsyncMock(return_value={"id": "01ABC", "value": {"title": "old"}})
+    mock_update_k = AsyncMock(return_value={"id": "01ABC", "value": {}})
+    mock_update_page = AsyncMock()
+    with patch.object(mod.SuperposClient, "get_knowledge", mock_get), \
+         patch.object(mod.SuperposClient, "update_knowledge", mock_update_k), \
+         patch.object(mod.KnowledgeClient, "update_page", mock_update_page), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        args = mod._build_parser().parse_args([
+            "update", "01ABC", "--content", "Rule: new content",
+            "--title", "New title",
+        ])
+        args.sort = None
+        rc = await mod._run(args)
+
+    assert rc == 0
+    mock_update_k.assert_called_once()
+    mock_update_page.assert_not_called()
+    # The shared --title and legacy --content both land in the merged value.
+    sent_value = mock_update_k.call_args.kwargs["value"]
+    assert sent_value["title"] == "New title"
+    assert sent_value["content"] == "Rule: new content"
+
+
+@pytest.mark.asyncio
+async def test_update_positional_id_legacy_flag_with_tags_routes_legacy(monkeypatch):
+    """``update <id> --content ... --tags a,b`` (legacy flag + shared --tags)
+    routes to update_knowledge with the tags merged into the value, not the XOR
+    error path."""
+    mod = _load_script()
+    _set_env(monkeypatch)
+    mock_get = AsyncMock(return_value={"id": "01ABC", "value": {}})
+    mock_update_k = AsyncMock(return_value={"id": "01ABC", "value": {}})
+    mock_update_page = AsyncMock()
+    with patch.object(mod.SuperposClient, "get_knowledge", mock_get), \
+         patch.object(mod.SuperposClient, "update_knowledge", mock_update_k), \
+         patch.object(mod.KnowledgeClient, "update_page", mock_update_page), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        args = mod._build_parser().parse_args([
+            "update", "01ABC", "--content", "Rule: c", "--tags", "a,b",
+        ])
+        args.sort = None
+        rc = await mod._run(args)
+
+    assert rc == 0
+    mock_update_k.assert_called_once()
+    mock_update_page.assert_not_called()
+    sent_value = mock_update_k.call_args.kwargs["value"]
+    assert sent_value["tags"] == ["a", "b"]
+    assert sent_value["content"] == "Rule: c"
+
+
+@pytest.mark.asyncio
 async def test_update_positional_entry_id_mixing_typed_and_legacy_rejected(monkeypatch):
     """``update <id> --body ... --content ...`` mixes typed and legacy shapes;
     the XOR guard must reject it before any API call (the positional id rides
-    along with whichever shape, but the shapes themselves can't be mixed)."""
+    along with whichever shape, but the shapes themselves can't be mixed).
+
+    Note: this is a genuinely typed-EXCLUSIVE flag (--body) mixed with legacy,
+    which is still rejected — distinct from a shared content flag (--title/
+    --summary/--tags) + legacy, which stays legacy (see the two tests above).
+    """
     mod = _load_script()
     _set_env(monkeypatch)
     mock_update_page = AsyncMock()
@@ -901,16 +978,17 @@ def test_guard_shape_xor_treats_id_as_typed_selector(capsys):
 
 def test_guard_shape_xor_positional_id_with_shared_content_is_typed(capsys):
     """A positional ``entry_id`` carrying a shared content flag
-    (--title/--summary/--tags) selects the typed path, since the positional id
-    aliases --id. Pure cross-cutting (--ttl/--visibility) or bare positional ids
-    stay legacy; mixing a shared content flag with a legacy flag is rejected.
+    (--title/--summary/--tags) AND no legacy flag selects the typed path, since
+    the positional id aliases --id. Pure cross-cutting (--ttl/--visibility) or
+    bare positional ids stay legacy; a shared content flag alongside a legacy
+    flag stays legacy too (the legacy flag pins the legacy path).
 
     Regression: the positional entry_id is a separate argparse dest from --id,
     so a positional-id update with only a shared content flag used to read as
     neither typed nor legacy and fell through to the legacy path.
     """
     mod = _load_script()
-    # positional id + shared content flag → typed.
+    # positional id + shared content flag (no legacy flag) → typed.
     assert mod._guard_shape_xor(_ns(entry_id="01ABC", summary="s")) is True
     assert mod._guard_shape_xor(_ns(entry_id="01ABC", title="T")) is True
     assert mod._guard_shape_xor(_ns(entry_id="01ABC", tags="")) is True
@@ -918,10 +996,12 @@ def test_guard_shape_xor_positional_id_with_shared_content_is_typed(capsys):
     assert mod._guard_shape_xor(_ns(entry_id="01ABC")) is False
     assert mod._guard_shape_xor(_ns(entry_id="01ABC", ttl="2026-06-11")) is False
     assert mod._guard_shape_xor(_ns(entry_id="01ABC", value="{}")) is False
-    # positional id + shared content flag mixed with a legacy flag → rejected.
-    with pytest.raises(SystemExit):
-        mod._guard_shape_xor(_ns(entry_id="01ABC", summary="s", value="{}"))
-    assert "cannot mix" in capsys.readouterr().err
+    # positional id + shared content flag + a legacy flag → legacy, NOT rejected.
+    # The shared fields are valid legacy content, so the legacy flag pins the
+    # legacy read-modify-write path (main-branch backwards compatibility).
+    assert mod._guard_shape_xor(_ns(entry_id="01ABC", summary="s", value="{}")) is False
+    assert mod._guard_shape_xor(_ns(entry_id="01ABC", title="T", content="Rule: c")) is False
+    assert mod._guard_shape_xor(_ns(entry_id="01ABC", tags="a,b", content="Rule: c")) is False
 
 
 @pytest.mark.asyncio
