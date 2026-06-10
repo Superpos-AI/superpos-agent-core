@@ -42,6 +42,15 @@ _TYPED_FLAGS = ("type", "slug", "body", "body_file", "frontmatter", "source_ids"
 # legacy key/value flags, so the guard treats them as typed.
 _TYPED_SELECTORS = ("id",)
 
+# Shared content flags — meaningful in both shapes, so they don't pick a shape on
+# their own. But on *update* the positional ``entry_id`` (a separate argparse
+# dest from ``--id``) is a typed selector too, and a positional-id update that
+# carries a shared content field but no legacy flag is unambiguously a typed
+# edit: route it to update_page rather than falling through to legacy. (Pure
+# cross-cutting --ttl/--visibility are NOT content fields and must not trigger
+# this — they stay on the legacy read-modify-write path so a value is sent.)
+_SHARED_CONTENT_FLAGS = ("title", "summary", "tags")
+
 # Legacy key/value-shape flags, deprecated in favour of the typed shape.
 _LEGACY_FLAGS = ("key", "value", "content", "confidence")
 
@@ -136,8 +145,23 @@ def _typed_requested(args: argparse.Namespace) -> bool:
     they don't on their own decide the shape — only the typed-exclusive flags
     in ``_TYPED_FLAGS`` and the typed selectors in ``_TYPED_SELECTORS`` (e.g.
     ``--id`` on update) do.
+
+    The one exception is the positional ``entry_id`` selector on update: it is
+    a direct alias for ``--id`` (a typed selector), so a positional-id update
+    that also carries a shared content flag (``--title``/``--summary``/
+    ``--tags``) is a typed edit. We report that typed intent honestly even when
+    a legacy flag is also present, so ``_guard_shape_xor`` can catch the mixing
+    instead of silently routing to legacy. Cross-cutting ``--ttl``/
+    ``--visibility`` are NOT content fields, so a bare positional id carrying
+    only those (or only legacy flags) is not seen as typed and still resolves
+    via the legacy read-modify-write path.
     """
-    return _has_any_flag(args, _TYPED_FLAGS) or _has_any_flag(args, _TYPED_SELECTORS)
+    if _has_any_flag(args, _TYPED_FLAGS) or _has_any_flag(args, _TYPED_SELECTORS):
+        return True
+    return (
+        getattr(args, "entry_id", None) is not None
+        and _has_any_flag(args, _SHARED_CONTENT_FLAGS)
+    )
 
 
 def _legacy_requested(args: argparse.Namespace) -> bool:
