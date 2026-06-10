@@ -128,9 +128,11 @@ class KnowledgeClient:
         source_ids: Sequence[str] | None = None,
         sources: Sequence[Mapping[str, Any]] | None = None,
         title: str | None = None,
+        summary: str | None = None,
         tags: Sequence[str] | None = None,
         scope: str = "hive",
         visibility: str = "public",
+        ttl: str | None = None,
         hive: str | None = None,
     ) -> dict[str, Any]:
         """``POST /knowledge`` — create a typed wiki page (new shape).
@@ -145,6 +147,14 @@ class KnowledgeClient:
         ``source_ids=`` attaches already-ingested sources; each id is
         subject to the §6.8 attach-time authorization rule (a source
         the caller cannot already see returns 403 and rolls back).
+
+        ``summary=`` is the page's top-level one-line summary (max 500
+        chars server-side); it is sent as a top-level field, never folded
+        into ``frontmatter``.
+
+        ``ttl=`` is an optional ISO8601 expiry timestamp after which the
+        entry auto-expires; like ``summary`` it is sent as a top-level
+        field (omitted entirely when ``None``).
         """
         hive_id = self._hive(hive)
         payload: dict[str, Any] = {
@@ -162,8 +172,12 @@ class KnowledgeClient:
             payload["sources"] = [dict(s) for s in sources]
         if title is not None:
             payload["title"] = title
+        if summary is not None:
+            payload["summary"] = summary
         if tags is not None:
             payload["tags"] = list(tags)
+        if ttl is not None:
+            payload["ttl"] = ttl
         return await self._request_json(
             "POST", f"/api/v1/hives/{hive_id}/knowledge", json=payload,
         )
@@ -175,10 +189,12 @@ class KnowledgeClient:
         body: str | None = None,
         frontmatter: Mapping[str, Any] | None = None,
         title: str | None = None,
+        summary: str | None = None,
         tags: Sequence[str] | None = None,
         source_ids: Sequence[str] | None = None,
         sources: Sequence[Mapping[str, Any]] | None = None,
         visibility: str | None = None,
+        ttl: str | None = None,
         hive: str | None = None,
     ) -> dict[str, Any]:
         """``PUT /knowledge/{entry}`` — update a typed wiki page.
@@ -186,7 +202,11 @@ class KnowledgeClient:
         Supports partial updates and bumps the page version server-side.
         Only the fields you pass are sent, so an update that touches just
         ``frontmatter`` leaves ``body`` untouched. ``body`` is a full
-        replacement of the page body.
+        replacement of the page body. ``summary`` is the top-level
+        one-line summary (max 500 chars), sent as a top-level field.
+        ``ttl`` is an optional ISO8601 expiry timestamp, also sent as a
+        top-level field (omitted when ``None``). ``scope`` is immutable
+        post-create and is not accepted here.
         """
         hive_id = self._hive(hive)
         payload: dict[str, Any] = {}
@@ -196,6 +216,8 @@ class KnowledgeClient:
             payload["frontmatter"] = dict(frontmatter)
         if title is not None:
             payload["title"] = title
+        if summary is not None:
+            payload["summary"] = summary
         if tags is not None:
             payload["tags"] = list(tags)
         if source_ids is not None:
@@ -204,6 +226,8 @@ class KnowledgeClient:
             payload["sources"] = [dict(s) for s in sources]
         if visibility is not None:
             payload["visibility"] = visibility
+        if ttl is not None:
+            payload["ttl"] = ttl
         return await self._request_json(
             "PUT", f"/api/v1/hives/{hive_id}/knowledge/{entry_id}", json=payload,
         )

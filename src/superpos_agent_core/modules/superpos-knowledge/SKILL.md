@@ -102,8 +102,85 @@ superpos-knowledge decisions
 ### `superpos-knowledge create` / `update` (recording knowledge)
 
 When you discover a **lasting, non-obvious** fact during a task, record it
-so future agents inherit it instead of rediscovering it.  This is the
-inline counterpart to the background `knowledge_fillin` pass.
+so future agents inherit it instead of rediscovering it.
+
+There are two shapes.  Prefer the **typed wiki** shape — it's the current
+model.  The legacy key/value shape still works but is **deprecated** (it
+prints a deprecation notice) and will be removed.
+
+#### Typed wiki pages (preferred)
+
+A typed page has a **type**, a stable **slug**, a Markdown **body**, and
+optional **frontmatter** (a JSON object, validated server-side per type).
+
+```bash
+# create a topic page from a Markdown file
+superpos-knowledge create \
+  --type topic \
+  --slug proposal-knowledge-wiki \
+  --body-file ./proposal.md \
+  --summary "A3 knowledge-wiki redesign: typed pages + sources." \
+  --tags proposal,architecture \
+  --frontmatter '{"status": "accepted"}'
+
+# create an entity page (entity REQUIRES frontmatter.kind)
+superpos-knowledge create \
+  --type entity --slug entity:redis-cluster-prod \
+  --body "# Redis prod cluster" \
+  --frontmatter '{"kind": "service"}'
+
+# update by id (PUT is id-only)
+superpos-knowledge update --id 01HXYZ... --summary "refreshed" --body-file ./new.md
+
+# update by slug (resolved to an id via the typed list endpoint;
+# --type is required so the lookup knows which list to scan.
+# Best-effort: only the newest 100 entries of the type are scanned
+# (server cap, no pagination) — for older entries use --id.)
+superpos-knowledge update --type topic --slug proposal-knowledge-wiki \
+  --frontmatter '{"status": "superseded"}'
+```
+
+**Types** (exactly these six): `entity`, `topic`, `trend`, `source_page`,
+`log`, `procedure`.
+
+**Gotcha:** `--type entity` **requires** `frontmatter.kind` — the CLI
+fails fast if it's missing, and the server returns 422 on the
+`frontmatter` field otherwise.  Other types accept empty frontmatter.
+
+Typed flags (create & update):
+- `--type` — one of the six types above (required with `--slug` on create)
+- `--slug` — stable slug, regex `^[A-Za-z0-9:_\-.]+$`
+- `--body` — Markdown body, OR `--body-file <path>` to read it from a file
+  (the two are mutually exclusive)
+- `--frontmatter '<json>'` — frontmatter as a JSON object (clear error on
+  invalid JSON)
+- `--summary` — top-level one-line summary (max 500 chars; not folded into
+  frontmatter)
+- `--title`, `--tags a,b,c`, `--visibility public|private`, `--ttl <ISO8601>`
+  - `--ttl` is an optional expiry; it works on typed create/update (sent as a
+    top-level field), not just the legacy shape.
+  - On **update**, `--visibility` cannot be the only field — the server
+    rejects a visibility-only typed update, so it must accompany at least one
+    content field (`--body`/`--body-file`/`--frontmatter`/`--title`/
+    `--summary`/`--tags`). On create, visibility-with-content is fine.
+- create-only: `--scope` (defaults to `SUPERPOS_KNOWLEDGE_FILLIN_SCOPE`
+  env or `hive`; org scope needs `knowledge.write_organization`; scope is
+  immutable after create)
+
+**Update is id-only.**  `--id` updates directly (exact, unbounded).
+`--slug` is resolved to an id first by listing pages of `--type` and
+matching the slug, so `--type` is required with `--slug`; a slug that
+matches 0 or >1 pages errors rather than guessing.  `scope` cannot be
+changed on update.
+
+**Caveat — slug resolution is bounded.**  The typed list endpoint returns
+only the newest 100 entries of the type (server cap, no pagination, no
+exact-slug route), so `update --type X --slug Y` only resolves slugs among
+those 100. An entry older than the newest 100 of its type can't be reached
+by slug — the CLI says so explicitly and tells you to use `update --id
+<id>` instead, which is exact and unbounded.
+
+#### Legacy key/value (deprecated)
 
 ```bash
 superpos-knowledge create \
@@ -118,16 +195,15 @@ How to apply: when adding new claim/expire paths, respect MAX_TASK_CLAIMS rather
 superpos-knowledge update 01HXYZ... --content "Rule: …  Why: …  How to apply: …"
 ```
 
-Flags (create & update):
+Legacy flags:
 - `--content` (required on create) — the body.  **Use the shape below.**
-- `--title`, `--summary` — headline + one-line gist shown in search results
-- `--tags a,b,c`, `--confidence high|medium|low`
+- `--title`, `--summary`, `--tags a,b,c`, `--confidence high|medium|low`
 - `--visibility public|private`, `--ttl <ISO8601>`
 - `--value '<json>'` — raw escape hatch; structured flags override its fields
+- create: `--key` (required, stable); update: positional `entry_id`
 
-Create also takes `--key` (required, stable) and `--scope` (defaults to
-`SUPERPOS_KNOWLEDGE_FILLIN_SCOPE` env or `hive`; org scope needs the
-`knowledge.write_organization` permission). Scope is immutable after create.
+You **cannot mix** typed and legacy flags in one call — the CLI rejects
+that up front, mirroring the server's dual-shape XOR.
 
 **KEEP** — worth recording: non-obvious invariants, design rationale with
 rejected alternatives, pitfalls with root cause, cross-file mental models.
@@ -146,62 +222,6 @@ How to apply: <when and where future work should invoke this>
 
 Before creating, **search first** — if a near-duplicate exists, `update`
 it (or link a `supersedes` relation) rather than writing a fresh entry.
-
-### Typed pages (TASK-297)
-
-The legacy `--key`+`--content` shape is for inline `Rule / Why / How` knowledge.
-For typed pages — proposals, topics, source pages, log entries, procedures,
-entity records, trends — use the `--type`+`--slug`+`--body` shape.  The two
-shapes are mutually exclusive on create.
-
-```bash
-# Inline a small typed topic
-superpos-knowledge create \
-  --type topic --slug proposal-knowledge-wiki \
-  --title "Knowledge Wiki Redesign" \
-  --summary "Karpathy-style typed pages with wikilinks." \
-  --body "# Knowledge Wiki Redesign
-
-A typed-page model for the Superpos knowledge store.
-" \
-  --frontmatter '{"summary": "Karpathy-style typed pages with wikilinks.", "related_topic_slugs": ["proposal-registry"]}' \
-  --tags proposal,track:knowledge-wiki,architecture
-
-# Or read the body from a file
-superpos-knowledge create \
-  --type topic --slug proposal-registry \
-  --body-file docs/proposals/registry.md \
-  --title "Registry: Subagents, Skills, Modules" \
-  --tags proposal,track:registry,architecture
-
-# Partial typed update — only the body changes
-superpos-knowledge update 01HXYZ... --body-file docs/proposals/registry.md
-
-# Update only the title and tags
-superpos-knowledge update 01HXYZ... --title "New title" --tags proposal,architecture
-```
-
-Flags (typed shape, create & update):
-- `--type` — one of `entity`, `topic`, `trend`, `source_page`, `log`, `procedure`
-- `--slug` — stable slug (required on create; immutable on update)
-- `--body` / `--body-file <path>` — markdown body (one of the two required on typed create)
-- `--frontmatter` — JSON object string (e.g. `'{"summary": "..."}'`)
-- `--source-ids` — comma-separated source ULIDs / agent IDs (curator audit trail;
-  server enforces proposal §6.8 ACL, so only pass entries the writing agent
-  already has read access to).  Not auto-stamped from `SUPERPOS_AGENT_ID` —
-  opt in explicitly.
-
-Legacy flags (`--key`, `--content`, `--value`, `--confidence`) remain supported
-on the same subcommand — pass `--key` (and NOT `--type`) for the legacy shape.
-
-**Update routing.** On `update`, the shape is inferred from the flags you pass:
-the legacy-only flags (`--content`, `--value`, `--confidence`) pin the legacy
-`value` path; any other knowledge field — including the shared
-`--title`/`--summary`/`--tags` as well as `--body`/`--frontmatter`/`--source-ids`
-— routes to the typed page path.  So `update <id> --title ... --tags ...` updates
-a typed page's metadata, while `update <id> --content ...` does a legacy
-read-modify-write.  `--type` and `--slug` are immutable on update and always
-rejected (exit 2) — re-typing or re-slugging is a migration, not an edit.
 
 ## Tips
 

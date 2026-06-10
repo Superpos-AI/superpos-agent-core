@@ -109,6 +109,58 @@ async def test_create_page_inline_sources_ingest_and_attach():
     assert "tags" not in sent
 
 
+async def test_create_page_sends_summary_top_level():
+    handler, captured = _capturing(_envelope({"id": "kxe_s"}))
+    client = _make_client(handler)
+
+    await client.create_page(
+        type="topic",
+        slug="topic:x",
+        body="b",
+        summary="one-liner",
+    )
+
+    sent = json.loads(captured[0].content)
+    assert sent["summary"] == "one-liner"
+    # summary is a top-level field, never folded into frontmatter
+    assert "frontmatter" not in sent
+
+
+async def test_create_page_omits_summary_when_none():
+    handler, captured = _capturing(_envelope({"id": "kxe_s2"}))
+    client = _make_client(handler)
+
+    await client.create_page(type="topic", slug="topic:x", body="b")
+
+    assert "summary" not in json.loads(captured[0].content)
+
+
+async def test_create_page_sends_ttl_top_level():
+    handler, captured = _capturing(_envelope({"id": "kxe_t"}))
+    client = _make_client(handler)
+
+    await client.create_page(
+        type="topic",
+        slug="topic:x",
+        body="b",
+        ttl="2026-06-11T00:00:00Z",
+    )
+
+    sent = json.loads(captured[0].content)
+    assert sent["ttl"] == "2026-06-11T00:00:00Z"
+    # ttl is a top-level field, never folded into frontmatter
+    assert "frontmatter" not in sent
+
+
+async def test_create_page_omits_ttl_when_none():
+    handler, captured = _capturing(_envelope({"id": "kxe_t2"}))
+    client = _make_client(handler)
+
+    await client.create_page(type="topic", slug="topic:x", body="b")
+
+    assert "ttl" not in json.loads(captured[0].content)
+
+
 # ── update_page ───────────────────────────────────────────────────────
 
 
@@ -126,6 +178,16 @@ async def test_update_page_puts_only_provided_fields():
     assert result == {"id": "kxe_1", "version": 4}
 
 
+async def test_update_page_sends_summary_top_level():
+    handler, captured = _capturing(_envelope({"id": "kxe_1"}))
+    client = _make_client(handler)
+
+    await client.update_page("kxe_1", summary="new summary")
+
+    sent = json.loads(captured[0].content)
+    assert sent == {"summary": "new summary"}
+
+
 async def test_update_page_body_and_frontmatter():
     handler, captured = _capturing(_envelope({"id": "kxe_1"}))
     client = _make_client(handler)
@@ -134,6 +196,25 @@ async def test_update_page_body_and_frontmatter():
 
     sent = json.loads(captured[0].content)
     assert sent == {"body": "new body", "frontmatter": {"status": "ok"}}
+
+
+async def test_update_page_sends_ttl_top_level():
+    handler, captured = _capturing(_envelope({"id": "kxe_1"}))
+    client = _make_client(handler)
+
+    await client.update_page("kxe_1", ttl="2026-06-11T00:00:00Z")
+
+    sent = json.loads(captured[0].content)
+    assert sent == {"ttl": "2026-06-11T00:00:00Z"}
+
+
+async def test_update_page_omits_ttl_when_none():
+    handler, captured = _capturing(_envelope({"id": "kxe_1"}))
+    client = _make_client(handler)
+
+    await client.update_page("kxe_1", title="New Title")
+
+    assert "ttl" not in json.loads(captured[0].content)
 
 
 # ── get_backlinks ─────────────────────────────────────────────────────
