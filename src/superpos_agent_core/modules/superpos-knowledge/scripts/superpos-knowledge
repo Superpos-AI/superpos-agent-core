@@ -469,7 +469,12 @@ async def _run(args: argparse.Namespace) -> int:
             _print(await client.get_knowledge(args.entry_id))
 
         elif args.cmd == "get-by-slug":
-            _print(await client.get_knowledge_by_slug(args.slug))
+            try:
+                out = await client.get_knowledge_by_slug(args.slug)
+            except ValueError as e:
+                print(f"Error: {e}", file=sys.stderr)
+                return 2
+            _print(out)
 
         elif args.cmd == "list":
             _print(await client.list_knowledge(

@@ -1329,6 +1329,26 @@ async def test_get_by_slug_routes_to_get_knowledge_by_slug(monkeypatch):
     mock.assert_awaited_once_with("proposal-x")
 
 
+@pytest.mark.asyncio
+async def test_get_by_slug_missing_slug_errors_to_stderr_exit_2(monkeypatch, capsys):
+    """When the search hop finds no candidate, get_knowledge_by_slug raises
+    ValueError; the CLI must catch it, print `Error: ...` to stderr, and
+    return 2 instead of letting the traceback escape."""
+    mod = _load_script()
+    _env_for_run(monkeypatch)
+    mock = AsyncMock(side_effect=ValueError("no knowledge entry found for slug 'missing'"))
+    mock_close = AsyncMock()
+    with patch.object(mod.SuperposClient, "get_knowledge_by_slug", mock), \
+         patch.object(mod.SuperposClient, "close", mock_close):
+        args = mod._build_parser().parse_args(["get-by-slug", "missing"])
+        args.sort = None
+        rc = await mod._run(args)
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "Error: no knowledge entry found for slug 'missing'" in err
+    mock.assert_awaited_once_with("missing")
+
+
 def test_parser_get_by_slug_requires_slug_arg():
     """`get-by-slug` without a positional slug must exit 2."""
     mod = _load_script()
