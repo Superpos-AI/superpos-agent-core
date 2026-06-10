@@ -297,18 +297,27 @@ async def _run(args: argparse.Namespace) -> int:
                 )
             )
             type_or_slug_set = args.type is not None or args.slug is not None
+            # --visibility/--ttl are metadata fields the typed PUT supports
+            # natively. When supplied without any legacy-only flag, a
+            # metadata-only update must route to the typed path so it issues a
+            # single typed PUT instead of a legacy get_knowledge()+
+            # update_knowledge() read-modify-write. If a legacy-only flag is
+            # also present the legacy path still carries visibility/ttl as before.
+            meta_flags_set = args.visibility is not None or args.ttl is not None
             use_typed_path = type_or_slug_set or (
-                typed_shape_flags_set and not legacy_only_flags_set
+                (typed_shape_flags_set or meta_flags_set) and not legacy_only_flags_set
             )
             if use_typed_path:
                 kwargs = _build_typed_update_kwargs(args)
                 # Drop None entries so partial updates send only what's set
                 kwargs = {k: v for k, v in kwargs.items() if v is not None}
-                if not kwargs:
+                # visibility/ttl are valid typed updates on their own, so a
+                # metadata-only update counts as non-empty.
+                if not kwargs and not meta_flags_set:
                     print(
                         "Error: typed update requires at least one of "
                         "--body/--body-file, --title, --summary, --tags, "
-                        "--frontmatter, --source-ids.",
+                        "--frontmatter, --source-ids, --visibility, --ttl.",
                         file=sys.stderr,
                     )
                     return 2
