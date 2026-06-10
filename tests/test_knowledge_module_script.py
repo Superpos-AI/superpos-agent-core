@@ -570,6 +570,126 @@ async def test_typed_update_by_id_routes_to_update_page(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_typed_update_positional_entry_id_routes_to_update_page(monkeypatch):
+    """``update <entry_id> --body ...`` (POSITIONAL id, no --id) must route to
+    the typed update path and call update_page with that id — exit 0, no error.
+
+    Backwards-compat regression: before --id existed, the positional entry_id
+    was the only way to point a typed update at a page; introducing --id must
+    not break the positional spelling.
+    """
+    mod = _load_script()
+    _set_env(monkeypatch)
+    mock_update = AsyncMock(return_value={"id": "01ABC", "version": 2})
+    mock_list = AsyncMock()
+    with patch.object(mod.KnowledgeClient, "update_page", mock_update), \
+         patch.object(mod.KnowledgeClient, "list_by_type", mock_list), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        args = mod._build_parser().parse_args([
+            "update", "01ABC", "--body", "new body",
+        ])
+        args.sort = None
+        rc = await mod._run(args)
+
+    assert rc == 0
+    mock_list.assert_not_called()  # positional id given → no slug resolution
+    assert mock_update.call_args.args[0] == "01ABC"
+    assert mock_update.call_args.kwargs["body"] == "new body"
+
+
+@pytest.mark.asyncio
+async def test_typed_update_positional_entry_id_with_slug_rejected(monkeypatch):
+    """A positional entry_id and --type/--slug both identify the page; giving
+    both is ambiguous and must fail fast before any API call (mirrors the
+    --id selector guard)."""
+    mod = _load_script()
+    _set_env(monkeypatch)
+    mock_update = AsyncMock()
+    mock_list = AsyncMock()
+    with patch.object(mod.KnowledgeClient, "update_page", mock_update), \
+         patch.object(mod.KnowledgeClient, "list_by_type", mock_list), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        args = mod._build_parser().parse_args([
+            "update", "01ABC", "--type", "topic", "--slug", "topic:x",
+            "--body", "new body",
+        ])
+        args.sort = None
+        with pytest.raises(SystemExit) as exc:
+            await mod._run(args)
+
+    assert exc.value.code == 2
+    mock_update.assert_not_called()
+    mock_list.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_typed_update_positional_entry_id_and_id_mismatch_rejected(monkeypatch):
+    """The positional entry_id is an alias for --id; if both are given but
+    differ, refuse rather than silently picking one."""
+    mod = _load_script()
+    _set_env(monkeypatch)
+    mock_update = AsyncMock()
+    with patch.object(mod.KnowledgeClient, "update_page", mock_update), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        args = mod._build_parser().parse_args([
+            "update", "01ABC", "--id", "kxe_other", "--body", "new body",
+        ])
+        args.sort = None
+        with pytest.raises(SystemExit) as exc:
+            await mod._run(args)
+
+    assert exc.value.code == 2
+    mock_update.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_positional_entry_id_with_legacy_flags_routes_legacy(monkeypatch):
+    """A positional entry_id with ONLY legacy flags (e.g. --content) is a
+    plain legacy key/value update and must route to update_knowledge, never
+    update_page."""
+    mod = _load_script()
+    _set_env(monkeypatch)
+    mock_get = AsyncMock(return_value={"id": "01ABC", "value": {}})
+    mock_update_k = AsyncMock(return_value={"id": "01ABC", "value": {}})
+    mock_update_page = AsyncMock()
+    with patch.object(mod.SuperposClient, "get_knowledge", mock_get), \
+         patch.object(mod.SuperposClient, "update_knowledge", mock_update_k), \
+         patch.object(mod.KnowledgeClient, "update_page", mock_update_page), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        args = mod._build_parser().parse_args([
+            "update", "01ABC", "--content", "Rule: new content",
+        ])
+        args.sort = None
+        rc = await mod._run(args)
+
+    assert rc == 0
+    mock_update_k.assert_called_once()
+    mock_update_page.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_positional_entry_id_mixing_typed_and_legacy_rejected(monkeypatch):
+    """``update <id> --body ... --content ...`` mixes typed and legacy shapes;
+    the XOR guard must reject it before any API call (the positional id rides
+    along with whichever shape, but the shapes themselves can't be mixed)."""
+    mod = _load_script()
+    _set_env(monkeypatch)
+    mock_update_page = AsyncMock()
+    mock_update_k = AsyncMock()
+    with patch.object(mod.KnowledgeClient, "update_page", mock_update_page), \
+         patch.object(mod.SuperposClient, "update_knowledge", mock_update_k), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        args = mod._build_parser().parse_args([
+            "update", "01ABC", "--body", "b", "--content", "Rule: c",
+        ])
+        args.sort = None
+        with pytest.raises(SystemExit):
+            await mod._run(args)
+    mock_update_page.assert_not_called()
+    mock_update_k.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_typed_update_forwards_ttl_with_content(monkeypatch):
     """``--ttl`` is forwarded when it accompanies a real content field.
 

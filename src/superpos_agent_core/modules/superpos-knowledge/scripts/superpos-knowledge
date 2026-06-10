@@ -313,16 +313,37 @@ async def _run_typed_create(kclient: KnowledgeClient, args: argparse.Namespace) 
 async def _run_typed_update(kclient: KnowledgeClient, args: argparse.Namespace) -> None:
     """Update a typed wiki page via KnowledgeClient.update_page.
 
-    Accepts ``--id`` (direct) or ``--slug`` (resolved to an id first, since
-    PUT is id-only).
+    Accepts a positional ``entry_id`` or ``--id`` (both direct, interchangeable
+    aliases — the positional form is the backwards-compatible spelling that
+    worked before ``--id`` existed), or ``--slug`` (resolved to an id first,
+    since PUT is id-only).
     """
-    if args.id:
-        entry_id = args.id
+    # The positional ``entry_id`` is an alias for ``--id``: both identify the
+    # page directly. They must agree if both are given, and neither can be
+    # combined with ``--slug`` (two different ways to point at the same page).
+    direct_id = args.id or args.entry_id
+    if args.id and args.entry_id and args.id != args.entry_id:
+        print(
+            "Error: positional entry_id and --id both given but differ; "
+            "pass only one.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if direct_id and args.slug:
+        print(
+            "Error: pass either an entry id (positional or --id) or "
+            "--type/--slug to identify the page, not both.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if direct_id:
+        entry_id = direct_id
     elif args.slug:
         entry_id = await _resolve_slug_to_id(kclient, type_=args.type, slug=args.slug)
     else:
         print(
-            "Error: typed update needs --id or --slug to identify the page.",
+            "Error: typed update needs an entry id (positional or --id) or "
+            "--slug to identify the page.",
             file=sys.stderr,
         )
         sys.exit(2)
@@ -642,14 +663,17 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_update.add_argument(
         "entry_id", nargs="?",
-        help="[legacy] Knowledge entry ULID to update. Use --id for a "
-             "typed update, or --type+--slug to resolve by slug.",
+        help="Knowledge entry ULID to update. On a typed update (e.g. with "
+             "--body) it identifies the page, exactly like --id; on a legacy "
+             "key/value update it is the entry to modify. Alternatively use "
+             "--type+--slug to resolve a typed page by slug.",
     )
     p_update.add_argument(
         "--id", dest="id",
-        help="Typed page entry id to update directly (PUT is id-only). "
-             "Exact and unbounded — unlike --type+--slug, which resolves "
-             "only over the newest 100 entries of the type.",
+        help="Typed page entry id to update directly (PUT is id-only); a "
+             "named alias for the positional entry_id. Exact and unbounded — "
+             "unlike --type+--slug, which resolves only over the newest 100 "
+             "entries of the type.",
     )
     p_update.add_argument(
         "--scope",
