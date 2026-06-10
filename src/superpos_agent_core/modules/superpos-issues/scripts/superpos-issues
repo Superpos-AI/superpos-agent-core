@@ -3,7 +3,7 @@
 
 Subcommands mirror the client API:
   list, show, create, update, transition, close,
-  link-task, link-channel, request-approval,
+  link-task, link-channel, link-track, request-approval,
   add-dependency, remove-dependency,
   types,
   attach, attachments, detach,
@@ -165,7 +165,7 @@ async def _run(args: argparse.Namespace) -> int:
             _print(await client.get_issue(args.issue_id))
 
         elif args.cmd == "create":
-            _print(await client.create_issue(
+            issue = await client.create_issue(
                 title=args.title,
                 issue_type_id=args.issue_type_id,
                 description=args.description,
@@ -174,7 +174,37 @@ async def _run(args: argparse.Namespace) -> int:
                 metadata=_parse_json_arg("metadata", args.metadata),
                 channel_id=args.channel_id,
                 thread_id=args.thread_id,
-            ))
+            )
+            # ``--track-slug`` is a CLI convenience, NOT an atomic backend
+            # operation: the issue-create endpoint (CreateIssueRequest) has no
+            # track field today, so we create first, then link via
+            # POST /tracks/{slug}/issues. If the create succeeds but the link
+            # fails we surface the created issue id so the caller knows the
+            # issue exists and only the link needs retrying (no rollback).
+            if args.track_slug:
+                issue_id = issue.get("id") if isinstance(issue, dict) else None
+                if not issue_id:
+                    print(
+                        "Error: issue created but its id was missing from the "
+                        "response, so it could not be linked to track "
+                        f"'{args.track_slug}'. Created issue: "
+                        f"{json.dumps(issue, default=str)}",
+                        file=sys.stderr,
+                    )
+                    return 1
+                try:
+                    await client.link_issue_to_track(args.track_slug, issue_id)
+                except Exception as e:  # noqa: BLE001 — surface, don't roll back
+                    print(
+                        f"Error: issue {issue_id} was created but linking it to "
+                        f"track '{args.track_slug}' failed: {e}. The issue "
+                        "exists; re-run `link-track` to retry the link.",
+                        file=sys.stderr,
+                    )
+                    return 1
+                # Re-fetch so the printed issue reflects the new track link.
+                issue = await client.get_issue(issue_id)
+            _print(issue)
 
         elif args.cmd == "update":
             try:
@@ -209,6 +239,11 @@ async def _run(args: argparse.Namespace) -> int:
         elif args.cmd == "link-channel":
             _print(await client.link_channel_to_issue(
                 args.issue_id, channel_id=args.channel_id,
+            ))
+
+        elif args.cmd == "link-track":
+            _print(await client.link_issue_to_track(
+                args.track_slug, args.issue_id,
             ))
 
         elif args.cmd == "request-approval":
@@ -305,6 +340,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p_create.add_argument("--metadata", help="JSON object")
     p_create.add_argument("--channel-id")
     p_create.add_argument("--thread-id")
+    p_create.add_argument(
+        "--track-slug",
+        help=(
+            "Link the new issue to this track after creating it. Convenience "
+            "two-call flow (create, then POST /tracks/{slug}/issues) — the "
+            "backend issue-create endpoint has no track field yet."
+        ),
+    )
 
     # update
     p_update = sub.add_parser("update", help="Partial update of an existing issue")
@@ -338,6 +381,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p_lc = sub.add_parser("link-channel", help="Bind a channel to this issue")
     p_lc.add_argument("issue_id")
     p_lc.add_argument("--channel-id", required=True)
+
+    # link-track
+    p_ltr = sub.add_parser(
+        "link-track",
+        help="Link an existing issue to a track (by track slug)",
+    )
+    p_ltr.add_argument("issue_id")
+    p_ltr.add_argument(
+        "--track-slug", required=True, help="Slug of the track to link to",
+    )
 
     # request-approval
     p_ra = sub.add_parser("request-approval", help="Escalate for human approval")

@@ -817,6 +817,23 @@ class SuperposClient:
         data = resp.json()
         return data.get("data", data) if isinstance(data, dict) else data
 
+    async def link_issue_to_track(
+        self, track_slug: str, issue_id: str,
+    ) -> dict[str, Any]:
+        """``POST /tracks/{slug}/issues`` — link an existing issue to a track.
+
+        The track is addressed by ``slug`` in the URL path; the body carries
+        the issue id, mirroring the platform's ``TrackController::linkIssue``
+        (returns ``{"track_id", "issue_id"}``). Requires ``issues.manage``.
+        """
+        hive = self._config.superpos_hive_id
+        resp = await self._request(
+            "POST", f"/api/v1/hives/{hive}/tracks/{track_slug}/issues",
+            json={"issue_id": issue_id},
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
     async def request_issue_approval(
         self,
         issue_id: str,
