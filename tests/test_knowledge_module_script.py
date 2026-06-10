@@ -962,6 +962,53 @@ async def test_typed_update_ttl_and_visibility_only_rejected(monkeypatch):
     mock_update.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_typed_update_id_only_no_content_rejected(monkeypatch):
+    """``update --id X`` with NO content and NO cross-cutting field must fail
+    fast and never call update_page: --id alone routes to the typed path, and a
+    content-less typed update would otherwise PUT an empty {} body — surfacing a
+    server validation error / no-op as a successful (exit 0) command. The PR
+    contract is that content-less typed updates are rejected client-side."""
+    mod = _load_script()
+    _set_env(monkeypatch)
+    mock_update = AsyncMock()
+    mock_list = AsyncMock()
+    with patch.object(mod.KnowledgeClient, "update_page", mock_update), \
+         patch.object(mod.KnowledgeClient, "list_by_type", mock_list), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        args = mod._build_parser().parse_args(["update", "--id", "kxe_1"])
+        args.sort = None
+        with pytest.raises(SystemExit) as exc:
+            await mod._run(args)
+
+    assert exc.value.code == 2
+    mock_update.assert_not_called()
+    mock_list.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_typed_update_slug_only_no_content_rejected(monkeypatch):
+    """``update --type topic --slug s`` with no content field must also be
+    rejected before any API call (and before resolving the slug to an id) —
+    same empty-{}-payload bug via the slug selector instead of --id."""
+    mod = _load_script()
+    _set_env(monkeypatch)
+    mock_update = AsyncMock()
+    mock_list = AsyncMock()
+    with patch.object(mod.KnowledgeClient, "update_page", mock_update), \
+         patch.object(mod.KnowledgeClient, "list_by_type", mock_list), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        args = mod._build_parser().parse_args([
+            "update", "--type", "topic", "--slug", "s",
+        ])
+        args.sort = None
+        with pytest.raises(SystemExit) as exc:
+            await mod._run(args)
+
+    assert exc.value.code == 2
+    mock_update.assert_not_called()
+
+
 def test_guard_shape_xor_treats_id_as_typed_selector(capsys):
     """``--id`` selects the typed path, so it must not be mixed with legacy
     flags (regression: ``--id`` was previously not seen by the guard, letting

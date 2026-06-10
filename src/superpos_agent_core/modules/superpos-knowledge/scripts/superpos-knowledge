@@ -368,6 +368,43 @@ async def _run_typed_update(kclient: KnowledgeClient, args: argparse.Namespace) 
             file=sys.stderr,
         )
         sys.exit(2)
+    body = _resolve_body(args)
+    frontmatter = _parse_json_arg("frontmatter", args.frontmatter)
+    tags = _split_tags(args.tags)
+    source_ids = _split_tags(args.source_ids)
+    # A typed update must carry at least one content field. --id/--slug/--type
+    # are selectors/routing, not content, and the server's UpdateKnowledgeRequest
+    # treats `visibility` and `ttl` as cross-cutting fields its writable-shape
+    # guard EXCLUDES — so a payload carrying only selectors and/or cross-cutting
+    # fields (or nothing at all, e.g. `update --id X`) reduces to an empty/
+    # content-less body that fails server-side validation ("value required") or
+    # no-ops. Reject before any API call (including the slug→id resolution): a
+    # content field (body/frontmatter/title/summary/tags/source_ids) is required.
+    has_content = any(
+        v is not None for v in (
+            body, frontmatter, args.title, args.summary, tags, source_ids,
+        )
+    )
+    if not has_content:
+        if args.visibility is not None or args.ttl is not None:
+            # Cross-cutting flag(s) present but no content to hang them on.
+            print(
+                "Error: --visibility/--ttl cannot be the only updated field(s) "
+                "on a typed update; they must accompany at least one content "
+                "field (--body/--body-file/--frontmatter/--title/--summary/"
+                "--tags/--source-ids).",
+                file=sys.stderr,
+            )
+        else:
+            # Nothing to update at all — a bare selector (e.g. `update --id X`)
+            # would otherwise send an empty {} body and report success.
+            print(
+                "Error: a typed update needs at least one content field to "
+                "change (--body/--body-file/--frontmatter/--title/--summary/"
+                "--tags/--source-ids).",
+                file=sys.stderr,
+            )
+        sys.exit(2)
     if direct_id:
         entry_id = direct_id
     elif args.slug:
@@ -376,34 +413,6 @@ async def _run_typed_update(kclient: KnowledgeClient, args: argparse.Namespace) 
         print(
             "Error: typed update needs an entry id (positional or --id) or "
             "--slug to identify the page.",
-            file=sys.stderr,
-        )
-        sys.exit(2)
-    body = _resolve_body(args)
-    frontmatter = _parse_json_arg("frontmatter", args.frontmatter)
-    tags = _split_tags(args.tags)
-    source_ids = _split_tags(args.source_ids)
-    # The server's UpdateKnowledgeRequest treats `visibility` and `ttl` as
-    # cross-cutting fields: its writable-shape guard EXCLUDES them, so a payload
-    # carrying only cross-cutting fields (e.g. {"visibility": …} or {"ttl": …})
-    # fails server-side validation ("value required"). --id/--slug/--type are
-    # selectors/routing, not content, so reject the cross-cutting-only case
-    # before any API call: --visibility/--ttl must accompany a real content
-    # field (a body/frontmatter/title/summary/tags/source_ids change).
-    has_content = any(
-        v is not None for v in (
-            body, frontmatter, args.title, args.summary, tags, source_ids,
-        )
-    )
-    is_cross_cutting_only = (
-        args.visibility is not None or args.ttl is not None
-    ) and not has_content
-    if is_cross_cutting_only:
-        print(
-            "Error: --visibility/--ttl cannot be the only updated field(s) on a "
-            "typed update; they must accompany at least one content field "
-            "(--body/--body-file/--frontmatter/--title/--summary/--tags/"
-            "--source-ids).",
             file=sys.stderr,
         )
         sys.exit(2)
