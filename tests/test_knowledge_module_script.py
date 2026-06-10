@@ -346,6 +346,24 @@ async def test_typed_create_routes_to_create_page(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_typed_create_forwards_ttl(monkeypatch):
+    mod = _load_script()
+    _set_env(monkeypatch)
+    mock_create = AsyncMock(return_value={"id": "kxe_1", "type": "topic"})
+    with patch.object(mod.KnowledgeClient, "create_page", mock_create), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        args = mod._build_parser().parse_args([
+            "create", "--type", "topic", "--slug", "topic:x",
+            "--body", "# body", "--ttl", "2026-06-11T00:00:00Z",
+        ])
+        args.sort = None
+        rc = await mod._run(args)
+
+    assert rc == 0
+    assert mock_create.call_args.kwargs["ttl"] == "2026-06-11T00:00:00Z"
+
+
+@pytest.mark.asyncio
 async def test_typed_create_body_file(monkeypatch, tmp_path):
     mod = _load_script()
     _set_env(monkeypatch)
@@ -460,6 +478,27 @@ async def test_typed_update_by_id_routes_to_update_page(monkeypatch):
     kw = mock_update.call_args.kwargs
     assert kw["body"] == "new"
     assert kw["summary"] == "s"
+
+
+@pytest.mark.asyncio
+async def test_typed_update_forwards_ttl(monkeypatch):
+    mod = _load_script()
+    _set_env(monkeypatch)
+    mock_update = AsyncMock(return_value={"id": "kxe_1", "version": 2})
+    mock_list = AsyncMock()
+    with patch.object(mod.KnowledgeClient, "update_page", mock_update), \
+         patch.object(mod.KnowledgeClient, "list_by_type", mock_list), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        args = mod._build_parser().parse_args([
+            "update", "--id", "kxe_1", "--ttl", "2026-06-11T00:00:00Z",
+        ])
+        args.sort = None
+        rc = await mod._run(args)
+
+    assert rc == 0
+    mock_list.assert_not_called()
+    assert mock_update.call_args.args[0] == "kxe_1"
+    assert mock_update.call_args.kwargs["ttl"] == "2026-06-11T00:00:00Z"
 
 
 def test_guard_shape_xor_treats_id_as_typed_selector(capsys):

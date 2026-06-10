@@ -281,6 +281,7 @@ async def _run_typed_create(kclient: KnowledgeClient, args: argparse.Namespace) 
         tags=_split_tags(args.tags),
         scope=_default_scope(args.scope),
         visibility=args.visibility or "public",
+        ttl=args.ttl,
     ))
 
 
@@ -329,6 +330,7 @@ async def _run_typed_update(kclient: KnowledgeClient, args: argparse.Namespace) 
         summary=args.summary,
         tags=tags,
         visibility=args.visibility,
+        ttl=args.ttl,
     ))
 
 
@@ -460,7 +462,7 @@ def _add_value_flags(p: argparse.ArgumentParser) -> None:
     - Legacy shape (deprecated): ``--key`` (create only), ``--content``,
       ``--value``, ``--confidence``.
     - Shared: ``--title``, ``--summary``, ``--tags``, ``--visibility``,
-      ``--ttl`` (legacy only), ``--scope``.
+      ``--ttl`` (applies to both typed and legacy shapes), ``--scope``.
     """
     # ── typed shape ──
     p.add_argument(
@@ -509,7 +511,8 @@ def _add_value_flags(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument(
         "--ttl",
-        help="[legacy] ISO8601 expiry timestamp (entry auto-expires after)",
+        help="ISO8601 expiry timestamp (entry auto-expires after); applies "
+             "to both typed and legacy shapes",
     )
 
 

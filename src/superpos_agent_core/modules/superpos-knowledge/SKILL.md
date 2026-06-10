@@ -154,7 +154,9 @@ Typed flags (create & update):
   invalid JSON)
 - `--summary` — top-level one-line summary (max 500 chars; not folded into
   frontmatter)
-- `--title`, `--tags a,b,c`, `--visibility public|private`
+- `--title`, `--tags a,b,c`, `--visibility public|private`, `--ttl <ISO8601>`
+  - `--ttl` is an optional expiry; it works on typed create/update (sent as a
+    top-level field), not just the legacy shape.
   - On **update**, `--visibility` cannot be the only field — the server
     rejects a visibility-only typed update, so it must accompany at least one
     content field (`--body`/`--body-file`/`--frontmatter`/`--title`/
