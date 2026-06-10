@@ -1270,3 +1270,155 @@ def test_source_ids_help_does_not_claim_auto_stamp():
         checked.append(name)
 
     assert checked == ["create", "update"]
+
+
+# --- presence-vs-truthiness parsing for --tags / --source-ids -----------------
+# The backend distinguishes an *omitted* field from an explicit empty array:
+# `tags: []` clears tags and `source_ids: []` removes citations. The CLI must
+# therefore parse comma-list flags by PRESENCE, not truthiness — an explicit
+# `--tags ""` sends `[]`, while an absent flag omits the field entirely.
+
+
+def test_parse_csv_arg_distinguishes_absent_from_empty():
+    """_parse_csv_arg: None -> None (omit), '' -> [] (explicit clear)."""
+    mod = _load_script()
+    assert mod._parse_csv_arg(None) is None
+    assert mod._parse_csv_arg("") == []
+    assert mod._parse_csv_arg("   ") == []  # whitespace-only also clears
+    assert mod._parse_csv_arg("a, b ,c") == ["a", "b", "c"]
+    assert mod._parse_csv_arg(",, ,") == []  # all-empty parts stripped
+
+
+@pytest.mark.asyncio
+async def test_update_typed_empty_tags_clears_tags(monkeypatch):
+    """`update ID --tags ""` must send tags=[] (explicit clear) and exit 0,
+    not exit 2."""
+    mod = _load_script()
+
+    mock_update_page = AsyncMock(return_value={"id": "01ABC", "tags": []})
+    mock_update_legacy = AsyncMock()
+    mock_get = AsyncMock()
+    mock_close = AsyncMock()
+
+    monkeypatch.setenv("SUPERPOS_BASE_URL", "http://fake")
+    monkeypatch.setenv("SUPERPOS_HIVE_ID", "hive1")
+    monkeypatch.setenv("SUPERPOS_API_TOKEN", "tok")
+
+    with patch.object(mod.SuperposClient, "update_knowledge_page", mock_update_page), \
+         patch.object(mod.SuperposClient, "update_knowledge", mock_update_legacy), \
+         patch.object(mod.SuperposClient, "get_knowledge", mock_get), \
+         patch.object(mod.SuperposClient, "close", mock_close):
+        args = mod._build_parser().parse_args(["update", "01ABC", "--tags", ""])
+        args.sort = None
+        rc = await mod._run(args)
+
+    assert rc == 0
+    mock_update_page.assert_awaited_once()
+    assert mock_update_page.call_args.kwargs["tags"] == []
+    mock_update_legacy.assert_not_called()
+    mock_get.assert_not_called()  # typed path, no read-modify-write
+
+
+@pytest.mark.asyncio
+async def test_update_typed_body_plus_empty_source_ids_clears_citations(monkeypatch):
+    """`update ID --body new --source-ids ""` must send BOTH body AND
+    source_ids=[] (clearing citations), not drop source_ids."""
+    mod = _load_script()
+
+    mock_update_page = AsyncMock(return_value={"id": "01ABC"})
+    mock_close = AsyncMock()
+
+    monkeypatch.setenv("SUPERPOS_BASE_URL", "http://fake")
+    monkeypatch.setenv("SUPERPOS_HIVE_ID", "hive1")
+    monkeypatch.setenv("SUPERPOS_API_TOKEN", "tok")
+
+    with patch.object(mod.SuperposClient, "update_knowledge_page", mock_update_page), \
+         patch.object(mod.SuperposClient, "close", mock_close):
+        args = mod._build_parser().parse_args([
+            "update", "01ABC", "--body", "new", "--source-ids", "",
+        ])
+        args.sort = None
+        rc = await mod._run(args)
+
+    assert rc == 0
+    kwargs = mock_update_page.call_args.kwargs
+    assert kwargs["body"] == "new"
+    assert kwargs["source_ids"] == []
+
+
+@pytest.mark.asyncio
+async def test_update_typed_absent_tags_omits_field(monkeypatch):
+    """An absent --tags must omit tags entirely (no regression): the field is
+    dropped, not sent as []."""
+    mod = _load_script()
+
+    mock_update_page = AsyncMock(return_value={"id": "01ABC"})
+    mock_close = AsyncMock()
+
+    monkeypatch.setenv("SUPERPOS_BASE_URL", "http://fake")
+    monkeypatch.setenv("SUPERPOS_HIVE_ID", "hive1")
+    monkeypatch.setenv("SUPERPOS_API_TOKEN", "tok")
+
+    with patch.object(mod.SuperposClient, "update_knowledge_page", mock_update_page), \
+         patch.object(mod.SuperposClient, "close", mock_close):
+        args = mod._build_parser().parse_args(["update", "01ABC", "--body", "new"])
+        args.sort = None
+        await mod._run(args)
+
+    kwargs = mock_update_page.call_args.kwargs
+    # Absent flags are dropped before the client call.
+    assert "tags" not in kwargs
+    assert "source_ids" not in kwargs
+
+
+@pytest.mark.asyncio
+async def test_create_typed_empty_tags_and_source_ids_send_empty_lists(monkeypatch):
+    """create --type ... --tags "" --source-ids "" must forward tags=[] and
+    source_ids=[] (explicit empties), while absent flags would be None."""
+    mod = _load_script()
+
+    mock_create_page = AsyncMock(return_value={"id": "01NEW"})
+    mock_close = AsyncMock()
+
+    monkeypatch.setenv("SUPERPOS_BASE_URL", "http://fake")
+    monkeypatch.setenv("SUPERPOS_HIVE_ID", "hive1")
+    monkeypatch.setenv("SUPERPOS_API_TOKEN", "tok")
+
+    with patch.object(mod.SuperposClient, "create_knowledge_page", mock_create_page), \
+         patch.object(mod.SuperposClient, "close", mock_close):
+        args = mod._build_parser().parse_args([
+            "create", "--type", "topic", "--slug", "s", "--body", "b",
+            "--tags", "", "--source-ids", "",
+        ])
+        args.sort = None
+        await mod._run(args)
+
+    kwargs = mock_create_page.call_args.kwargs
+    assert kwargs["tags"] == []
+    assert kwargs["source_ids"] == []
+
+
+@pytest.mark.asyncio
+async def test_create_typed_absent_tags_and_source_ids_are_none(monkeypatch):
+    """create --type ... with no --tags/--source-ids must pass None for both so
+    the client omits them from the payload."""
+    mod = _load_script()
+
+    mock_create_page = AsyncMock(return_value={"id": "01NEW"})
+    mock_close = AsyncMock()
+
+    monkeypatch.setenv("SUPERPOS_BASE_URL", "http://fake")
+    monkeypatch.setenv("SUPERPOS_HIVE_ID", "hive1")
+    monkeypatch.setenv("SUPERPOS_API_TOKEN", "tok")
+
+    with patch.object(mod.SuperposClient, "create_knowledge_page", mock_create_page), \
+         patch.object(mod.SuperposClient, "close", mock_close):
+        args = mod._build_parser().parse_args([
+            "create", "--type", "topic", "--slug", "s", "--body", "b",
+        ])
+        args.sort = None
+        await mod._run(args)
+
+    kwargs = mock_create_page.call_args.kwargs
+    assert kwargs["tags"] is None
+    assert kwargs["source_ids"] is None

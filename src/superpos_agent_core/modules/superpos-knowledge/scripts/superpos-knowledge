@@ -72,6 +72,19 @@ def _parse_json_arg(label: str, raw: str | None) -> dict[str, Any] | None:
     return parsed
 
 
+def _parse_csv_arg(raw: str | None) -> list[str] | None:
+    """Parse a comma-separated flag value by *presence*, not truthiness.
+
+    An absent flag (``None``) returns ``None`` so the field is omitted from the
+    payload; an explicit empty string (``--tags ""``) returns ``[]`` so the
+    server clears the field (``tags: []`` drops tags, ``source_ids: []`` removes
+    citations). Whitespace-only entries are stripped out.
+    """
+    if raw is None:
+        return None
+    return [part.strip() for part in raw.split(",") if part.strip()]
+
+
 def _build_value(args: argparse.Namespace) -> dict[str, Any]:
     """Assemble the canonical knowledge ``value`` dict from CLI flags.
 
@@ -160,9 +173,6 @@ def _build_typed_page_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         sys.exit(2)
 
     frontmatter = _parse_json_arg("frontmatter", args.frontmatter)
-    source_ids: list[str] | None = None
-    if args.source_ids:
-        source_ids = [s.strip() for s in args.source_ids.split(",") if s.strip()]
 
     return {
         "type": args.type,
@@ -171,8 +181,8 @@ def _build_typed_page_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         "title": args.title,
         "summary": args.summary,
         "frontmatter": frontmatter,
-        "tags": ([t.strip() for t in args.tags.split(",") if t.strip()] if args.tags else None),
-        "source_ids": source_ids,
+        "tags": _parse_csv_arg(args.tags),
+        "source_ids": _parse_csv_arg(args.source_ids),
     }
 
 
@@ -199,11 +209,8 @@ def _build_typed_update_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         "title": args.title,
         "summary": args.summary,
         "frontmatter": frontmatter,
-        "tags": ([t.strip() for t in args.tags.split(",") if t.strip()] if args.tags else None),
-        "source_ids": (
-            [s.strip() for s in args.source_ids.split(",") if s.strip()]
-            if args.source_ids else None
-        ),
+        "tags": _parse_csv_arg(args.tags),
+        "source_ids": _parse_csv_arg(args.source_ids),
     }
 
 
