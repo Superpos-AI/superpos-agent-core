@@ -259,6 +259,21 @@ async def _run(args: argparse.Namespace) -> int:
                 )
                 return 2
             if args.type:
+                legacy_only = [
+                    flag for flag, val in (
+                        ("--content", args.content),
+                        ("--value", args.value),
+                        ("--confidence", args.confidence),
+                    ) if val
+                ]
+                if legacy_only:
+                    print(
+                        "Error: legacy-only flags ("
+                        + ", ".join(legacy_only)
+                        + ") are not valid on the typed (--type) create path.",
+                        file=sys.stderr,
+                    )
+                    return 2
                 kwargs = _build_typed_page_kwargs(args)
                 _print(await client.create_knowledge_page(
                     **kwargs,
@@ -267,6 +282,23 @@ async def _run(args: argparse.Namespace) -> int:
                     ttl=args.ttl,
                 ))
             else:
+                typed_only = [
+                    flag for flag, val in (
+                        ("--slug", args.slug),
+                        ("--body", args.body),
+                        ("--body-file", args.body_file),
+                        ("--frontmatter", args.frontmatter),
+                        ("--source-ids", args.source_ids),
+                    ) if val
+                ]
+                if typed_only:
+                    print(
+                        "Error: typed-only flags ("
+                        + ", ".join(typed_only)
+                        + ") are not valid on the legacy (--key) create path.",
+                        file=sys.stderr,
+                    )
+                    return 2
                 if not args.key:
                     print("Error: --key is required for legacy create.", file=sys.stderr)
                     return 2

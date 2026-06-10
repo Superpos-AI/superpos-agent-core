@@ -437,6 +437,61 @@ async def test_create_typed_and_legacy_are_mutually_exclusive(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_create_typed_rejects_legacy_only_flags(monkeypatch):
+    """Typed (--type) create must reject legacy-only flags like --content."""
+    mod = _load_script()
+
+    mock_create_page = AsyncMock()
+    mock_create_legacy = AsyncMock()
+    mock_close = AsyncMock()
+
+    monkeypatch.setenv("SUPERPOS_BASE_URL", "http://fake")
+    monkeypatch.setenv("SUPERPOS_HIVE_ID", "hive1")
+    monkeypatch.setenv("SUPERPOS_API_TOKEN", "tok")
+
+    with patch.object(mod.SuperposClient, "create_knowledge_page", mock_create_page), \
+         patch.object(mod.SuperposClient, "create_knowledge", mock_create_legacy), \
+         patch.object(mod.SuperposClient, "close", mock_close):
+        args = mod._build_parser().parse_args([
+            "create",
+            "--type", "topic", "--slug", "s", "--body", "typed",
+            "--content", "legacy",
+        ])
+        args.sort = None
+        rc = await mod._run(args)
+    assert rc == 2
+    mock_create_page.assert_not_called()
+    mock_create_legacy.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_create_legacy_rejects_typed_only_flags(monkeypatch):
+    """Legacy (--key) create must reject typed-only flags like --body."""
+    mod = _load_script()
+
+    mock_create_page = AsyncMock()
+    mock_create_legacy = AsyncMock()
+    mock_close = AsyncMock()
+
+    monkeypatch.setenv("SUPERPOS_BASE_URL", "http://fake")
+    monkeypatch.setenv("SUPERPOS_HIVE_ID", "hive1")
+    monkeypatch.setenv("SUPERPOS_API_TOKEN", "tok")
+
+    with patch.object(mod.SuperposClient, "create_knowledge_page", mock_create_page), \
+         patch.object(mod.SuperposClient, "create_knowledge", mock_create_legacy), \
+         patch.object(mod.SuperposClient, "close", mock_close):
+        args = mod._build_parser().parse_args([
+            "create",
+            "--key", "k", "--content", "c", "--body", "typed",
+        ])
+        args.sort = None
+        rc = await mod._run(args)
+    assert rc == 2
+    mock_create_legacy.assert_not_called()
+    mock_create_page.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_create_typed_with_frontmatter_parses_json(monkeypatch):
     mod = _load_script()
 
