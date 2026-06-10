@@ -2,7 +2,9 @@
 """CLI wrapper around superpos_agent_core.SuperposClient knowledge methods.
 
 Subcommands mirror the client API:
-  search, get, list, graph, topics, decisions   (read)
+  search, get, get-by-slug, list, list-by-type,  (read)
+  graph, topics, decisions, lint-state,
+  broken-links, backlinks
   create, update                                 (bounded write)
 
 Prints JSON to stdout, errors to stderr.  Designed for the LLM to call
@@ -224,6 +226,9 @@ async def _run(args: argparse.Namespace) -> int:
         elif args.cmd == "get":
             _print(await client.get_knowledge(args.entry_id))
 
+        elif args.cmd == "get-by-slug":
+            _print(await client.get_knowledge_by_slug(args.slug))
+
         elif args.cmd == "list":
             _print(await client.list_knowledge(
                 key=args.key,
@@ -232,6 +237,18 @@ async def _run(args: argparse.Namespace) -> int:
                 stale_days=args.stale_days,
                 sort=args.sort,
                 limit=args.limit,
+            ))
+
+        elif args.cmd == "list-by-type":
+            if args.type not in _KNOWLEDGE_PAGE_TYPES:
+                print(
+                    f"Error: --type {args.type!r} is not a known page type. "
+                    f"Valid types: {', '.join(sorted(_KNOWLEDGE_PAGE_TYPES))}.",
+                    file=sys.stderr,
+                )
+                return 2
+            _print(await client.list_knowledge_by_type(
+                args.type, limit=args.limit,
             ))
 
         elif args.cmd == "graph":
@@ -247,6 +264,15 @@ async def _run(args: argparse.Namespace) -> int:
 
         elif args.cmd == "decisions":
             _print(await client.knowledge_decisions())
+
+        elif args.cmd == "lint-state":
+            _print(await client.get_knowledge_lint_state())
+
+        elif args.cmd == "broken-links":
+            _print(await client.list_knowledge_broken_links())
+
+        elif args.cmd == "backlinks":
+            _print(await client.list_knowledge_backlinks(args.slug))
 
         elif args.cmd == "create":
             if args.key and args.type:
@@ -361,6 +387,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p_get = sub.add_parser("get", help="Fetch a single entry by ID")
     p_get.add_argument("entry_id", help="Knowledge entry ULID")
 
+    # get-by-slug
+    p_get_slug = sub.add_parser(
+        "get-by-slug", help="Fetch a single entry by slug (typed-page lookup)",
+    )
+    p_get_slug.add_argument(
+        "slug", help="Entry slug, e.g. 'proposal-knowledge-wiki'",
+    )
+
     # list
     p_list = sub.add_parser("list", help="Browse entries with filters")
     p_list.add_argument("--key", help="Key pattern (* wildcard)")
@@ -373,6 +407,22 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Sort order — currently only least-read is supported server-side",
     )
     p_list.add_argument("--limit", type=int, default=50, help="Default 50, server cap 100")
+
+    # list-by-type
+    p_list_type = sub.add_parser(
+        "list-by-type",
+        help="List entries filtered by type (typed-page browse)",
+    )
+    p_list_type.add_argument(
+        "type",
+        help=(
+            "Page type: "
+            f"{', '.join(sorted(_KNOWLEDGE_PAGE_TYPES))}"
+        ),
+    )
+    p_list_type.add_argument(
+        "--limit", type=int, default=50, help="Max entries (default 50, server cap 100)",
+    )
 
     # graph
     p_graph = sub.add_parser("graph", help="BFS link traversal from an entry")
@@ -390,6 +440,18 @@ def _build_parser() -> argparse.ArgumentParser:
     # topics / decisions
     sub.add_parser("topics", help="Convenience index of topic clusters in this hive")
     sub.add_parser("decisions", help="Convenience index of recorded decisions")
+
+    # lint-state / broken-links / backlinks — typed-page hygiene
+    sub.add_parser(
+        "lint-state", help="Show entries with lint_state=needs_attention",
+    )
+    sub.add_parser(
+        "broken-links", help="List wiki-style double-bracket refs that don't resolve",
+    )
+    p_backlinks = sub.add_parser(
+        "backlinks", help="Show entries that link to this slug",
+    )
+    p_backlinks.add_argument("slug", help="Target slug to find backlinks for")
 
     # ── Typed-page flags (create & update) ──────────────────────────
     def _add_typed_flags(p: argparse.ArgumentParser, *, slug_required: bool) -> None:
