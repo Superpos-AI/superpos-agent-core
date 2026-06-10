@@ -430,21 +430,29 @@ async def test_get_knowledge_by_slug_searches_then_gets_by_id():
     await client.close()
 
 
-async def test_get_knowledge_by_slug_falls_back_to_first_result():
+async def test_get_knowledge_by_slug_raises_when_no_exact_match():
     captured: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured.append(request)
         if request.url.path.endswith("/knowledge/search"):
-            # No exact slug match — fall back to the first result.
-            return _envelope([{"id": "01FIRST", "slug": "other-page"}])
+            # Relevance search returns candidates, but NONE has the exact
+            # slug — get-by-slug must NOT fall back to an unrelated hit.
+            return _envelope(
+                [
+                    {"id": "01FIRST", "slug": "other-page"},
+                    {"id": "01SECOND", "slug": "another-page"},
+                ],
+            )
         return _envelope({"id": "01FIRST", "slug": "other-page"})
 
     client = _make_client(handler)
-    out = await client.get_knowledge_by_slug("missing-exact")
+    with pytest.raises(ValueError, match="no knowledge entry found for slug"):
+        await client.get_knowledge_by_slug("missing-exact")
 
-    assert captured[1].url.path == "/api/v1/hives/hive-x/knowledge/01FIRST"
-    assert out == {"id": "01FIRST", "slug": "other-page"}
+    # Only the search hop ran — no get-by-id fetch of an unrelated entry.
+    assert len(captured) == 1
+    assert captured[0].url.path == "/api/v1/hives/hive-x/knowledge/search"
     await client.close()
 
 

@@ -465,26 +465,27 @@ class SuperposClient:
         this is a two-hop over existing endpoints:
 
         1. :meth:`search_knowledge` (``GET /knowledge/search``) resolves the
-           slug to an entry — we search with the slug as the query and prefer
-           the result whose ``slug`` field equals ``slug`` exactly, falling
-           back to the first result when none match exactly.
+           slug to an entry — we search with the slug as the query and require
+           a result whose ``slug`` field equals ``slug`` exactly. Because the
+           search is a relevance search over entry text, a non-exact candidate
+           may be unrelated, so we do not fall back to it.
         2. :meth:`get_knowledge` (``GET /knowledge/{entry}``) fetches the full
            entry by its ULID.
 
-        Raises :class:`ValueError` if the search returns no candidate or the
-        resolved candidate carries no ``id`` — a clear "not found" rather than
-        a delayed HTTP error.
+        Raises :class:`ValueError` if the search returns no exact slug match or
+        the resolved candidate carries no ``id`` — a clear "not found" rather
+        than a delayed HTTP error or an unrelated relevance hit.
         """
         results = await self.search_knowledge(slug, limit=10)
-        if not results:
-            raise ValueError(f"no knowledge entry found for slug {slug!r}")
         match = next(
             (
                 r for r in results
                 if isinstance(r, dict) and r.get("slug") == slug
             ),
-            results[0],
+            None,
         )
+        if match is None:
+            raise ValueError(f"no knowledge entry found for slug {slug!r}")
         entry_id = match.get("id") if isinstance(match, dict) else None
         if not entry_id:
             raise ValueError(
