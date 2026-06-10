@@ -462,6 +462,41 @@ async def test_typed_update_by_id_routes_to_update_page(monkeypatch):
     assert kw["summary"] == "s"
 
 
+def test_guard_shape_xor_treats_id_as_typed_selector(capsys):
+    """``--id`` selects the typed path, so it must not be mixed with legacy
+    flags (regression: ``--id`` was previously not seen by the guard, letting
+    ``update --id ... --content`` bypass the XOR and send an empty update)."""
+    mod = _load_script()
+    # --id alone (or with shared flags) → typed.
+    assert mod._guard_shape_xor(_ns(id="kxe_1")) is True
+    assert mod._guard_shape_xor(_ns(id="kxe_1", summary="s")) is True
+    # --id mixed with a legacy flag → rejected, not silently typed.
+    with pytest.raises(SystemExit):
+        mod._guard_shape_xor(_ns(id="kxe_1", content="Rule: ..."))
+    assert "cannot mix" in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
+async def test_update_id_with_legacy_flags_errors_no_call(monkeypatch):
+    """``update --id ... --content`` must fail fast and send nothing — neither a
+    legacy update nor an empty typed update (regression for the routing bug)."""
+    mod = _load_script()
+    _set_env(monkeypatch)
+    mock_update_page = AsyncMock()
+    mock_update_k = AsyncMock()
+    with patch.object(mod.KnowledgeClient, "update_page", mock_update_page), \
+         patch.object(mod.SuperposClient, "update_knowledge", mock_update_k), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        args = mod._build_parser().parse_args([
+            "update", "--id", "kxe_1", "--content", "Rule: do the thing",
+        ])
+        args.sort = None
+        with pytest.raises(SystemExit):
+            await mod._run(args)
+    mock_update_page.assert_not_called()
+    mock_update_k.assert_not_called()
+
+
 @pytest.mark.asyncio
 async def test_typed_update_by_slug_resolves_then_updates(monkeypatch):
     mod = _load_script()
