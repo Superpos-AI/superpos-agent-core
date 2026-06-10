@@ -332,27 +332,32 @@ async def _run(args: argparse.Namespace) -> int:
                 )
             )
             type_or_slug_set = args.type is not None or args.slug is not None
-            # --visibility/--ttl are metadata fields the typed PUT supports
-            # natively. When supplied without any legacy-only flag, a
-            # metadata-only update must route to the typed path so it issues a
-            # single typed PUT instead of a legacy get_knowledge()+
-            # update_knowledge() read-modify-write. If a legacy-only flag is
-            # also present the legacy path still carries visibility/ttl as before.
-            meta_flags_set = args.visibility is not None or args.ttl is not None
+            # --visibility/--ttl are metadata fields, NOT a writable content
+            # shape. The server's UpdateKnowledgeRequest validator rejects a PUT
+            # body whose only fields are visibility/ttl with a 422 ("The value
+            # field is required"). So a *metadata-only* update (visibility/ttl
+            # set, but no typed content flag and no type/slug) must NOT take the
+            # typed PUT path — it routes through the legacy read-modify-write
+            # path below, which re-sends the existing `value` alongside
+            # visibility/ttl and therefore satisfies the validator. When a typed
+            # content flag (or type/slug) is also present, visibility/ttl ride
+            # along on the typed PUT as before.
             use_typed_path = type_or_slug_set or (
-                (typed_shape_flags_set or meta_flags_set) and not legacy_only_flags_set
+                typed_shape_flags_set and not legacy_only_flags_set
             )
             if use_typed_path:
                 kwargs = _build_typed_update_kwargs(args)
                 # Drop None entries so partial updates send only what's set
                 kwargs = {k: v for k, v in kwargs.items() if v is not None}
-                # visibility/ttl are valid typed updates on their own, so a
-                # metadata-only update counts as non-empty.
-                if not kwargs and not meta_flags_set:
+                # The typed path is only reached when a typed content flag is
+                # present, so kwargs is non-empty here. visibility/ttl ride along
+                # but are not a writable shape on their own — a metadata-only
+                # update is routed to the legacy path instead (see above).
+                if not kwargs:
                     print(
                         "Error: typed update requires at least one of "
                         "--body/--body-file, --title, --summary, --tags, "
-                        "--frontmatter, --source-ids, --visibility, --ttl.",
+                        "--frontmatter, --source-ids.",
                         file=sys.stderr,
                     )
                     return 2

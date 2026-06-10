@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 
 from superpos_agent_core import bundled_modules_dir
@@ -922,32 +924,37 @@ async def test_update_title_with_content_stays_legacy(monkeypatch):
 
 
 # ── Metadata-only update routing (visibility/ttl) regression, PR #31 ─────────
-# --visibility/--ttl are in neither the legacy-only nor the typed-shape flag
-# sets, so a metadata-only update (e.g. `update ID --visibility private`) used
-# to fall through to the legacy get_knowledge()+update_knowledge() path and
-# synthesize a legacy `value` payload. update_knowledge_page() already accepts
-# visibility/ttl, so these must route to the typed PUT instead.
+# --visibility/--ttl are metadata fields, NOT a writable content shape. A bare
+# `update ID --visibility private` (no typed content flag, no legacy-only flag)
+# must route through the legacy get_knowledge()+update_knowledge()
+# read-modify-write path, which re-sends the existing `value` alongside the new
+# visibility/ttl. The typed PUT (update_knowledge_page) would send a bare
+# {"visibility": ...} body, which the server's UpdateKnowledgeRequest validator
+# rejects with a 422 ("The value field is required"). When a typed content flag
+# is also present, visibility/ttl ride along on the typed PUT instead.
 
 
 @pytest.mark.asyncio
-async def test_update_visibility_only_routes_to_typed_page(monkeypatch):
-    """`update ID --visibility private` (no other flag) must call
-    update_knowledge_page with visibility='private' and must NOT do a legacy
-    read-modify-write via get_knowledge()/update_knowledge()."""
+async def test_update_visibility_only_routes_to_legacy_page(monkeypatch):
+    """`update ID --visibility private` (no other flag) must route through the
+    legacy read-modify-write path (get_knowledge()+update_knowledge()) and
+    forward visibility='private'. It must NOT call update_knowledge_page,
+    because a bare {"visibility": ...} PUT body fails the server validator."""
     mod = _load_script()
 
-    mock_update_page = AsyncMock(return_value={"id": "01ABC"})
-    mock_update_legacy = AsyncMock()
-    mock_get = AsyncMock()
+    existing_entry = {"id": "01ABC", "value": {"content": "Old content"}}
+    mock_get = AsyncMock(return_value=existing_entry)
+    mock_update_legacy = AsyncMock(return_value={"id": "01ABC", "value": {}})
+    mock_update_page = AsyncMock()
     mock_close = AsyncMock()
 
     monkeypatch.setenv("SUPERPOS_BASE_URL", "http://fake")
     monkeypatch.setenv("SUPERPOS_HIVE_ID", "hive1")
     monkeypatch.setenv("SUPERPOS_API_TOKEN", "tok")
 
-    with patch.object(mod.SuperposClient, "update_knowledge_page", mock_update_page), \
+    with patch.object(mod.SuperposClient, "get_knowledge", mock_get), \
          patch.object(mod.SuperposClient, "update_knowledge", mock_update_legacy), \
-         patch.object(mod.SuperposClient, "get_knowledge", mock_get), \
+         patch.object(mod.SuperposClient, "update_knowledge_page", mock_update_page), \
          patch.object(mod.SuperposClient, "close", mock_close):
         args = mod._build_parser().parse_args([
             "update", "01ABC", "--visibility", "private",
@@ -955,19 +962,54 @@ async def test_update_visibility_only_routes_to_typed_page(monkeypatch):
         args.sort = None
         await mod._run(args)
 
-    mock_update_page.assert_awaited_once()
-    call = mock_update_page.call_args
+    mock_update_page.assert_not_called()
+    mock_update_legacy.assert_awaited_once()
+    call = mock_update_legacy.call_args
     assert call.args[0] == "01ABC"
     assert call.kwargs["visibility"] == "private"
-    # No legacy value payload and no read-modify-write on the typed path.
-    mock_update_legacy.assert_not_called()
-    mock_get.assert_not_called()
+    # The legacy path re-sends a value (read-modify-write) so the validator is
+    # satisfied — never a bare metadata body.
+    assert "value" in call.kwargs
 
 
 @pytest.mark.asyncio
-async def test_update_ttl_only_routes_to_typed_page(monkeypatch):
-    """`update ID --ttl <iso>` (no other flag) must call update_knowledge_page
-    with the ttl forwarded and must NOT do a legacy read-modify-write."""
+async def test_update_ttl_only_routes_to_legacy_page(monkeypatch):
+    """`update ID --ttl <iso>` (no other flag) must route through the legacy
+    read-modify-write path and forward the ttl, NOT call update_knowledge_page."""
+    mod = _load_script()
+
+    existing_entry = {"id": "01ABC", "value": {"content": "Old content"}}
+    mock_get = AsyncMock(return_value=existing_entry)
+    mock_update_legacy = AsyncMock(return_value={"id": "01ABC", "value": {}})
+    mock_update_page = AsyncMock()
+    mock_close = AsyncMock()
+
+    monkeypatch.setenv("SUPERPOS_BASE_URL", "http://fake")
+    monkeypatch.setenv("SUPERPOS_HIVE_ID", "hive1")
+    monkeypatch.setenv("SUPERPOS_API_TOKEN", "tok")
+
+    with patch.object(mod.SuperposClient, "get_knowledge", mock_get), \
+         patch.object(mod.SuperposClient, "update_knowledge", mock_update_legacy), \
+         patch.object(mod.SuperposClient, "update_knowledge_page", mock_update_page), \
+         patch.object(mod.SuperposClient, "close", mock_close):
+        args = mod._build_parser().parse_args([
+            "update", "01ABC", "--ttl", "2026-07-01T00:00:00Z",
+        ])
+        args.sort = None
+        await mod._run(args)
+
+    mock_update_page.assert_not_called()
+    mock_update_legacy.assert_awaited_once()
+    call = mock_update_legacy.call_args
+    assert call.args[0] == "01ABC"
+    assert call.kwargs["ttl"] == "2026-07-01T00:00:00Z"
+    assert "value" in call.kwargs
+
+
+@pytest.mark.asyncio
+async def test_update_visibility_with_body_routes_to_typed_page(monkeypatch):
+    """`update ID --body ... --visibility private` carries a typed content shape,
+    so it routes to the typed PUT and visibility rides along on it."""
     mod = _load_script()
 
     mock_update_page = AsyncMock(return_value={"id": "01ABC"})
@@ -984,7 +1026,7 @@ async def test_update_ttl_only_routes_to_typed_page(monkeypatch):
          patch.object(mod.SuperposClient, "get_knowledge", mock_get), \
          patch.object(mod.SuperposClient, "close", mock_close):
         args = mod._build_parser().parse_args([
-            "update", "01ABC", "--ttl", "2026-07-01T00:00:00Z",
+            "update", "01ABC", "--body", "New body", "--visibility", "private",
         ])
         args.sort = None
         await mod._run(args)
@@ -992,9 +1034,64 @@ async def test_update_ttl_only_routes_to_typed_page(monkeypatch):
     mock_update_page.assert_awaited_once()
     call = mock_update_page.call_args
     assert call.args[0] == "01ABC"
-    assert call.kwargs["ttl"] == "2026-07-01T00:00:00Z"
+    assert call.kwargs["body"] == "New body"
+    assert call.kwargs["visibility"] == "private"
+    # Typed content shape present, so no legacy read-modify-write.
     mock_update_legacy.assert_not_called()
     mock_get.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_visibility_only_outbound_body_carries_writable_shape(monkeypatch):
+    """Contract-level guard: drive `update ID --visibility private` end-to-end
+    through the CLI dispatcher against a real httpx transport and assert the
+    captured PUT body carries a writable shape (`value`) — NOT a bare
+    {"visibility": "private"} body, which the server's UpdateKnowledgeRequest
+    validator rejects with a 422. This is the regression that mocking the client
+    methods could not catch."""
+    mod = _load_script()
+
+    monkeypatch.setenv("SUPERPOS_BASE_URL", "https://test.example")
+    monkeypatch.setenv("SUPERPOS_HIVE_ID", "hive-x")
+    monkeypatch.setenv("SUPERPOS_API_TOKEN", "tok")
+
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        body = {"data": {}, "meta": {}, "errors": []}
+        if request.method == "GET":
+            body["data"] = {
+                "id": "01ABC",
+                "value": {"content": "Existing content"},
+            }
+        return httpx.Response(200, json=body)
+
+    real_init = mod.SuperposClient.__init__
+
+    def patched_init(self, config):
+        real_init(self, config)
+        self._client = httpx.AsyncClient(
+            base_url="https://test.example",
+            transport=httpx.MockTransport(handler),
+        )
+
+    with patch.object(mod.SuperposClient, "__init__", patched_init):
+        args = mod._build_parser().parse_args([
+            "update", "01ABC", "--visibility", "private",
+        ])
+        args.sort = None
+        rc = await mod._run(args)
+
+    assert rc == 0
+    put_requests = [r for r in captured if r.method == "PUT"]
+    assert len(put_requests) == 1
+    sent = json.loads(put_requests[0].content)
+    # The outbound body must contain a writable shape, not bare metadata.
+    assert "value" in sent, f"PUT body lacks a writable `value` shape: {sent}"
+    assert sent["visibility"] == "private"
+    # Existing content survives the read-modify-write.
+    assert sent["value"].get("content") == "Existing content"
 
 
 @pytest.mark.asyncio
