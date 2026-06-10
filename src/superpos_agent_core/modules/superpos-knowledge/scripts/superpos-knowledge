@@ -446,7 +446,8 @@ def _build_parser() -> argparse.ArgumentParser:
         p.add_argument(
             "--source-ids",
             help="Comma-separated source entry ULIDs / agent IDs (curator audit trail). "
-                 "Defaults to SUPERPOS_AGENT_ID when set.",
+                 "Optional and not auto-stamped: source_ids is sent only when you pass "
+                 "this flag (auto-stamping SUPERPOS_AGENT_ID would 403 per proposal §6.8).",
         )
 
     # create

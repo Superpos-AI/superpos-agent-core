@@ -952,3 +952,37 @@ async def test_update_visibility_with_content_stays_legacy(monkeypatch):
     mock_update_legacy.assert_awaited_once()
     mock_update_page.assert_not_called()
     assert mock_update_legacy.call_args.kwargs["visibility"] == "private"
+
+
+def _source_ids_help(subparser) -> str:
+    """Return the help string of the --source-ids action on a subparser."""
+    for action in subparser._actions:
+        if "--source-ids" in action.option_strings:
+            return action.help
+    raise AssertionError("--source-ids action not found on subparser")
+
+
+def test_source_ids_help_does_not_claim_auto_stamp():
+    """The --source-ids help must not imply auto-stamping from SUPERPOS_AGENT_ID;
+    source_ids is only forwarded when the user explicitly passes the flag."""
+    mod = _load_script()
+    parser = mod._build_parser()
+
+    # Locate the create/update subparsers (the ones carrying --source-ids).
+    subparsers_action = next(
+        a for a in parser._actions
+        if isinstance(a, argparse._SubParsersAction)
+    )
+    checked = []
+    for name in ("create", "update"):
+        sub = subparsers_action.choices[name]
+        help_text = _source_ids_help(sub)
+        assert "Defaults to SUPERPOS_AGENT_ID" not in help_text, (
+            f"{name} --source-ids help still claims a SUPERPOS_AGENT_ID default"
+        )
+        assert "not auto-stamped" in help_text, (
+            f"{name} --source-ids help should state it is not auto-stamped"
+        )
+        checked.append(name)
+
+    assert checked == ["create", "update"]
