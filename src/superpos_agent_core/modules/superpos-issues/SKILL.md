@@ -28,6 +28,17 @@ just knowledge lookup — skip this skill.
 All commands are on PATH inside the container. They print JSON to
 stdout that you can `jq` over.
 
+### Coverage
+
+The CLI covers the issue lifecycle (list / show / create / update /
+transition / close), linking (tasks, channels, **tracks**),
+dependencies, attachments, discussion comments, approval requests, and
+the issue-type catalogue. Known backend gap: there is **no atomic
+create-and-link-to-track** call — `create --track-slug` is a CLI-side
+two-call flow (create, then link). Track *unlink* and track listing
+(`GET /tracks`) are not exposed by this CLI yet (out of scope for the
+linking use case).
+
 ### `superpos-issues list`
 
 Paginated index. Useful for "show me what's open" or "find issues of
@@ -72,7 +83,24 @@ superpos-issues create \
 ```
 
 Optional flags: `--assignee-type`, `--assignee-id`, `--channel-id`,
-`--thread-id`, `--metadata` (JSON object).
+`--thread-id`, `--metadata` (JSON object), `--track-slug`.
+
+`--track-slug` links the new issue to a track in one command:
+
+```bash
+superpos-issues create \
+  --title "Audit the issues CLI" \
+  --issue-type-id 01HISSUETYPEXYZ \
+  --track-slug agent-capabilities
+```
+
+This is a **two-call convenience**, not an atomic backend operation: the
+issue-create endpoint has no track field, so the CLI creates the issue
+first and then links it (`POST /tracks/{slug}/issues`). On success the
+linked issue is re-fetched and printed (so `track` reflects the link).
+If the create succeeds but the link fails, the CLI exits non-zero and
+prints the **created issue id** to stderr — the issue exists; re-run
+`link-track` to retry just the link (nothing is rolled back).
 
 ### `superpos-issues update <issue-id>`
 
@@ -122,6 +150,18 @@ to address an issue — link it so the work stays traceable.
 ### `superpos-issues link-channel <issue-id> --channel-id <channel-id>`
 
 Bind a channel (Telegram/Slack thread) to the issue.
+
+### `superpos-issues link-track <issue-id> --track-slug <slug>`
+
+Link an existing issue to a track. The track is addressed by **slug**
+(no id lookup needed); the issue is addressed by id. This is the
+explicit, callable-by-id alternative to `create --track-slug`.
+
+```bash
+superpos-issues link-track 01HXYZ --track-slug agent-capabilities
+```
+
+Requires `issues.manage`. Returns `{"track_id", "issue_id"}`.
 
 ### `superpos-issues request-approval <issue-id>`
 

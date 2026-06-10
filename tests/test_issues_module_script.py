@@ -102,6 +102,131 @@ def test_parser_comment_and_discussion():
     assert d.cmd == "discussion" and d.issue_id == "i1"
 
 
+def test_parser_create_track_slug_optional():
+    mod = _load_script()
+    parser = mod._build_parser()
+    # --track-slug is optional on create
+    plain = parser.parse_args(["create", "--title", "T", "--issue-type-id", "it-1"])
+    assert plain.cmd == "create" and plain.track_slug is None
+    linked = parser.parse_args(
+        ["create", "--title", "T", "--issue-type-id", "it-1", "--track-slug", "agent-capabilities"],
+    )
+    assert linked.track_slug == "agent-capabilities"
+
+
+def test_parser_link_track_requires_slug():
+    mod = _load_script()
+    parser = mod._build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["link-track", "i1"])  # missing --track-slug
+    args = parser.parse_args(["link-track", "i1", "--track-slug", "agent-capabilities"])
+    assert args.cmd == "link-track"
+    assert args.issue_id == "i1"
+    assert args.track_slug == "agent-capabilities"
+
+
+# ── dispatch: create + track linking ────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_create_without_track_slug_does_not_link(monkeypatch):
+    mod = _load_script()
+    _set_env(monkeypatch)
+
+    mock_create = AsyncMock(return_value={"id": "i1", "title": "T", "state": "open"})
+    mock_link = AsyncMock()
+    mock_get = AsyncMock()
+    with patch.object(mod.SuperposClient, "create_issue", mock_create), \
+         patch.object(mod.SuperposClient, "link_issue_to_track", mock_link), \
+         patch.object(mod.SuperposClient, "get_issue", mock_get), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        args = mod._build_parser().parse_args(
+            ["create", "--title", "T", "--issue-type-id", "it-1"],
+        )
+        rc = await mod._run(args)
+
+    assert rc == 0
+    mock_create.assert_awaited_once()
+    mock_link.assert_not_awaited()
+    mock_get.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_create_with_track_slug_creates_then_links(monkeypatch):
+    """`create --track-slug` must create the issue, then call
+    link_issue_to_track(slug, <returned id>), then re-fetch so the output
+    reflects the link."""
+    mod = _load_script()
+    _set_env(monkeypatch)
+
+    mock_create = AsyncMock(return_value={"id": "i1", "title": "T", "state": "open"})
+    mock_link = AsyncMock(return_value={"track_id": "tr-1", "issue_id": "i1"})
+    mock_get = AsyncMock(return_value={"id": "i1", "title": "T", "track": "agent-capabilities"})
+    with patch.object(mod.SuperposClient, "create_issue", mock_create), \
+         patch.object(mod.SuperposClient, "link_issue_to_track", mock_link), \
+         patch.object(mod.SuperposClient, "get_issue", mock_get), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        args = mod._build_parser().parse_args(
+            ["create", "--title", "T", "--issue-type-id", "it-1",
+             "--track-slug", "agent-capabilities"],
+        )
+        rc = await mod._run(args)
+
+    assert rc == 0
+    mock_create.assert_awaited_once()
+    # link called with the slug and the id returned by create
+    mock_link.assert_awaited_once_with("agent-capabilities", "i1")
+    # output re-fetched so it reflects the track link
+    mock_get.assert_awaited_once_with("i1")
+
+
+@pytest.mark.asyncio
+async def test_create_with_track_slug_link_failure_surfaces_id(monkeypatch, capsys):
+    """If create succeeds but the link fails, the CLI must exit non-zero and
+    mention the created issue id — the issue WAS created, only the link
+    failed (no rollback)."""
+    mod = _load_script()
+    _set_env(monkeypatch)
+
+    mock_create = AsyncMock(return_value={"id": "i-created", "title": "T"})
+    mock_link = AsyncMock(side_effect=RuntimeError("403 forbidden"))
+    mock_get = AsyncMock()
+    with patch.object(mod.SuperposClient, "create_issue", mock_create), \
+         patch.object(mod.SuperposClient, "link_issue_to_track", mock_link), \
+         patch.object(mod.SuperposClient, "get_issue", mock_get), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        args = mod._build_parser().parse_args(
+            ["create", "--title", "T", "--issue-type-id", "it-1",
+             "--track-slug", "agent-capabilities"],
+        )
+        rc = await mod._run(args)
+
+    assert rc == 1
+    mock_create.assert_awaited_once()
+    mock_link.assert_awaited_once_with("agent-capabilities", "i-created")
+    # we never re-fetch when the link failed
+    mock_get.assert_not_awaited()
+    err = capsys.readouterr().err
+    assert "i-created" in err  # created id surfaced so caller can retry
+
+
+@pytest.mark.asyncio
+async def test_link_track_calls_link_issue_to_track(monkeypatch):
+    mod = _load_script()
+    _set_env(monkeypatch)
+
+    mock_link = AsyncMock(return_value={"track_id": "tr-1", "issue_id": "i1"})
+    with patch.object(mod.SuperposClient, "link_issue_to_track", mock_link), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        args = mod._build_parser().parse_args(
+            ["link-track", "i1", "--track-slug", "agent-capabilities"],
+        )
+        rc = await mod._run(args)
+
+    assert rc == 0
+    mock_link.assert_awaited_once_with("agent-capabilities", "i1")
+
+
 # ── dispatch: attachments ───────────────────────────────────────────────
 
 

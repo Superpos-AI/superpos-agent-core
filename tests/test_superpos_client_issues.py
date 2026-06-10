@@ -308,6 +308,26 @@ async def test_link_channel_to_issue():
     await client.close()
 
 
+async def test_link_issue_to_track():
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return _envelope({"track_id": "tr-1", "issue_id": "i1"})
+
+    client = _make_client(handler)
+    result = await client.link_issue_to_track("agent-capabilities", "i1")
+
+    req = captured[0]
+    body = json.loads(req.content)
+    assert req.method == "POST"
+    # track addressed by slug in the path; issue id in the body
+    assert req.url.path == "/api/v1/hives/hive-x/tracks/agent-capabilities/issues"
+    assert body == {"issue_id": "i1"}
+    assert result == {"track_id": "tr-1", "issue_id": "i1"}
+    await client.close()
+
+
 # ── approvals & dependencies ────────────────────────────────────────────
 
 
