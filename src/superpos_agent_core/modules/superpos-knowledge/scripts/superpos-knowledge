@@ -144,6 +144,9 @@ def _build_typed_page_kwargs(args: argparse.Namespace) -> dict[str, Any]:
     auto-stamping ``SUPERPOS_AGENT_ID`` would 403 for agents whose read scope
     doesn't cover their own agent page.
     """
+    if not args.slug:
+        print("Error: --type requires --slug.", file=sys.stderr)
+        sys.exit(2)
     body = _resolve_body(args.body, args.body_file)
     if body is None:
         print("Error: --type requires --body or --body-file.", file=sys.stderr)

@@ -387,6 +387,26 @@ async def test_create_typed_rejects_missing_body(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_create_typed_rejects_missing_slug(monkeypatch):
+    """--type without --slug must exit 2 (typed contract is type+slug+body) and
+    never reach the client with slug=None."""
+    mod = _load_script()
+    monkeypatch.setenv("SUPERPOS_BASE_URL", "http://fake")
+    monkeypatch.setenv("SUPERPOS_HIVE_ID", "hive1")
+    monkeypatch.setenv("SUPERPOS_API_TOKEN", "tok")
+    mock_create_page = AsyncMock()
+    mock_close = AsyncMock()
+    with patch.object(mod.SuperposClient, "create_knowledge_page", mock_create_page), \
+         patch.object(mod.SuperposClient, "close", mock_close):
+        args = mod._build_parser().parse_args(["create", "--type", "topic", "--body", "b"])
+        args.sort = None
+        with pytest.raises(SystemExit) as exc:
+            await mod._run(args)
+    assert exc.value.code == 2
+    mock_create_page.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_create_typed_and_legacy_are_mutually_exclusive(monkeypatch):
     """Passing both --key (legacy) and --type (typed) must exit 2 and never
     hit the network."""
