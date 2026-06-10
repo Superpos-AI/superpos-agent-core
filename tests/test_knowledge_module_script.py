@@ -765,7 +765,9 @@ async def test_typed_update_visibility_with_content_routes_to_update_page(monkey
 
 
 @pytest.mark.asyncio
-async def test_typed_update_slug_no_match_errors(monkeypatch):
+async def test_typed_update_slug_no_match_under_cap_errors(monkeypatch, capsys):
+    """Result set under the cap → the whole type was scanned, so the slug
+    genuinely doesn't exist: report a plain "no page found" miss."""
     mod = _load_script()
     _set_env(monkeypatch)
     mock_list = AsyncMock(return_value=[{"id": "a", "slug": "topic:other"}])
@@ -777,8 +779,39 @@ async def test_typed_update_slug_no_match_errors(monkeypatch):
             "update", "--type", "topic", "--slug", "nope", "--summary", "x",
         ])
         args.sort = None
-        with pytest.raises(SystemExit):
+        with pytest.raises(SystemExit) as exc_info:
             await mod._run(args)
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "no topic page found with slug 'nope'." in err
+    assert "most recent" not in err
+    mock_update.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_typed_update_slug_no_match_at_cap_discloses_bound(monkeypatch, capsys):
+    """Result set at the cap → it was truncated to the newest entries, so the
+    page may exist but is unreachable by slug: disclose the bound and point at
+    --id."""
+    mod = _load_script()
+    _set_env(monkeypatch)
+    # Exactly the cap's worth of pages, none matching the target slug.
+    pages = [{"id": f"k{i}", "slug": f"topic:n{i}"} for i in range(100)]
+    mock_list = AsyncMock(return_value=pages)
+    mock_update = AsyncMock()
+    with patch.object(mod.KnowledgeClient, "list_by_type", mock_list), \
+         patch.object(mod.KnowledgeClient, "update_page", mock_update), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        args = mod._build_parser().parse_args([
+            "update", "--type", "topic", "--slug", "nope", "--summary", "x",
+        ])
+        args.sort = None
+        with pytest.raises(SystemExit) as exc_info:
+            await mod._run(args)
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "100 most recent entries" in err
+    assert "--id" in err
     mock_update.assert_not_called()
 
 

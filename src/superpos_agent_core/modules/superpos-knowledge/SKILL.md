@@ -133,7 +133,9 @@ superpos-knowledge create \
 superpos-knowledge update --id 01HXYZ... --summary "refreshed" --body-file ./new.md
 
 # update by slug (resolved to an id via the typed list endpoint;
-# --type is required so the lookup knows which list to scan)
+# --type is required so the lookup knows which list to scan.
+# Best-effort: only the newest 100 entries of the type are scanned
+# (server cap, no pagination) — for older entries use --id.)
 superpos-knowledge update --type topic --slug proposal-knowledge-wiki \
   --frontmatter '{"status": "superseded"}'
 ```
@@ -165,10 +167,18 @@ Typed flags (create & update):
   env or `hive`; org scope needs `knowledge.write_organization`; scope is
   immutable after create)
 
-**Update is id-only.**  `--id` updates directly.  `--slug` is resolved to
-an id first by listing pages of `--type` and matching the slug, so
-`--type` is required with `--slug`; a slug that matches 0 or >1 pages
-errors rather than guessing.  `scope` cannot be changed on update.
+**Update is id-only.**  `--id` updates directly (exact, unbounded).
+`--slug` is resolved to an id first by listing pages of `--type` and
+matching the slug, so `--type` is required with `--slug`; a slug that
+matches 0 or >1 pages errors rather than guessing.  `scope` cannot be
+changed on update.
+
+**Caveat — slug resolution is bounded.**  The typed list endpoint returns
+only the newest 100 entries of the type (server cap, no pagination, no
+exact-slug route), so `update --type X --slug Y` only resolves slugs among
+those 100. An entry older than the newest 100 of its type can't be reached
+by slug — the CLI says so explicitly and tells you to use `update --id
+<id>` instead, which is exact and unbounded.
 
 #### Legacy key/value (deprecated)
 

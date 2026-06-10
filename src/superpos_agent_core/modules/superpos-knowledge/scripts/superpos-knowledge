@@ -45,6 +45,13 @@ _TYPED_SELECTORS = ("id",)
 # Legacy key/value-shape flags, deprecated in favour of the typed shape.
 _LEGACY_FLAGS = ("key", "value", "content", "confidence")
 
+# Upper bound for slug-on-update resolution. The typed list endpoint returns
+# only the newest entries of a type (server-clamped, no pagination, no exact
+# slug route), so slug resolution is a bounded best-effort scan. Used both for
+# the ``list_by_type`` call and the under-cap/at-cap comparison so they can't
+# drift apart.
+_SLUG_RESOLVE_LIMIT = 100
+
 
 def _config_from_env() -> BaseConfig:
     base_url = os.environ.get("SUPERPOS_BASE_URL", "").rstrip("/")
@@ -209,6 +216,10 @@ async def _resolve_slug_to_id(
     slug or PATCH route — so we list pages of the given type (newest first)
     and match on the entry's ``slug`` field. ``--type`` is required alongside
     ``--slug`` because the typed list endpoint is keyed by type.
+
+    This is a bounded best-effort scan: the list endpoint returns only the
+    newest ``_SLUG_RESOLVE_LIMIT`` entries (server-clamped, no pagination), so
+    an entry older than that can't be resolved by slug — use ``--id`` instead.
     """
     if type_ is None:
         print(
@@ -217,16 +228,29 @@ async def _resolve_slug_to_id(
             file=sys.stderr,
         )
         sys.exit(2)
-    pages = await kclient.list_by_type(type_, limit=100)
+    pages = await kclient.list_by_type(type_, limit=_SLUG_RESOLVE_LIMIT)
     matches = [
         p for p in pages
         if isinstance(p, dict) and p.get("slug") == slug
     ]
     if not matches:
-        print(
-            f"Error: no {type_} page found with slug {slug!r}.",
-            file=sys.stderr,
-        )
+        if len(pages) >= _SLUG_RESOLVE_LIMIT:
+            # The result set was truncated to the newest entries, so the page
+            # may exist but is unreachable by slug. Be honest about the bound.
+            print(
+                f"Error: no {type_!r} page with slug {slug!r} found among the "
+                f"{_SLUG_RESOLVE_LIMIT} most recent entries. Older entries "
+                "can't be resolved by slug (the server returns only the newest "
+                f"{_SLUG_RESOLVE_LIMIT} with no pagination); update it by --id "
+                "instead.",
+                file=sys.stderr,
+            )
+        else:
+            # The whole type was scanned, so the slug genuinely doesn't exist.
+            print(
+                f"Error: no {type_} page found with slug {slug!r}.",
+                file=sys.stderr,
+            )
         sys.exit(2)
     if len(matches) > 1:
         ids = ", ".join(str(p.get("id")) for p in matches)
@@ -483,7 +507,10 @@ def _add_value_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--slug",
         help="Stable typed-page slug (regex ^[A-Za-z0-9:_\\-.]+$). Required "
-             "with --type on create; resolves to an id on update.",
+             "with --type on create. On update it is resolved to an id as a "
+             "best-effort scan over the newest 100 entries of the type "
+             "(server cap, no pagination); for older entries use --id, which "
+             "is exact and unbounded.",
     )
     p.add_argument("--body", help="Typed page body (Markdown).")
     p.add_argument(
@@ -620,7 +647,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_update.add_argument(
         "--id", dest="id",
-        help="Typed page entry id to update directly (PUT is id-only).",
+        help="Typed page entry id to update directly (PUT is id-only). "
+             "Exact and unbounded — unlike --type+--slug, which resolves "
+             "only over the newest 100 entries of the type.",
     )
     p_update.add_argument(
         "--scope",
