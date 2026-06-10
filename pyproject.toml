@@ -31,6 +31,7 @@ superpos_agent_core = [
     "modules/**/*.yaml",
     "modules/**/*.md",
     "modules/**/scripts/*",
+    "wiki/*.md",
 ]
 
 [tool.ruff]
