@@ -327,10 +327,40 @@ async def _run(args: argparse.Namespace) -> int:
             # --body/--frontmatter/--source-ids) belongs to the typed page
             # shape. --type/--slug are immutable on update and always route to
             # the typed path so _build_typed_update_kwargs() can reject them.
-            legacy_only_flags_set = any(
-                getattr(args, f, None) is not None
-                for f in ("content", "value", "confidence")
-            )
+            # Legacy-only flags pin the `value` shape; typed-only flags pin the
+            # typed-page shape. --title/--summary/--tags are SHARED (valid on
+            # either shape) and never force a path on their own. Mixing a
+            # legacy-only flag with a typed-only flag is a contradiction: the
+            # update can only dispatch to one endpoint, so silently honoring one
+            # and dropping the other would lose data. Reject the mix up front,
+            # in both directions, before any shape detection.
+            legacy_only_set = [
+                flag for flag, val in (
+                    ("--content", args.content),
+                    ("--value", args.value),
+                    ("--confidence", args.confidence),
+                ) if val is not None
+            ]
+            typed_only_set = [
+                flag for flag, val in (
+                    ("--body", args.body),
+                    ("--body-file", args.body_file),
+                    ("--frontmatter", args.frontmatter),
+                    ("--source-ids", args.source_ids),
+                ) if val is not None
+            ]
+            if legacy_only_set and typed_only_set:
+                print(
+                    "Error: legacy-only flags ("
+                    + ", ".join(legacy_only_set)
+                    + ") cannot be combined with typed-only flags ("
+                    + ", ".join(typed_only_set)
+                    + ") on update; they dispatch to different endpoints. "
+                    "Use --title/--summary/--tags for fields shared by both.",
+                    file=sys.stderr,
+                )
+                return 2
+            legacy_only_flags_set = bool(legacy_only_set)
             typed_shape_flags_set = any(
                 getattr(args, f, None) is not None
                 for f in (
