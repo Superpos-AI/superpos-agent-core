@@ -24,7 +24,20 @@ import sys
 from typing import Any
 
 # `superpos_agent_core` is pip-installed via the container's requirements.txt.
-from superpos_agent_core import BaseConfig, SuperposClient
+from superpos_agent_core import BaseConfig, KnowledgeClient, SuperposClient
+
+# Typed knowledge page types accepted by the create/update API (server-side
+# frontmatter validation is per-type; `entity` additionally requires
+# `frontmatter.kind`).
+_KNOWLEDGE_TYPES = ("entity", "topic", "trend", "source_page", "log", "procedure")
+
+# Typed-shape flags. Presence of any of these (on create/update) routes the
+# command through KnowledgeClient.create_page / update_page instead of the
+# legacy key/value path. Mirrors the server's dual-shape XOR.
+_TYPED_FLAGS = ("type", "slug", "body", "body_file", "frontmatter")
+
+# Legacy key/value-shape flags, deprecated in favour of the typed shape.
+_LEGACY_FLAGS = ("key", "value", "content", "confidence")
 
 
 def _config_from_env() -> BaseConfig:
@@ -72,6 +85,80 @@ def _parse_json_arg(label: str, raw: str | None) -> dict[str, Any] | None:
     return parsed
 
 
+def _split_tags(raw: str | None) -> list[str] | None:
+    """Parse a comma-separated ``--tags`` flag into a clean list (or None)."""
+    if raw is None:
+        return None
+    return [t.strip() for t in raw.split(",") if t.strip()]
+
+
+def _has_any_flag(args: argparse.Namespace, names: tuple[str, ...]) -> bool:
+    """True if any of the named attributes is set (non-None) on ``args``."""
+    return any(getattr(args, n, None) is not None for n in names)
+
+
+def _resolve_body(args: argparse.Namespace) -> str | None:
+    """Resolve the page body from ``--body`` / ``--body-file`` (mutually exclusive)."""
+    if args.body is not None and args.body_file is not None:
+        print(
+            "Error: --body and --body-file are mutually exclusive; pass only one.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if args.body_file is not None:
+        try:
+            with open(args.body_file, encoding="utf-8") as fh:
+                return fh.read()
+        except OSError as e:
+            print(f"Error: could not read --body-file {args.body_file!r}: {e}",
+                  file=sys.stderr)
+            sys.exit(2)
+    return args.body
+
+
+def _typed_requested(args: argparse.Namespace) -> bool:
+    """True if the user supplied any typed-shape flag.
+
+    ``--title``/``--summary``/``--tags`` are shared between both shapes, so
+    they don't on their own decide the shape — only the typed-exclusive flags
+    in ``_TYPED_FLAGS`` do.
+    """
+    return _has_any_flag(args, _TYPED_FLAGS)
+
+
+def _legacy_requested(args: argparse.Namespace) -> bool:
+    """True if the user supplied any legacy key/value-shape flag."""
+    return _has_any_flag(args, _LEGACY_FLAGS)
+
+
+def _guard_shape_xor(args: argparse.Namespace) -> bool:
+    """Decide between typed and legacy shapes, mirroring the server XOR.
+
+    Returns True for the typed shape, False for legacy. Fails fast (exit 2)
+    if the user mixes typed and legacy flags, so the CLI never sends a mixed
+    payload the server would reject with a 422 on ``shape``.
+    """
+    typed = _typed_requested(args)
+    legacy = _legacy_requested(args)
+    if typed and legacy:
+        print(
+            "Error: cannot mix typed flags (--type/--slug/--body/--body-file/"
+            "--frontmatter) with legacy flags (--key/--value/--content/"
+            "--confidence). Use one shape. See SKILL.md.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    return typed
+
+
+def _deprecation_notice() -> None:
+    print(
+        "⚠ legacy key/value knowledge is deprecated; use --type/--slug/"
+        "--body. See SKILL.md.",
+        file=sys.stderr,
+    )
+
+
 def _build_value(args: argparse.Namespace) -> dict[str, Any]:
     """Assemble the canonical knowledge ``value`` dict from CLI flags.
 
@@ -104,6 +191,119 @@ def _build_value(args: argparse.Namespace) -> dict[str, Any]:
 def _default_scope(explicit: str | None) -> str:
     """Resolve the write scope: explicit flag → fillin default env → ``hive``."""
     return explicit or os.environ.get("SUPERPOS_KNOWLEDGE_FILLIN_SCOPE", "hive")
+
+
+async def _resolve_slug_to_id(
+    kclient: KnowledgeClient, *, type_: str | None, slug: str,
+) -> str:
+    """Resolve a typed page ``slug`` to its entry id for update-by-slug.
+
+    The update endpoint (PUT /knowledge/{entry}) is id-only — there is no
+    slug or PATCH route — so we list pages of the given type (newest first)
+    and match on the entry's ``slug`` field. ``--type`` is required alongside
+    ``--slug`` because the typed list endpoint is keyed by type.
+    """
+    if type_ is None:
+        print(
+            "Error: --type is required with --slug for update (slug is "
+            "resolved to an id via the typed list endpoint).",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    pages = await kclient.list_by_type(type_, limit=100)
+    matches = [
+        p for p in pages
+        if isinstance(p, dict) and p.get("slug") == slug
+    ]
+    if not matches:
+        print(
+            f"Error: no {type_} page found with slug {slug!r}.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if len(matches) > 1:
+        ids = ", ".join(str(p.get("id")) for p in matches)
+        print(
+            f"Error: {len(matches)} {type_} pages match slug {slug!r} "
+            f"(ids: {ids}); refusing to guess. Update by --id instead.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    entry_id = matches[0].get("id")
+    if not entry_id:
+        print(
+            f"Error: resolved {type_} page for slug {slug!r} has no id.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    return str(entry_id)
+
+
+async def _run_typed_create(kclient: KnowledgeClient, args: argparse.Namespace) -> None:
+    """Create a typed wiki page via KnowledgeClient.create_page."""
+    if not args.type:
+        print("Error: --type is required for a typed create.", file=sys.stderr)
+        sys.exit(2)
+    if not args.slug:
+        print("Error: --slug is required for a typed create.", file=sys.stderr)
+        sys.exit(2)
+    body = _resolve_body(args)
+    if body is None:
+        print(
+            "Error: a typed create needs a body (--body or --body-file).",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    frontmatter = _parse_json_arg("frontmatter", args.frontmatter)
+    # Fail fast on the one server invariant worth pre-checking: entity pages
+    # require frontmatter.kind. (Other types are validated server-side.)
+    if args.type == "entity" and not (frontmatter or {}).get("kind"):
+        print(
+            "Error: --type entity requires frontmatter.kind, e.g. "
+            "--frontmatter '{\"kind\": \"service\"}'.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    _print(await kclient.create_page(
+        type=args.type,
+        slug=args.slug,
+        body=body,
+        frontmatter=frontmatter,
+        title=args.title,
+        summary=args.summary,
+        tags=_split_tags(args.tags),
+        scope=_default_scope(args.scope),
+        visibility=args.visibility or "public",
+    ))
+
+
+async def _run_typed_update(kclient: KnowledgeClient, args: argparse.Namespace) -> None:
+    """Update a typed wiki page via KnowledgeClient.update_page.
+
+    Accepts ``--id`` (direct) or ``--slug`` (resolved to an id first, since
+    PUT is id-only).
+    """
+    if args.id:
+        entry_id = args.id
+    elif args.slug:
+        entry_id = await _resolve_slug_to_id(kclient, type_=args.type, slug=args.slug)
+    else:
+        print(
+            "Error: typed update needs --id or --slug to identify the page.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    body = _resolve_body(args)
+    frontmatter = _parse_json_arg("frontmatter", args.frontmatter)
+    _print(await kclient.update_page(
+        entry_id,
+        body=body,
+        frontmatter=frontmatter,
+        title=args.title,
+        summary=args.summary,
+        tags=_split_tags(args.tags),
+        visibility=args.visibility,
+    ))
 
 
 async def _run(args: argparse.Namespace) -> int:
@@ -151,6 +351,19 @@ async def _run(args: argparse.Namespace) -> int:
             _print(await client.knowledge_decisions())
 
         elif args.cmd == "create":
+            if _guard_shape_xor(args):
+                await _run_typed_create(KnowledgeClient(client), args)
+                return 0
+            # Legacy key/value path (deprecated).
+            _deprecation_notice()
+            if not args.key:
+                print("Error: --key is required for a legacy create.",
+                      file=sys.stderr)
+                return 2
+            if not args.content:
+                print("Error: --content is required for a legacy create.",
+                      file=sys.stderr)
+                return 2
             _print(await client.create_knowledge(
                 key=args.key,
                 value=_build_value(args),
@@ -160,6 +373,18 @@ async def _run(args: argparse.Namespace) -> int:
             ))
 
         elif args.cmd == "update":
+            if _guard_shape_xor(args) or args.id is not None or args.slug is not None:
+                await _run_typed_update(KnowledgeClient(client), args)
+                return 0
+            # Legacy key/value path (deprecated).
+            _deprecation_notice()
+            if not args.entry_id:
+                print(
+                    "Error: legacy update needs a positional entry_id "
+                    "(or use --id/--slug for a typed update).",
+                    file=sys.stderr,
+                )
+                return 2
             has_individual_flags = any(
                 getattr(args, f, None) is not None
                 for f in ("title", "summary", "content", "tags", "confidence")
@@ -194,28 +419,68 @@ async def _run(args: argparse.Namespace) -> int:
         await client.close()
 
 
-def _add_value_flags(p: argparse.ArgumentParser, *, require_content: bool) -> None:
-    """Shared value-shaping flags for create/update."""
+def _add_value_flags(p: argparse.ArgumentParser) -> None:
+    """Shared flags for create/update, covering both shapes.
+
+    ``--content`` is no longer ``required`` at the argparse level: the handler
+    enforces it only for the legacy path, since a typed create uses
+    ``--body``/``--body-file`` instead. Flags fall into three groups:
+
+    - Typed shape: ``--type``, ``--slug``, ``--body``, ``--body-file``,
+      ``--frontmatter`` → KnowledgeClient.create_page / update_page.
+    - Legacy shape (deprecated): ``--key`` (create only), ``--content``,
+      ``--value``, ``--confidence``.
+    - Shared: ``--title``, ``--summary``, ``--tags``, ``--visibility``,
+      ``--ttl`` (legacy only), ``--scope``.
+    """
+    # ── typed shape ──
     p.add_argument(
-        "--content", required=require_content,
-        help="Entry body. Prefer the shape 'Rule: …  Why: …  How to apply: …'",
+        "--type", choices=list(_KNOWLEDGE_TYPES),
+        help="Typed page type (entity, topic, trend, source_page, log, "
+             "procedure). Routes through the typed wiki API.",
     )
+    p.add_argument(
+        "--slug",
+        help="Stable typed-page slug (regex ^[A-Za-z0-9:_\\-.]+$). Required "
+             "with --type on create; resolves to an id on update.",
+    )
+    p.add_argument("--body", help="Typed page body (Markdown).")
+    p.add_argument(
+        "--body-file", dest="body_file",
+        help="Read the typed page body from a file (mutually exclusive with "
+             "--body).",
+    )
+    p.add_argument(
+        "--frontmatter",
+        help="Typed page frontmatter as a JSON object string. "
+             "(--type entity requires frontmatter.kind.)",
+    )
+    # ── legacy shape (deprecated) ──
+    p.add_argument(
+        "--content",
+        help="[legacy] Entry body. Prefer --body. "
+             "Shape: 'Rule: …  Why: …  How to apply: …'",
+    )
+    p.add_argument(
+        "--confidence", choices=["high", "medium", "low"],
+        help="[legacy] Confidence level for this entry",
+    )
+    p.add_argument(
+        "--value",
+        help="[legacy] Raw JSON object for the full value (escape hatch; "
+             "structured flags override fields on top of it)",
+    )
+    # ── shared ──
     p.add_argument("--title", help="Short headline for the entry")
     p.add_argument("--summary", help="One-line summary (shown in search results)")
     p.add_argument("--tags", help="Comma-separated tags")
     p.add_argument(
-        "--confidence", choices=["high", "medium", "low"],
-        help="Confidence level for this entry",
-    )
-    p.add_argument(
         "--visibility", choices=["public", "private"],
         help="Override visibility (defaults server-side by scope)",
     )
-    p.add_argument("--ttl", help="ISO8601 expiry timestamp (entry auto-expires after)")
     p.add_argument(
-        "--value",
-        help="Raw JSON object for the full value (escape hatch; structured "
-             "flags override fields on top of it)",
+        "--ttl",
+        help="[legacy] ISO8601 expiry timestamp (entry auto-expires after)",
     )
 
 
@@ -276,22 +541,42 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # create
     p_create = sub.add_parser(
-        "create", help="Record a new lasting knowledge entry (bounded write)",
+        "create",
+        help="Record a new knowledge entry — typed (--type/--slug/--body) "
+             "or legacy (--key/--content, deprecated)",
     )
-    p_create.add_argument("--key", required=True, help="Stable key, e.g. 'decisions:eventbus-unification'")
+    p_create.add_argument(
+        "--key",
+        help="[legacy] Stable key, e.g. 'decisions:eventbus-unification'. "
+             "Use --type/--slug for typed pages.",
+    )
     p_create.add_argument(
         "--scope",
         help="Scope (default: SUPERPOS_KNOWLEDGE_FILLIN_SCOPE env or 'hive'). "
              "Org scope needs the knowledge.write_organization permission.",
     )
-    _add_value_flags(p_create, require_content=True)
+    _add_value_flags(p_create)
 
     # update
     p_update = sub.add_parser(
-        "update", help="Replace an existing entry's value (bumps version)",
+        "update",
+        help="Update an existing entry — typed (--id or --type+--slug) "
+             "or legacy (positional entry_id, deprecated)",
     )
-    p_update.add_argument("entry_id", help="Knowledge entry ULID to update")
-    _add_value_flags(p_update, require_content=False)
+    p_update.add_argument(
+        "entry_id", nargs="?",
+        help="[legacy] Knowledge entry ULID to update. Use --id for a "
+             "typed update, or --type+--slug to resolve by slug.",
+    )
+    p_update.add_argument(
+        "--id", dest="id",
+        help="Typed page entry id to update directly (PUT is id-only).",
+    )
+    p_update.add_argument(
+        "--scope",
+        help="[unused on update] Scope is immutable after create.",
+    )
+    _add_value_flags(p_update)
 
     return parser
 

@@ -14,9 +14,16 @@ from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 
 from superpos_agent_core import bundled_modules_dir
+
+
+def _set_env(monkeypatch):
+    monkeypatch.setenv("SUPERPOS_BASE_URL", "http://fake")
+    monkeypatch.setenv("SUPERPOS_HIVE_ID", "hive1")
+    monkeypatch.setenv("SUPERPOS_API_TOKEN", "tok")
 
 _SCRIPT = (
     Path(bundled_modules_dir())
@@ -38,6 +45,10 @@ def _ns(**kw) -> argparse.Namespace:
     base = dict(
         value=None, title=None, summary=None, content=None,
         tags=None, confidence=None,
+        # typed-shape attrs
+        type=None, slug=None, body=None, body_file=None, frontmatter=None,
+        id=None, visibility=None, ttl=None, scope=None, key=None,
+        entry_id=None,
     )
     base.update(kw)
     return argparse.Namespace(**base)
@@ -95,14 +106,22 @@ def test_default_scope_precedence(monkeypatch):
     assert mod._default_scope(None) == "hive"                     # final default
 
 
-def test_parser_create_requires_key_and_content():
+def test_parser_create_accepts_legacy_and_typed_flags():
     mod = _load_script()
     parser = mod._build_parser()
-    with pytest.raises(SystemExit):
-        parser.parse_args(["create"])  # missing --key and --content
-    # valid create parses
+    # Requiredness for key/content is enforced in the handler (so the typed
+    # shape can omit them), not at the argparse level — so a bare `create`
+    # now parses without error.
+    args = parser.parse_args(["create"])
+    assert args.cmd == "create" and args.key is None and args.content is None
+    # legacy create parses
     args = parser.parse_args(["create", "--key", "k", "--content", "c"])
     assert args.cmd == "create" and args.key == "k" and args.content == "c"
+    # typed create parses
+    args = parser.parse_args([
+        "create", "--type", "topic", "--slug", "topic:x", "--body", "b",
+    ])
+    assert args.type == "topic" and args.slug == "topic:x" and args.body == "b"
 
 
 def test_parser_update_takes_entry_id_and_optional_content():
@@ -259,3 +278,268 @@ async def test_update_value_with_flag_overrides_still_merges(monkeypatch):
     # Provenance metadata stamped
     assert sent_value["metadata"]["source"] == "agent_inline"
     assert sent_value["metadata"]["auto_generated"] is True
+
+
+# ── pure helper tests (typed shape) ───────────────────────────────────
+
+
+def test_resolve_body_reads_body_file(tmp_path):
+    mod = _load_script()
+    f = tmp_path / "page.md"
+    f.write_text("# Hello\n\nbody", encoding="utf-8")
+    assert mod._resolve_body(_ns(body_file=str(f))) == "# Hello\n\nbody"
+    assert mod._resolve_body(_ns(body="inline")) == "inline"
+    assert mod._resolve_body(_ns()) is None
+
+
+def test_resolve_body_rejects_both(capsys):
+    mod = _load_script()
+    with pytest.raises(SystemExit):
+        mod._resolve_body(_ns(body="x", body_file="y"))
+    assert "mutually exclusive" in capsys.readouterr().err
+
+
+def test_parse_json_arg_bad_json_exits(capsys):
+    mod = _load_script()
+    with pytest.raises(SystemExit):
+        mod._parse_json_arg("frontmatter", "{not json")
+    assert "must be valid JSON" in capsys.readouterr().err
+
+
+def test_guard_shape_xor_rejects_mixed(capsys):
+    mod = _load_script()
+    with pytest.raises(SystemExit):
+        mod._guard_shape_xor(_ns(type="topic", key="k"))
+    assert "cannot mix" in capsys.readouterr().err
+    # pure typed → True, pure legacy → False
+    assert mod._guard_shape_xor(_ns(type="topic", slug="topic:x", body="b")) is True
+    assert mod._guard_shape_xor(_ns(key="k", content="c")) is False
+
+
+# ── routing tests ─────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_typed_create_routes_to_create_page(monkeypatch):
+    mod = _load_script()
+    _set_env(monkeypatch)
+    mock_create = AsyncMock(return_value={"id": "kxe_1", "type": "topic"})
+    with patch.object(mod.KnowledgeClient, "create_page", mock_create), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        args = mod._build_parser().parse_args([
+            "create", "--type", "topic", "--slug", "topic:x",
+            "--body", "# body", "--summary", "s", "--title", "T",
+            "--tags", "a, b", "--frontmatter", '{"status": "ok"}',
+        ])
+        args.sort = None
+        rc = await mod._run(args)
+
+    assert rc == 0
+    kw = mock_create.call_args.kwargs
+    assert kw["type"] == "topic"
+    assert kw["slug"] == "topic:x"
+    assert kw["body"] == "# body"
+    assert kw["summary"] == "s"
+    assert kw["title"] == "T"
+    assert kw["tags"] == ["a", "b"]
+    assert kw["frontmatter"] == {"status": "ok"}
+
+
+@pytest.mark.asyncio
+async def test_typed_create_body_file(monkeypatch, tmp_path):
+    mod = _load_script()
+    _set_env(monkeypatch)
+    f = tmp_path / "p.md"
+    f.write_text("from file", encoding="utf-8")
+    mock_create = AsyncMock(return_value={"id": "kxe_1"})
+    with patch.object(mod.KnowledgeClient, "create_page", mock_create), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        args = mod._build_parser().parse_args([
+            "create", "--type", "topic", "--slug", "topic:x",
+            "--body-file", str(f),
+        ])
+        args.sort = None
+        await mod._run(args)
+    assert mock_create.call_args.kwargs["body"] == "from file"
+
+
+@pytest.mark.asyncio
+async def test_typed_create_bad_frontmatter_json_errors(monkeypatch):
+    mod = _load_script()
+    _set_env(monkeypatch)
+    mock_create = AsyncMock()
+    with patch.object(mod.KnowledgeClient, "create_page", mock_create), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        args = mod._build_parser().parse_args([
+            "create", "--type", "topic", "--slug", "topic:x",
+            "--body", "b", "--frontmatter", "{bad",
+        ])
+        args.sort = None
+        with pytest.raises(SystemExit):
+            await mod._run(args)
+    mock_create.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_typed_create_entity_requires_kind(monkeypatch):
+    mod = _load_script()
+    _set_env(monkeypatch)
+    mock_create = AsyncMock()
+    with patch.object(mod.KnowledgeClient, "create_page", mock_create), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        args = mod._build_parser().parse_args([
+            "create", "--type", "entity", "--slug", "entity:x", "--body", "b",
+        ])
+        args.sort = None
+        with pytest.raises(SystemExit):
+            await mod._run(args)
+    mock_create.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_legacy_create_routes_to_create_knowledge_with_deprecation(
+    monkeypatch, capsys,
+):
+    mod = _load_script()
+    _set_env(monkeypatch)
+    mock_create = AsyncMock(return_value={"id": "01ABC"})
+    mock_kpage = AsyncMock()
+    with patch.object(mod.SuperposClient, "create_knowledge", mock_create), \
+         patch.object(mod.KnowledgeClient, "create_page", mock_kpage), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        args = mod._build_parser().parse_args([
+            "create", "--key", "decisions:x", "--content", "Rule: y",
+        ])
+        args.sort = None
+        rc = await mod._run(args)
+
+    assert rc == 0
+    mock_create.assert_called_once()
+    mock_kpage.assert_not_called()
+    assert "deprecated" in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
+async def test_create_mixing_typed_and_legacy_errors_no_call(monkeypatch):
+    mod = _load_script()
+    _set_env(monkeypatch)
+    mock_create_k = AsyncMock()
+    mock_create_page = AsyncMock()
+    with patch.object(mod.SuperposClient, "create_knowledge", mock_create_k), \
+         patch.object(mod.KnowledgeClient, "create_page", mock_create_page), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        args = mod._build_parser().parse_args([
+            "create", "--type", "topic", "--slug", "topic:x",
+            "--body", "b", "--key", "k",
+        ])
+        args.sort = None
+        with pytest.raises(SystemExit):
+            await mod._run(args)
+    mock_create_k.assert_not_called()
+    mock_create_page.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_typed_update_by_id_routes_to_update_page(monkeypatch):
+    mod = _load_script()
+    _set_env(monkeypatch)
+    mock_update = AsyncMock(return_value={"id": "kxe_1", "version": 2})
+    mock_list = AsyncMock()
+    with patch.object(mod.KnowledgeClient, "update_page", mock_update), \
+         patch.object(mod.KnowledgeClient, "list_by_type", mock_list), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        args = mod._build_parser().parse_args([
+            "update", "--id", "kxe_1", "--body", "new", "--summary", "s",
+        ])
+        args.sort = None
+        rc = await mod._run(args)
+
+    assert rc == 0
+    mock_list.assert_not_called()  # id given → no slug resolution
+    assert mock_update.call_args.args[0] == "kxe_1"
+    kw = mock_update.call_args.kwargs
+    assert kw["body"] == "new"
+    assert kw["summary"] == "s"
+
+
+@pytest.mark.asyncio
+async def test_typed_update_by_slug_resolves_then_updates(monkeypatch):
+    mod = _load_script()
+    _set_env(monkeypatch)
+    mock_list = AsyncMock(return_value=[
+        {"id": "kxe_other", "slug": "topic:other"},
+        {"id": "kxe_match", "slug": "proposal-knowledge-wiki"},
+    ])
+    mock_update = AsyncMock(return_value={"id": "kxe_match", "version": 5})
+    with patch.object(mod.KnowledgeClient, "list_by_type", mock_list), \
+         patch.object(mod.KnowledgeClient, "update_page", mock_update), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        args = mod._build_parser().parse_args([
+            "update", "--type", "topic", "--slug", "proposal-knowledge-wiki",
+            "--summary", "refreshed",
+        ])
+        args.sort = None
+        rc = await mod._run(args)
+
+    assert rc == 0
+    mock_list.assert_called_once_with("topic", limit=100)
+    assert mock_update.call_args.args[0] == "kxe_match"
+    assert mock_update.call_args.kwargs["summary"] == "refreshed"
+
+
+@pytest.mark.asyncio
+async def test_typed_update_slug_without_type_errors(monkeypatch):
+    mod = _load_script()
+    _set_env(monkeypatch)
+    mock_update = AsyncMock()
+    with patch.object(mod.KnowledgeClient, "update_page", mock_update), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        args = mod._build_parser().parse_args([
+            "update", "--slug", "proposal-knowledge-wiki", "--summary", "x",
+        ])
+        args.sort = None
+        with pytest.raises(SystemExit):
+            await mod._run(args)
+    mock_update.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_typed_update_slug_no_match_errors(monkeypatch):
+    mod = _load_script()
+    _set_env(monkeypatch)
+    mock_list = AsyncMock(return_value=[{"id": "a", "slug": "topic:other"}])
+    mock_update = AsyncMock()
+    with patch.object(mod.KnowledgeClient, "list_by_type", mock_list), \
+         patch.object(mod.KnowledgeClient, "update_page", mock_update), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        args = mod._build_parser().parse_args([
+            "update", "--type", "topic", "--slug", "nope", "--summary", "x",
+        ])
+        args.sort = None
+        with pytest.raises(SystemExit):
+            await mod._run(args)
+    mock_update.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_typed_create_422_propagates_server_message(monkeypatch, capsys):
+    """A server 422 (bad shape / frontmatter) surfaces as an HTTPStatusError
+    whose message reaches the user (asyncio.run re-raises out of main)."""
+    mod = _load_script()
+    _set_env(monkeypatch)
+
+    request = httpx.Request("POST", "http://fake/knowledge")
+    response = httpx.Response(
+        422, request=request,
+        json={"errors": [{"field": "frontmatter", "message": "kind required"}]},
+    )
+    err = httpx.HTTPStatusError("422", request=request, response=response)
+    mock_create = AsyncMock(side_effect=err)
+    with patch.object(mod.KnowledgeClient, "create_page", mock_create), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        args = mod._build_parser().parse_args([
+            "create", "--type", "topic", "--slug", "topic:x", "--body", "b",
+        ])
+        args.sort = None
+        with pytest.raises(httpx.HTTPStatusError):
+            await mod._run(args)
