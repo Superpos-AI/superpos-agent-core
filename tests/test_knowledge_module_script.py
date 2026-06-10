@@ -1303,3 +1303,120 @@ async def test_typed_create_422_propagates_server_message(monkeypatch, capsys):
         args.sort = None
         with pytest.raises(httpx.HTTPStatusError):
             await mod._run(args)
+
+# ── Typed-page read subcommands (AG-2) ──────────────────────────────────────
+
+
+def _env_for_run(monkeypatch):
+    """Common env setup for run-path tests in this section."""
+    monkeypatch.setenv("SUPERPOS_BASE_URL", "http://fake")
+    monkeypatch.setenv("SUPERPOS_HIVE_ID", "hive1")
+    monkeypatch.setenv("SUPERPOS_API_TOKEN", "tok")
+
+
+@pytest.mark.asyncio
+async def test_get_by_slug_routes_to_get_knowledge_by_slug(monkeypatch):
+    """`get-by-slug <slug>` must call get_knowledge_by_slug with the slug."""
+    mod = _load_script()
+    _env_for_run(monkeypatch)
+    mock = AsyncMock(return_value={"id": "01ABC", "slug": "proposal-x", "type": "topic"})
+    mock_close = AsyncMock()
+    with patch.object(mod.SuperposClient, "get_knowledge_by_slug", mock), \
+         patch.object(mod.SuperposClient, "close", mock_close):
+        args = mod._build_parser().parse_args(["get-by-slug", "proposal-x"])
+        args.sort = None
+        await mod._run(args)
+    mock.assert_awaited_once_with("proposal-x")
+
+
+@pytest.mark.asyncio
+async def test_get_by_slug_missing_slug_errors_to_stderr_exit_2(monkeypatch, capsys):
+    """When the search hop finds no candidate, get_knowledge_by_slug raises
+    ValueError; the CLI must catch it, print `Error: ...` to stderr, and
+    return 2 instead of letting the traceback escape."""
+    mod = _load_script()
+    _env_for_run(monkeypatch)
+    mock = AsyncMock(side_effect=ValueError("no knowledge entry found for slug 'missing'"))
+    mock_close = AsyncMock()
+    with patch.object(mod.SuperposClient, "get_knowledge_by_slug", mock), \
+         patch.object(mod.SuperposClient, "close", mock_close):
+        args = mod._build_parser().parse_args(["get-by-slug", "missing"])
+        args.sort = None
+        rc = await mod._run(args)
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "Error: no knowledge entry found for slug 'missing'" in err
+    mock.assert_awaited_once_with("missing")
+
+
+def test_parser_get_by_slug_requires_slug_arg():
+    """`get-by-slug` without a positional slug must exit 2."""
+    mod = _load_script()
+    parser = mod._build_parser()
+    with pytest.raises(SystemExit) as exc:
+        parser.parse_args(["get-by-slug"])
+    assert exc.value.code == 2
+
+
+@pytest.mark.asyncio
+async def test_list_by_type_routes_to_list_knowledge_by_type(monkeypatch):
+    """`list-by-type <type> --limit N` must forward both type and limit."""
+    mod = _load_script()
+    _env_for_run(monkeypatch)
+    mock = AsyncMock(return_value=[{"id": "01ABC", "type": "topic"}])
+    mock_close = AsyncMock()
+    with patch.object(mod.SuperposClient, "list_knowledge_by_type", mock), \
+         patch.object(mod.SuperposClient, "close", mock_close):
+        args = mod._build_parser().parse_args(["list-by-type", "topic", "--limit", "7"])
+        args.sort = None
+        await mod._run(args)
+    mock.assert_awaited_once_with("topic", limit=7)
+
+
+def test_parser_list_by_type_requires_type_arg():
+    """`list-by-type` without a positional type must exit 2."""
+    mod = _load_script()
+    parser = mod._build_parser()
+    with pytest.raises(SystemExit) as exc:
+        parser.parse_args(["list-by-type"])
+    assert exc.value.code == 2
+
+
+@pytest.mark.asyncio
+async def test_list_by_type_rejects_unknown_type(monkeypatch):
+    """Unknown type values are rejected at parse/run time, before any network call."""
+    mod = _load_script()
+    _env_for_run(monkeypatch)
+    mock = AsyncMock()
+    mock_close = AsyncMock()
+    with patch.object(mod.SuperposClient, "list_knowledge_by_type", mock), \
+         patch.object(mod.SuperposClient, "close", mock_close):
+        args = mod._build_parser().parse_args(["list-by-type", "bogus"])
+        args.sort = None
+        rc = await mod._run(args)
+    assert rc == 2
+    mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_backlinks_routes_to_list_knowledge_backlinks(monkeypatch):
+    """`backlinks <entry_id>` must call list_knowledge_backlinks with the ULID."""
+    mod = _load_script()
+    _env_for_run(monkeypatch)
+    mock = AsyncMock(return_value=[{"slug": "proposal-x", "id": "01ABC"}])
+    mock_close = AsyncMock()
+    with patch.object(mod.SuperposClient, "list_knowledge_backlinks", mock), \
+         patch.object(mod.SuperposClient, "close", mock_close):
+        args = mod._build_parser().parse_args(["backlinks", "01TARGET"])
+        args.sort = None
+        await mod._run(args)
+    mock.assert_awaited_once_with("01TARGET")
+
+
+def test_parser_backlinks_requires_entry_id_arg():
+    """`backlinks` without a positional entry_id must exit 2."""
+    mod = _load_script()
+    parser = mod._build_parser()
+    with pytest.raises(SystemExit) as exc:
+        parser.parse_args(["backlinks"])
+    assert exc.value.code == 2

@@ -2,7 +2,8 @@
 """CLI wrapper around superpos_agent_core.SuperposClient knowledge methods.
 
 Subcommands mirror the client API:
-  search, get, list, graph, topics, decisions   (read)
+  search, get, get-by-slug, list, list-by-type,  (read)
+  graph, topics, decisions, backlinks
   create, update                                 (bounded write)
 
 Prints JSON to stdout, errors to stderr.  Designed for the LLM to call
@@ -30,6 +31,11 @@ from superpos_agent_core import BaseConfig, KnowledgeClient, SuperposClient
 # frontmatter validation is per-type; `entity` additionally requires
 # `frontmatter.kind`).
 _KNOWLEDGE_TYPES = ("entity", "topic", "trend", "source_page", "log", "procedure")
+# AG-2 (PR #34) introduced the name `_KNOWLEDGE_PAGE_TYPES` for the same set;
+# main's fix series renamed the canonical constant to `_KNOWLEDGE_TYPES`. Keep
+# the AG-2 name working as an alias so both the typed-page help text and the
+# ``list-by-type`` validation resolve without further conflict.
+_KNOWLEDGE_PAGE_TYPES = frozenset(_KNOWLEDGE_TYPES)
 
 # Typed-shape flags. Presence of any of these (on create/update) routes the
 # command through KnowledgeClient.create_page / update_page instead of the
@@ -462,6 +468,14 @@ async def _run(args: argparse.Namespace) -> int:
         elif args.cmd == "get":
             _print(await client.get_knowledge(args.entry_id))
 
+        elif args.cmd == "get-by-slug":
+            try:
+                out = await client.get_knowledge_by_slug(args.slug)
+            except ValueError as e:
+                print(f"Error: {e}", file=sys.stderr)
+                return 2
+            _print(out)
+
         elif args.cmd == "list":
             _print(await client.list_knowledge(
                 key=args.key,
@@ -470,6 +484,18 @@ async def _run(args: argparse.Namespace) -> int:
                 stale_days=args.stale_days,
                 sort=args.sort,
                 limit=args.limit,
+            ))
+
+        elif args.cmd == "list-by-type":
+            if args.type not in _KNOWLEDGE_PAGE_TYPES:
+                print(
+                    f"Error: --type {args.type!r} is not a known page type. "
+                    f"Valid types: {', '.join(sorted(_KNOWLEDGE_PAGE_TYPES))}.",
+                    file=sys.stderr,
+                )
+                return 2
+            _print(await client.list_knowledge_by_type(
+                args.type, limit=args.limit,
             ))
 
         elif args.cmd == "graph":
@@ -485,6 +511,9 @@ async def _run(args: argparse.Namespace) -> int:
 
         elif args.cmd == "decisions":
             _print(await client.knowledge_decisions())
+
+        elif args.cmd == "backlinks":
+            _print(await client.list_knowledge_backlinks(args.entry_id))
 
         elif args.cmd == "create":
             if _guard_shape_xor(args):
@@ -661,6 +690,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p_get = sub.add_parser("get", help="Fetch a single entry by ID")
     p_get.add_argument("entry_id", help="Knowledge entry ULID")
 
+    # get-by-slug
+    p_get_slug = sub.add_parser(
+        "get-by-slug", help="Fetch a single entry by slug (typed-page lookup)",
+    )
+    p_get_slug.add_argument(
+        "slug", help="Entry slug, e.g. 'proposal-knowledge-wiki'",
+    )
+
     # list
     p_list = sub.add_parser("list", help="Browse entries with filters")
     p_list.add_argument("--key", help="Key pattern (* wildcard)")
@@ -673,6 +710,22 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Sort order — currently only least-read is supported server-side",
     )
     p_list.add_argument("--limit", type=int, default=50, help="Default 50, server cap 100")
+
+    # list-by-type
+    p_list_type = sub.add_parser(
+        "list-by-type",
+        help="List entries filtered by type (typed-page browse)",
+    )
+    p_list_type.add_argument(
+        "type",
+        help=(
+            "Page type: "
+            f"{', '.join(sorted(_KNOWLEDGE_PAGE_TYPES))}"
+        ),
+    )
+    p_list_type.add_argument(
+        "--limit", type=int, default=50, help="Max entries (default 50, server cap 100)",
+    )
 
     # graph
     p_graph = sub.add_parser("graph", help="BFS link traversal from an entry")
@@ -690,6 +743,50 @@ def _build_parser() -> argparse.ArgumentParser:
     # topics / decisions
     sub.add_parser("topics", help="Convenience index of topic clusters in this hive")
     sub.add_parser("decisions", help="Convenience index of recorded decisions")
+
+    # backlinks — typed-page hygiene
+    p_backlinks = sub.add_parser(
+        "backlinks", help="Show entries that link to this entry (by ULID)",
+    )
+    p_backlinks.add_argument(
+        "entry_id",
+        help=(
+            "Target entry ULID to find backlinks for. "
+            "Resolve a slug to a ULID first via `search <slug> --limit 1 | jq '.[0].id'`."
+        ),
+    )
+
+    # ── Typed-page flags (create & update) ──────────────────────────
+    def _add_typed_flags(p: argparse.ArgumentParser, *, slug_required: bool) -> None:
+        p.add_argument(
+            "--type",
+            help=(
+                "Page type for the typed create shape (TASK-297). "
+                "Mutually exclusive with --key. One of: "
+                f"{', '.join(sorted(_KNOWLEDGE_PAGE_TYPES))}."
+            ),
+        )
+        p.add_argument(
+            "--slug",
+            required=slug_required,
+            help="Stable slug for the typed page (e.g. 'proposal-knowledge-wiki'). "
+                 "Required when --type is set on create.",
+        )
+        p.add_argument("--body", help="Markdown body of the page (typed shape).")
+        p.add_argument(
+            "--body-file",
+            help="Path to a file containing the markdown body (mutually exclusive with --body).",
+        )
+        p.add_argument(
+            "--frontmatter",
+            help="JSON object string for the page frontmatter (e.g. "
+                 "'{\"summary\": \"...\"}').",
+        )
+        p.add_argument(
+            "--source-ids",
+            help="Comma-separated source entry ULIDs / agent IDs (curator audit trail). "
+                 "Defaults to SUPERPOS_AGENT_ID when set.",
+        )
 
     # create
     p_create = sub.add_parser(

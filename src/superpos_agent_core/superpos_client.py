@@ -458,6 +458,89 @@ class SuperposClient:
         data = resp.json()
         return data.get("data", data) if isinstance(data, dict) else data
 
+    async def get_knowledge_by_slug(self, slug: str) -> dict[str, Any]:
+        """Fetch a single entry by its stable human-readable slug.
+
+        There is no ``GET /knowledge/slug/{slug}`` route on the server, so
+        this is a two-hop over existing endpoints:
+
+        1. :meth:`search_knowledge` (``GET /knowledge/search``) resolves the
+           slug to an entry — we search with the slug as the query and require
+           a result whose ``slug`` field equals ``slug`` exactly. Because the
+           search is a relevance search over entry text, a non-exact candidate
+           may be unrelated, so we do not fall back to it.
+        2. :meth:`get_knowledge` (``GET /knowledge/{entry}``) fetches the full
+           entry by its ULID.
+
+        Raises :class:`ValueError` if the search returns no exact slug match or
+        the resolved candidate carries no ``id`` — a clear "not found" rather
+        than a delayed HTTP error or an unrelated relevance hit.
+        """
+        results = await self.search_knowledge(slug, limit=10)
+        match = next(
+            (
+                r for r in results
+                if isinstance(r, dict) and r.get("slug") == slug
+            ),
+            None,
+        )
+        if match is None:
+            raise ValueError(f"no knowledge entry found for slug {slug!r}")
+        entry_id = match.get("id") if isinstance(match, dict) else None
+        if not entry_id:
+            raise ValueError(
+                f"knowledge entry for slug {slug!r} has no id to fetch by",
+            )
+        return await self.get_knowledge(str(entry_id))
+
+    async def list_knowledge_by_type(
+        self,
+        type: str,
+        *,
+        limit: int | None = None,
+        offset: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """``GET /knowledge/types/{type}/list`` — list entries of a given type.
+
+        Hits the dedicated ``/types/{type}/list`` endpoint (handled by
+        ``KnowledgeController::listByType``), which validates ``type``
+        server-side against ``FrontmatterSchema::TYPES``.  The valid values
+        are ``entity``, ``topic``, ``trend``, ``source_page``, ``log``,
+        ``procedure`` — the script validates against that set before the
+        network round-trip.
+        """
+        hive = self._config.superpos_hive_id
+        params: dict[str, Any] = {}
+        if limit is not None:
+            params["limit"] = limit
+        if offset is not None:
+            params["offset"] = offset
+        resp = await self._request(
+            "GET",
+            f"/api/v1/hives/{hive}/knowledge/types/{type}/list",
+            params=params,
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def list_knowledge_backlinks(self, entry_id: str) -> list[dict[str, Any]]:
+        """``GET /knowledge/{entry}/backlinks`` — entries that link to this entry.
+
+        ``entry_id`` is a ULID (not a slug) — the server resolves the entry
+        by primary key.  To find the ULID for a given slug, do::
+
+            search <slug> --limit 1 | jq '.[0].id'
+
+        Inverse of wikilink resolution: surfaces typed pages whose body
+        (or frontmatter) contains ``[[<slug-of-entry>]]``.
+        """
+        hive = self._config.superpos_hive_id
+        resp = await self._request(
+            "GET", f"/api/v1/hives/{hive}/knowledge/{entry_id}/backlinks",
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
     async def get_knowledge_graph(
         self,
         entry_id: str,

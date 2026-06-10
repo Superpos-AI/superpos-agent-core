@@ -54,6 +54,15 @@ you want the full body.
 superpos-knowledge get 01HXYZ...
 ```
 
+### `superpos-knowledge get-by-slug <slug>`
+
+Fetch a single typed page by its stable slug.  Use this when you have the
+human-readable name (from a wikilink or proposal) rather than the ULID.
+
+```bash
+superpos-knowledge get-by-slug proposal-knowledge-wiki
+```
+
 ### `superpos-knowledge list`
 
 Browse entries with structured filters.  Useful for "find stale entries
@@ -72,6 +81,28 @@ Flags:
 - `--stale-days N` — entries not read in N days
 - `--sort least-read` — order by read-count ascending
 - `--limit N` — default 50, server cap 100
+
+### `superpos-knowledge list-by-type <type>`
+
+List typed pages of a given type.  Valid types: `entity`, `topic`,
+`trend`, `source_page`, `log`, `procedure`.  Unknown types are rejected
+at parse time (no network round-trip).
+
+```bash
+superpos-knowledge list-by-type topic --limit 10
+superpos-knowledge list-by-type source_page --limit 50
+```
+
+### `superpos-knowledge backlinks <entry_id>`
+
+Find what links TO a given page (inverse of wikilink resolution) — useful
+for tracing which entries reference a page in the typed-page graph:
+
+```bash
+# The argument is the target entry's ULID — resolve a slug to one with:
+#   superpos-knowledge search <slug> --limit 1 | jq '.[0].id'
+superpos-knowledge backlinks 01HXYZ...
+```
 
 ### `superpos-knowledge graph <entry_id>`
 

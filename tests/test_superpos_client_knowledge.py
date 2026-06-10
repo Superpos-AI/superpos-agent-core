@@ -334,3 +334,133 @@ async def test_unwrap_handles_responses_without_data_envelope():
     out = await client.search_knowledge("x")
     assert out == [{"id": "raw"}]
     await client.close()
+
+
+# ── Typed-page list_by_type / backlinks URL shapes ──────────────────────
+#
+# AG-2 originally wired these to the wrong URLs (verified by probing the
+# live server — see PR #35).  These tests pin the correct shapes:
+#   list-by-type → GET /knowledge/types/{type}/list  (NOT /knowledge?type=)
+#   backlinks    → GET /knowledge/{entry}/backlinks  (NOT /knowledge/backlinks/{slug})
+# The /knowledge?type= query-param is silently ignored on the index endpoint.
+
+
+async def test_list_knowledge_by_type_hits_types_list_endpoint():
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return _envelope([{"id": "k1", "type": "topic"}], meta={"total": 1, "type": "topic"})
+
+    client = _make_client(handler)
+    out = await client.list_knowledge_by_type("topic", limit=10)
+
+    assert len(captured) == 1
+    req = captured[0]
+    assert req.method == "GET"
+    # Correct URL: literal /types/{type}/list, NOT /knowledge?type=topic
+    assert req.url.path == "/api/v1/hives/hive-x/knowledge/types/topic/list"
+    # And the type is in the path, not the query string
+    assert "type" not in req.url.params
+    assert req.url.params["limit"] == "10"
+    assert out == [{"id": "k1", "type": "topic"}]
+    await client.close()
+
+
+async def test_list_knowledge_backlinks_hits_entry_backlinks_endpoint():
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return _envelope([{"slug": "proposal-x", "id": "01OTHER"}], meta={"total": 1})
+
+    client = _make_client(handler)
+    out = await client.list_knowledge_backlinks("01TARGET")
+
+    assert len(captured) == 1
+    req = captured[0]
+    assert req.method == "GET"
+    # Correct URL: per-entry sub-resource, NOT /knowledge/backlinks/{slug}
+    assert req.url.path == "/api/v1/hives/hive-x/knowledge/01TARGET/backlinks"
+    assert out == [{"slug": "proposal-x", "id": "01OTHER"}]
+    await client.close()
+
+
+# ── get_knowledge_by_slug — search → get two-hop ─────────────────────────
+#
+# There is no GET /knowledge/slug/{slug} route on the server, so the client
+# resolves the slug via the search endpoint, then fetches the full entry by
+# its ULID.  These tests pin that two-hop and assert it NEVER requests the
+# non-existent /knowledge/slug/... path.
+
+
+async def test_get_knowledge_by_slug_searches_then_gets_by_id():
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        if request.url.path.endswith("/knowledge/search"):
+            # Return two candidates; the exact-slug match is NOT first to
+            # prove the selection prefers an exact slug over result order.
+            return _envelope(
+                [
+                    {"id": "01NEAR", "slug": "proposal-knowledge-wiki-v2"},
+                    {"id": "01EXACT", "slug": "proposal-knowledge-wiki"},
+                ],
+                meta={"total": 2},
+            )
+        return _envelope(
+            {"id": "01EXACT", "slug": "proposal-knowledge-wiki", "value": {"x": 1}},
+        )
+
+    client = _make_client(handler)
+    out = await client.get_knowledge_by_slug("proposal-knowledge-wiki")
+
+    # Two hops: search first, then get-by-id — and never the slug route.
+    assert len(captured) == 2
+    assert captured[0].method == "GET"
+    assert captured[0].url.path == "/api/v1/hives/hive-x/knowledge/search"
+    assert captured[0].url.params["q"] == "proposal-knowledge-wiki"
+    # Exact-slug match wins: the second hop fetches 01EXACT, not 01NEAR.
+    assert captured[1].method == "GET"
+    assert captured[1].url.path == "/api/v1/hives/hive-x/knowledge/01EXACT"
+    # The non-existent slug route is never requested.
+    assert all("/knowledge/slug/" not in req.url.path for req in captured)
+    assert out == {"id": "01EXACT", "slug": "proposal-knowledge-wiki", "value": {"x": 1}}
+    await client.close()
+
+
+async def test_get_knowledge_by_slug_raises_when_no_exact_match():
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        if request.url.path.endswith("/knowledge/search"):
+            # Relevance search returns candidates, but NONE has the exact
+            # slug — get-by-slug must NOT fall back to an unrelated hit.
+            return _envelope(
+                [
+                    {"id": "01FIRST", "slug": "other-page"},
+                    {"id": "01SECOND", "slug": "another-page"},
+                ],
+            )
+        return _envelope({"id": "01FIRST", "slug": "other-page"})
+
+    client = _make_client(handler)
+    with pytest.raises(ValueError, match="no knowledge entry found for slug"):
+        await client.get_knowledge_by_slug("missing-exact")
+
+    # Only the search hop ran — no get-by-id fetch of an unrelated entry.
+    assert len(captured) == 1
+    assert captured[0].url.path == "/api/v1/hives/hive-x/knowledge/search"
+    await client.close()
+
+
+async def test_get_knowledge_by_slug_raises_when_no_results():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _envelope([])
+
+    client = _make_client(handler)
+    with pytest.raises(ValueError, match="no knowledge entry found for slug"):
+        await client.get_knowledge_by_slug("nope")
+    await client.close()
