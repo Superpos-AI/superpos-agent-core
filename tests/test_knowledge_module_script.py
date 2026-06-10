@@ -494,6 +494,118 @@ async def test_create_legacy_rejects_typed_only_flags(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_create_typed_rejects_empty_body_with_body_file(monkeypatch, tmp_path):
+    """An explicit empty --body alongside --body-file must be rejected by mutual
+    exclusion (exit 2), not silently drop --body-file. Regression: the presence
+    check uses `is not None`, so a falsy empty string still counts as supplied."""
+    mod = _load_script()
+    body_file = tmp_path / "page.md"
+    body_file.write_text("# From file", encoding="utf-8")
+
+    mock_create_page = AsyncMock()
+    mock_close = AsyncMock()
+
+    monkeypatch.setenv("SUPERPOS_BASE_URL", "http://fake")
+    monkeypatch.setenv("SUPERPOS_HIVE_ID", "hive1")
+    monkeypatch.setenv("SUPERPOS_API_TOKEN", "tok")
+
+    with patch.object(mod.SuperposClient, "create_knowledge_page", mock_create_page), \
+         patch.object(mod.SuperposClient, "close", mock_close):
+        args = mod._build_parser().parse_args([
+            "create", "--type", "topic", "--slug", "s",
+            "--body", "", "--body-file", str(body_file),
+        ])
+        args.sort = None
+        with pytest.raises(SystemExit) as exc:
+            await mod._run(args)
+    assert exc.value.code == 2
+    mock_create_page.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_rejects_empty_body_with_body_file(monkeypatch, tmp_path):
+    """The update path shares _resolve_body, so an explicit empty --body with
+    --body-file must also be rejected (exit 2) and never hit the network."""
+    mod = _load_script()
+    body_file = tmp_path / "page.md"
+    body_file.write_text("# From file", encoding="utf-8")
+
+    mock_update_page = AsyncMock()
+    mock_close = AsyncMock()
+
+    monkeypatch.setenv("SUPERPOS_BASE_URL", "http://fake")
+    monkeypatch.setenv("SUPERPOS_HIVE_ID", "hive1")
+    monkeypatch.setenv("SUPERPOS_API_TOKEN", "tok")
+
+    with patch.object(mod.SuperposClient, "update_knowledge_page", mock_update_page), \
+         patch.object(mod.SuperposClient, "close", mock_close):
+        args = mod._build_parser().parse_args([
+            "update", "01ENTRY",
+            "--body", "", "--body-file", str(body_file),
+        ])
+        args.sort = None
+        with pytest.raises(SystemExit) as exc:
+            await mod._run(args)
+    assert exc.value.code == 2
+    mock_update_page.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_create_legacy_rejects_empty_string_typed_only_flag(monkeypatch):
+    """A legacy (--key) create with an explicit empty typed-only flag
+    (`--body ""`) must be rejected (exit 2), not silently dropped."""
+    mod = _load_script()
+
+    mock_create_page = AsyncMock()
+    mock_create_legacy = AsyncMock()
+    mock_close = AsyncMock()
+
+    monkeypatch.setenv("SUPERPOS_BASE_URL", "http://fake")
+    monkeypatch.setenv("SUPERPOS_HIVE_ID", "hive1")
+    monkeypatch.setenv("SUPERPOS_API_TOKEN", "tok")
+
+    with patch.object(mod.SuperposClient, "create_knowledge_page", mock_create_page), \
+         patch.object(mod.SuperposClient, "create_knowledge", mock_create_legacy), \
+         patch.object(mod.SuperposClient, "close", mock_close):
+        args = mod._build_parser().parse_args([
+            "create", "--key", "k", "--content", "c", "--body", "",
+        ])
+        args.sort = None
+        rc = await mod._run(args)
+    assert rc == 2
+    mock_create_legacy.assert_not_called()
+    mock_create_page.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_create_typed_rejects_empty_string_legacy_only_flag(monkeypatch):
+    """A typed (--type) create with an explicit empty legacy-only flag
+    (`--content ""`) must be rejected (exit 2), not silently dropped."""
+    mod = _load_script()
+
+    mock_create_page = AsyncMock()
+    mock_create_legacy = AsyncMock()
+    mock_close = AsyncMock()
+
+    monkeypatch.setenv("SUPERPOS_BASE_URL", "http://fake")
+    monkeypatch.setenv("SUPERPOS_HIVE_ID", "hive1")
+    monkeypatch.setenv("SUPERPOS_API_TOKEN", "tok")
+
+    with patch.object(mod.SuperposClient, "create_knowledge_page", mock_create_page), \
+         patch.object(mod.SuperposClient, "create_knowledge", mock_create_legacy), \
+         patch.object(mod.SuperposClient, "close", mock_close):
+        args = mod._build_parser().parse_args([
+            "create", "--type", "topic", "--slug", "s", "--body", "b",
+            "--content", "",
+        ])
+        args.sort = None
+        rc = await mod._run(args)
+    assert rc == 2
+    mock_create_page.assert_not_called()
+    mock_create_legacy.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_create_typed_with_frontmatter_parses_json(monkeypatch):
     mod = _load_script()
 

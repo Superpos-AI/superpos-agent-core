@@ -118,7 +118,7 @@ def _resolve_body(body: str | None, body_file: str | None) -> str | None:
 
     Exactly one of the two must be supplied on a typed create.
     """
-    if body and body_file:
+    if body is not None and body_file is not None:
         print("Error: pass either --body or --body-file, not both.", file=sys.stderr)
         sys.exit(2)
     if body is not None:
@@ -264,7 +264,7 @@ async def _run(args: argparse.Namespace) -> int:
                         ("--content", args.content),
                         ("--value", args.value),
                         ("--confidence", args.confidence),
-                    ) if val
+                    ) if val is not None
                 ]
                 if legacy_only:
                     print(
@@ -289,7 +289,7 @@ async def _run(args: argparse.Namespace) -> int:
                         ("--body-file", args.body_file),
                         ("--frontmatter", args.frontmatter),
                         ("--source-ids", args.source_ids),
-                    ) if val
+                    ) if val is not None
                 ]
                 if typed_only:
                     print(
