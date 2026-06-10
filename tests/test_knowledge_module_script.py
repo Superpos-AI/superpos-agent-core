@@ -539,6 +539,51 @@ async def test_typed_update_slug_without_type_errors(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_typed_update_visibility_only_errors(monkeypatch):
+    """``update --id ... --visibility private`` with no content field must fail
+    fast and send nothing — the server rejects a visibility-only typed update
+    (visibility isn't a typed/legacy/source update field)."""
+    mod = _load_script()
+    _set_env(monkeypatch)
+    mock_update = AsyncMock()
+    mock_list = AsyncMock()
+    with patch.object(mod.KnowledgeClient, "update_page", mock_update), \
+         patch.object(mod.KnowledgeClient, "list_by_type", mock_list), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        args = mod._build_parser().parse_args([
+            "update", "--id", "kxe_1", "--visibility", "private",
+        ])
+        args.sort = None
+        with pytest.raises(SystemExit):
+            await mod._run(args)
+    mock_update.assert_not_called()
+    mock_list.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_typed_update_visibility_with_content_routes_to_update_page(monkeypatch):
+    """``--visibility`` alongside a content field is fine — the guard only
+    blocks the visibility-only case, so visibility is still forwarded."""
+    mod = _load_script()
+    _set_env(monkeypatch)
+    mock_update = AsyncMock(return_value={"id": "kxe_1", "version": 3})
+    with patch.object(mod.KnowledgeClient, "update_page", mock_update), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        args = mod._build_parser().parse_args([
+            "update", "--id", "kxe_1", "--visibility", "private",
+            "--body", "new body",
+        ])
+        args.sort = None
+        rc = await mod._run(args)
+
+    assert rc == 0
+    assert mock_update.call_args.args[0] == "kxe_1"
+    kw = mock_update.call_args.kwargs
+    assert kw["visibility"] == "private"
+    assert kw["body"] == "new body"
+
+
+@pytest.mark.asyncio
 async def test_typed_update_slug_no_match_errors(monkeypatch):
     mod = _load_script()
     _set_env(monkeypatch)

@@ -302,13 +302,32 @@ async def _run_typed_update(kclient: KnowledgeClient, args: argparse.Namespace) 
         sys.exit(2)
     body = _resolve_body(args)
     frontmatter = _parse_json_arg("frontmatter", args.frontmatter)
+    tags = _split_tags(args.tags)
+    # The server's UpdateKnowledgeRequest does not treat `visibility` as a
+    # typed/legacy/source update field, so a payload of only {"visibility": …}
+    # fails server-side validation ("value required"). --id/--slug/--type are
+    # selectors/routing, not content, so reject the visibility-only case
+    # before any API call: --visibility must accompany a real content field.
+    has_content = any(
+        v is not None for v in (
+            body, frontmatter, args.title, args.summary, tags,
+        )
+    )
+    if args.visibility is not None and not has_content:
+        print(
+            "Error: --visibility cannot be the only updated field on a typed "
+            "update; it must accompany at least one of --body/--body-file/"
+            "--frontmatter/--title/--summary/--tags.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
     _print(await kclient.update_page(
         entry_id,
         body=body,
         frontmatter=frontmatter,
         title=args.title,
         summary=args.summary,
-        tags=_split_tags(args.tags),
+        tags=tags,
         visibility=args.visibility,
     ))
 

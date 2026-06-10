@@ -155,6 +155,10 @@ Typed flags (create & update):
 - `--summary` — top-level one-line summary (max 500 chars; not folded into
   frontmatter)
 - `--title`, `--tags a,b,c`, `--visibility public|private`
+  - On **update**, `--visibility` cannot be the only field — the server
+    rejects a visibility-only typed update, so it must accompany at least one
+    content field (`--body`/`--body-file`/`--frontmatter`/`--title`/
+    `--summary`/`--tags`). On create, visibility-with-content is fine.
 - create-only: `--scope` (defaults to `SUPERPOS_KNOWLEDGE_FILLIN_SCOPE`
   env or `hive`; org scope needs `knowledge.write_organization`; scope is
   immutable after create)
