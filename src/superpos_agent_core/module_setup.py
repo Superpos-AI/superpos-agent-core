@@ -300,8 +300,8 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # Beat 2b: only touch the registry when the flag is on (default OFF →
-    # zero registry calls, identical to today's baked-in path).
+    # Beat 2b: only touch the registry when the flag is on (default ON; an
+    # explicit-false flag → zero registry calls, identical to baked-in path).
     from .registry_overlay import feature_enabled
 
     # Fetch the resolved set whenever the flag is on — NOT conditioned on
