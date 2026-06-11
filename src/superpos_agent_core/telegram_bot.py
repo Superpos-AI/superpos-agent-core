@@ -10,7 +10,8 @@ import signal
 import subprocess
 
 import httpx
-from telegram import Update
+from telegram import Message, Update
+from telegram.constants import ChatType
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -20,13 +21,36 @@ from telegram.ext import (
 )
 
 from .config import BaseConfig
-from .executor import Executor, ExecutionRequest
+from .executor import Executor, ExecutionRequest, chat_key
 from .runtime_config import RuntimeConfig
 
 log = logging.getLogger(__name__)
 
 # Matches "PR #123", "#123", "pr #123", "PR#123", etc.
 _PR_REF_RE = re.compile(r"(?:PR\s*)?#(\d+)", re.IGNORECASE)
+
+
+def resolve_topic_thread(
+    message: Message, bound_thread_id: int | None,
+) -> tuple[bool, int | None]:
+    """Topic-scope an incoming message; return ``(in_scope, thread_id)``.
+
+    ``thread_id`` is the forum topic the message was posted in, or None
+    for DMs, plain groups, and a forum's General topic (replies in plain
+    groups also carry ``message_thread_id``, so it only counts when
+    ``is_topic_message`` is set).
+
+    When the agent is bound to a topic (``bound_thread_id``), group
+    messages outside that topic are out of scope — several agents can
+    then share one forum group with a topic each.  DMs always stay in
+    scope so the operator can reach a bound agent directly.
+    """
+    thread_id = message.message_thread_id if message.is_topic_message else None
+    if bound_thread_id is None:
+        return True, thread_id
+    if message.chat.type == ChatType.PRIVATE:
+        return True, None
+    return thread_id == bound_thread_id, thread_id
 
 
 async def _resolve_pr_branch(pr_number: int, repo_dir: str) -> str | None:
@@ -99,43 +123,66 @@ async def run_telegram_bot(
     """Start the bot using non-blocking polling (compatible with asyncio.gather)."""
 
     allowed = set(config.telegram_allowed_users)
+    bound_thread = config.telegram_thread_id
     known_models = type(runtime).KNOWN_MODELS
     effort_levels = type(runtime).EFFORT_LEVELS
 
     def is_allowed(user_id: int) -> bool:
         return not allowed or user_id in allowed
 
-    async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    def gate(update: Update) -> tuple[bool, int | None]:
+        """Allowlist + topic-scope check; returns ``(handle, thread_id)``.
+
+        Every handler runs through this so commands and messages agree on
+        which topic a conversation belongs to.
+        """
         if not update.effective_user or not is_allowed(update.effective_user.id):
+            log.warning("Unauthorized user %s attempted access", update.effective_user)
+            return False, None
+        message = update.effective_message
+        if message is None:
+            return False, None
+        in_scope, thread_id = resolve_topic_thread(message, bound_thread)
+        if not in_scope:
+            log.debug(
+                "Ignoring message outside bound topic %s (chat=%s, thread=%s)",
+                bound_thread, message.chat_id, thread_id,
+            )
+        return in_scope, thread_id
+
+    async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not gate(update)[0]:
             return
         await update.message.reply_text(
             f"Hi! Send me any message and I'll process it with {config.executor_kind}."
         )
 
     async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not update.effective_user or not is_allowed(update.effective_user.id):
+        if not gate(update)[0]:
             return
         await update.message.reply_text(f"Queue depth: {executor.pending}")
 
     async def cmd_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not update.effective_user or not is_allowed(update.effective_user.id):
+        in_scope, thread_id = gate(update)
+        if not in_scope:
             return
-        executor.clear_session(update.effective_chat.id)
+        executor.clear_session(chat_key(update.effective_chat.id, thread_id))
         await update.message.reply_text(
             "Session cleared. Next message starts a fresh conversation."
         )
 
     async def cmd_restart(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not update.effective_user or not is_allowed(update.effective_user.id):
+        if not gate(update)[0]:
             return
         await update.message.reply_text("Restarting...")
         log.info("Restart requested by user %s — sending SIGTERM", update.effective_user.id)
         os.kill(os.getpid(), signal.SIGTERM)
 
     async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        """Cancel any in-flight work for this chat.
+        """Cancel any in-flight work for this chat (or forum topic).
 
-        Targets only the calling chat — other chats keep running.  This
+        Targets only the calling conversation — other chats and topics
+        keep running.  This
         is the kill-switch for "the agent went off the rails on the
         thing it's doing right now"; use ``/restart`` for a full reboot
         or ``/new`` to start a fresh conversation without interrupting
@@ -155,7 +202,8 @@ async def run_telegram_bot(
            ``is_busy`` is global, so claiming "this chat's executor
            doesn't support cancellation" based on it is misleading.
         """
-        if not update.effective_user or not is_allowed(update.effective_user.id):
+        in_scope, thread_id = gate(update)
+        if not in_scope:
             return
         # CommandHandler reprocesses edited commands, and on edit updates
         # update.message is None while update.effective_message is the
@@ -164,12 +212,12 @@ async def run_telegram_bot(
         reply_target = update.effective_message
         if reply_target is None:
             return
-        chat_id = update.effective_chat.id
-        cancelled = executor.cancel_chat(chat_id)
+        key = chat_key(update.effective_chat.id, thread_id)
+        cancelled = executor.cancel_chat(key)
         if cancelled:
             log.info(
                 "Cancelled %d in-flight task(s) for chat %s via /stop",
-                cancelled, chat_id,
+                cancelled, key,
             )
             plural = "tasks" if cancelled != 1 else "task"
             await reply_target.reply_text(
@@ -192,7 +240,7 @@ async def run_telegram_bot(
         await reply_target.reply_text(message)
 
     async def cmd_cleanup(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not update.effective_user or not is_allowed(update.effective_user.id):
+        if not gate(update)[0]:
             return
         counts = await asyncio.to_thread(executor.cleanup_stale_sessions, 24)
         freed_mb = counts.get("bytes_freed", 0) / (1024 * 1024)
@@ -204,7 +252,7 @@ async def run_telegram_bot(
         )
 
     async def cmd_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not update.effective_user or not is_allowed(update.effective_user.id):
+        if not gate(update)[0]:
             return
         args = ctx.args or []
         if not args:
@@ -234,7 +282,7 @@ async def run_telegram_bot(
         )
 
     async def cmd_effort(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not update.effective_user or not is_allowed(update.effective_user.id):
+        if not gate(update)[0]:
             return
         args = ctx.args or []
         if not args:
@@ -257,8 +305,8 @@ async def run_telegram_bot(
         )
 
     async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not update.effective_user or not is_allowed(update.effective_user.id):
-            log.warning("Unauthorized user %s attempted access", update.effective_user)
+        in_scope, thread_id = gate(update)
+        if not in_scope:
             return
         if not update.message or not update.message.text:
             return
@@ -282,17 +330,20 @@ async def run_telegram_bot(
             chat_id=update.effective_chat.id,
             source="telegram",
             branch=branch,
+            thread_id=thread_id,
         )
         await executor.queue.put(req)
         log.info(
-            "Enqueued telegram message from user %s (queue=%d, branch=%s)",
+            "Enqueued telegram message from user %s (queue=%d, branch=%s, thread=%s)",
             update.effective_user.id,
             executor.pending,
             branch,
+            thread_id,
         )
 
     async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not update.effective_user or not is_allowed(update.effective_user.id):
+        in_scope, thread_id = gate(update)
+        if not in_scope:
             return
         if not update.message or not update.message.photo:
             return
@@ -316,6 +367,7 @@ async def run_telegram_bot(
             source="telegram",
             branch=branch,
             image_paths=[path],
+            thread_id=thread_id,
         )
         await executor.queue.put(req)
         log.info(
@@ -324,7 +376,8 @@ async def run_telegram_bot(
         )
 
     async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not update.effective_user or not is_allowed(update.effective_user.id):
+        in_scope, thread_id = gate(update)
+        if not in_scope:
             return
         if not update.message or not update.message.voice:
             return
@@ -347,6 +400,7 @@ async def run_telegram_bot(
             prompt=transcript,
             chat_id=update.effective_chat.id,
             source="telegram",
+            thread_id=thread_id,
         )
         await executor.queue.put(req)
         log.info(
@@ -355,7 +409,8 @@ async def run_telegram_bot(
         )
 
     async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not update.effective_user or not is_allowed(update.effective_user.id):
+        in_scope, thread_id = gate(update)
+        if not in_scope:
             return
         if not update.message or not update.message.document:
             return
@@ -386,6 +441,7 @@ async def run_telegram_bot(
             chat_id=update.effective_chat.id,
             source="telegram",
             branch=branch,
+            thread_id=thread_id,
         )
         await executor.queue.put(req)
         log.info(

@@ -14,6 +14,19 @@ import asyncio
 from dataclasses import dataclass
 
 
+def chat_key(chat_id: int | str, thread_id: int | None = None) -> str:
+    """Canonical key for per-conversation state (sessions, /stop tracking).
+
+    A Telegram forum topic is an independent conversation, so messages
+    carrying a ``thread_id`` get a composite ``"{chat_id}:{thread_id}"``
+    key.  Plain chats keep the bare ``str(chat_id)`` so existing stored
+    sessions keep resolving after an upgrade.
+    """
+    if thread_id is not None:
+        return f"{chat_id}:{thread_id}"
+    return str(chat_id)
+
+
 @dataclass
 class ExecutionRequest:
     """A single unit of work routed through the executor queue."""
@@ -24,6 +37,14 @@ class ExecutionRequest:
     superpos_task_id: str | None = None
     branch: str | None = None
     image_paths: list[str] | None = None
+    # Telegram forum topic the request originated from (message_thread_id).
+    # None for DMs, plain groups, and a forum's General topic.
+    thread_id: int | None = None
+
+    @property
+    def chat_key(self) -> str:
+        """Conversation-state key — see :func:`chat_key`."""
+        return chat_key(self.chat_id, self.thread_id)
 
 
 class Executor(abc.ABC):

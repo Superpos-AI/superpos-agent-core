@@ -11,8 +11,11 @@ Superpos ``/agents/me`` endpoint returns server-authoritative values for
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -40,6 +43,12 @@ class BaseConfig:
     telegram_bot_token: str = ""
     telegram_allowed_users: list[int] = field(default_factory=list)
     telegram_chat_id: str = ""
+    # Forum topic (message_thread_id) this agent is bound to ("" = unbound).
+    # When set, the agent only handles group messages posted in this topic
+    # (DMs still work) and sends its proactive notifications — Superpos
+    # task streams, disk alerts, permission warnings — into it, so several
+    # agents can share one forum group with a topic each.
+    telegram_topic_id: str = ""
 
     # ── Executor (LLM-agnostic) ───────────────────────────────────────
     executor_kind: str = "generic"  # subclasses set this: "claude", "codex", "gemini", …
@@ -109,6 +118,7 @@ class BaseConfig:
                 int(u.strip()) for u in allowed.split(",") if u.strip()
             ],
             telegram_chat_id=os.environ.get("TELEGRAM_CHAT_ID", ""),
+            telegram_topic_id=os.environ.get("TELEGRAM_TOPIC_ID", ""),
             executor_working_dir=working_dir,
             executor_worktree_isolation=worktree_isolation,
             executor_max_parallel=int(os.environ.get("EXECUTOR_MAX_PARALLEL", "3")),
@@ -135,6 +145,24 @@ class BaseConfig:
     @property
     def telegram_enabled(self) -> bool:
         return bool(self.telegram_bot_token)
+
+    @property
+    def telegram_thread_id(self) -> int | None:
+        """``telegram_topic_id`` as the int the Bot API expects, or None.
+
+        A non-numeric value is treated as unbound (with the misconfig
+        logged) rather than crashing the agent at startup.
+        """
+        if not self.telegram_topic_id:
+            return None
+        try:
+            return int(self.telegram_topic_id)
+        except ValueError:
+            log.warning(
+                "TELEGRAM_TOPIC_ID=%r is not numeric — ignoring topic binding",
+                self.telegram_topic_id,
+            )
+            return None
 
     def has_permission(self, permission: str) -> bool:
         """Check whether the agent has a given permission.

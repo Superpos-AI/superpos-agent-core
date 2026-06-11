@@ -84,11 +84,17 @@ class TelegramGateway:
         text: str,
         *,
         parse_mode: str | None = None,
+        message_thread_id: int | None = None,
         priority: Priority = Priority.HIGH,
     ) -> Any:
         return await self._submit(
             method="send_message",
-            kwargs={"chat_id": chat_id, "text": text, "parse_mode": parse_mode},
+            kwargs={
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": parse_mode,
+                "message_thread_id": message_thread_id,
+            },
             priority=priority,
         )
 
@@ -131,11 +137,16 @@ class TelegramGateway:
         chat_id: int | str,
         action: str,
         *,
+        message_thread_id: int | None = None,
         priority: Priority = Priority.NORMAL,
     ) -> Any:
         return await self._submit(
             method="send_chat_action",
-            kwargs={"chat_id": chat_id, "action": action},
+            kwargs={
+                "chat_id": chat_id,
+                "action": action,
+                "message_thread_id": message_thread_id,
+            },
             priority=priority,
         )
 
