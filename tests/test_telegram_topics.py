@@ -18,10 +18,12 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from telegram.constants import ChatType
+from telegram.ext import Application, CommandHandler
 
 from superpos_agent_core.config import BaseConfig
 from superpos_agent_core.executor import ExecutionRequest, chat_key
-from superpos_agent_core.telegram_bot import resolve_topic_thread
+from superpos_agent_core.runtime_config import RuntimeConfig
+from superpos_agent_core.telegram_bot import register_handlers, resolve_topic_thread
 from superpos_agent_core.telegram_gateway import TelegramGateway
 from superpos_agent_core.telegram_streamer import TelegramStreamer
 
@@ -189,3 +191,127 @@ async def test_gateway_omits_none_thread_id():
     bot = SimpleNamespace(send_message=AsyncMock(return_value="ok"))
     await _roundtrip_send(bot)
     assert "message_thread_id" not in bot.send_message.await_args.kwargs
+
+
+# ── /new and /stop migration fallback ─────────────────────────────────
+#
+# An executor that hasn't migrated to ``req.chat_key`` stores its session
+# and tracks its in-flight task under ``str(chat_id)``.  When /new or /stop
+# fires inside a forum topic, the bot addresses the composite "chat:thread"
+# key — so without a legacy fallback the clear/cancel silently misses the
+# un-migrated executor's state.  These tests pin the fallback behaviour.
+
+
+class _RecordingExecutor:
+    """Minimal executor stand-in recording which keys it was addressed by."""
+
+    def __init__(self, *, cancel_keys: set[str] | None = None) -> None:
+        self.cleared: list[str] = []
+        self.cancelled: list[str] = []
+        # Keys that have "in-flight work" — cancel_chat returns 1 for these.
+        self._cancel_keys = cancel_keys or set()
+        self._active = bool(self._cancel_keys)
+
+    def clear_session(self, key: str) -> None:
+        self.cleared.append(key)
+
+    def cancel_chat(self, key: str) -> int:
+        self.cancelled.append(key)
+        return 1 if key in self._cancel_keys else 0
+
+    @property
+    def is_busy(self) -> bool:
+        return self._active
+
+
+def _build_handlers(executor, *, bound_thread: int | None = None):
+    """Register handlers on a real Application and return them by command."""
+    config = BaseConfig(
+        telegram_bot_token="123:dummy",
+        telegram_topic_id=str(bound_thread) if bound_thread is not None else "",
+    )
+    runtime = RuntimeConfig(model="m", effort="medium", path="/tmp/rc.json")
+    app = Application.builder().token("123:dummy").build()
+    register_handlers(app, executor, config, runtime)
+    handlers: dict[str, object] = {}
+    for group in app.handlers.values():
+        for h in group:
+            if isinstance(h, CommandHandler):
+                for cmd in h.commands:
+                    handlers[cmd] = h.callback
+    return handlers
+
+
+def _command_update(*, chat_id: int = -100123, thread_id: int | None = None):
+    """Fake Update for a command, optionally inside a forum topic."""
+    reply = AsyncMock()
+    is_topic = thread_id is not None
+    message = SimpleNamespace(
+        chat=SimpleNamespace(type=ChatType.SUPERGROUP, id=chat_id),
+        chat_id=chat_id,
+        message_thread_id=thread_id,
+        is_topic_message=is_topic,
+        reply_text=reply,
+    )
+    return SimpleNamespace(
+        effective_user=SimpleNamespace(id=999),
+        effective_message=message,
+        effective_chat=SimpleNamespace(id=chat_id),
+        message=message,
+    )
+
+
+async def test_cmd_new_in_topic_clears_topic_and_legacy_keys():
+    ex = _RecordingExecutor()
+    handlers = _build_handlers(ex)
+    await handlers["new"](_command_update(thread_id=42), None)
+    # Both the composite topic key and the legacy str(chat_id) key are cleared
+    # so un-migrated executors (keyed by chat_id) also drop the session.
+    assert ex.cleared == ["-100123:42", "-100123"]
+
+
+async def test_cmd_new_plain_chat_clears_single_key():
+    ex = _RecordingExecutor()
+    handlers = _build_handlers(ex)
+    await handlers["new"](_command_update(thread_id=None), None)
+    # Plain chats collapse to one key — no redundant double-clear.
+    assert ex.cleared == ["-100123"]
+
+
+async def test_cmd_stop_in_topic_falls_back_to_legacy_key():
+    # Un-migrated executor: work is tracked under the bare chat_id.
+    ex = _RecordingExecutor(cancel_keys={"-100123"})
+    handlers = _build_handlers(ex)
+    update = _command_update(thread_id=42)
+    await handlers["stop"](update, None)
+    # Topic key tried first (miss), then legacy key (hit).
+    assert ex.cancelled == ["-100123:42", "-100123"]
+    reply = update.effective_message.reply_text
+    assert "Stopped 1" in reply.await_args.args[0]
+
+
+async def test_cmd_stop_in_topic_prefers_topic_key_for_migrated_executor():
+    # Migrated executor: work tracked under the composite key. The topic key
+    # cancels, so we must NOT also hit the legacy key (no double-cancel).
+    ex = _RecordingExecutor(cancel_keys={"-100123:42"})
+    handlers = _build_handlers(ex)
+    await handlers["stop"](_command_update(thread_id=42), None)
+    assert ex.cancelled == ["-100123:42"]
+
+
+async def test_cmd_stop_nothing_running_tries_both_keys_then_reports():
+    ex = _RecordingExecutor(cancel_keys=set())
+    handlers = _build_handlers(ex)
+    update = _command_update(thread_id=42)
+    await handlers["stop"](update, None)
+    # Both keys consulted; nothing cancelled anywhere.
+    assert ex.cancelled == ["-100123:42", "-100123"]
+    reply = update.effective_message.reply_text
+    assert "Nothing to stop" in reply.await_args.args[0]
+
+
+async def test_cmd_stop_plain_chat_consults_single_key():
+    ex = _RecordingExecutor(cancel_keys={"-100123"})
+    handlers = _build_handlers(ex)
+    await handlers["stop"](_command_update(thread_id=None), None)
+    assert ex.cancelled == ["-100123"]

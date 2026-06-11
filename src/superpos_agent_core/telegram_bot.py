@@ -114,13 +114,18 @@ def build_telegram_app(config: BaseConfig) -> Application:
     return Application.builder().token(config.telegram_bot_token).build()
 
 
-async def run_telegram_bot(
+def register_handlers(
     app: Application,
     executor: Executor,
     config: BaseConfig,
     runtime: RuntimeConfig,
 ) -> None:
-    """Start the bot using non-blocking polling (compatible with asyncio.gather)."""
+    """Wire all command/message handlers onto ``app``.
+
+    Split out from :func:`run_telegram_bot` so the handler logic (which
+    lives in closures over ``executor``/``config``) can be exercised in
+    tests without standing up polling or touching the network.
+    """
 
     allowed = set(config.telegram_allowed_users)
     bound_thread = config.telegram_thread_id
@@ -162,11 +167,34 @@ async def run_telegram_bot(
             return
         await update.message.reply_text(f"Queue depth: {executor.pending}")
 
+    def _session_keys(chat_id: int, thread_id: int | None) -> list[str]:
+        """Keys to address for clear/cancel, newest-contract first.
+
+        Returns the topic-scoped ``chat:thread`` key for forum messages,
+        plus the legacy ``str(chat_id)`` key as a migration fallback.  An
+        executor that has already switched to ``req.chat_key`` stores its
+        session/task under the composite key; one still on ``req.chat_id``
+        stores under the bare chat_id.  We don't know which an executor
+        uses, so we address both — otherwise ``/new`` and ``/stop`` in a
+        topic would silently miss un-migrated executors (their work keeps
+        running under ``str(chat_id)``).  For plain chats both keys are
+        identical, so this collapses to a single key.
+        """
+        keys = [chat_key(chat_id, thread_id)]
+        legacy = chat_key(chat_id)
+        if legacy not in keys:
+            keys.append(legacy)
+        return keys
+
     async def cmd_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         in_scope, thread_id = gate(update)
         if not in_scope:
             return
-        executor.clear_session(chat_key(update.effective_chat.id, thread_id))
+        # Clear under both the topic key and the legacy chat_id key so the
+        # session is dropped whether or not the executor has migrated to
+        # req.chat_key.  clear_session is a no-op for an unknown key.
+        for key in _session_keys(update.effective_chat.id, thread_id):
+            executor.clear_session(key)
         await update.message.reply_text(
             "Session cleared. Next message starts a fresh conversation."
         )
@@ -212,8 +240,19 @@ async def run_telegram_bot(
         reply_target = update.effective_message
         if reply_target is None:
             return
+        # Try the topic-scoped key first; if nothing was tracked there,
+        # fall back to the legacy str(chat_id) key so /stop still cancels
+        # work on executors that haven't migrated to req.chat_key.  We
+        # stop at the first key that cancels something to avoid an executor
+        # whose composite key happens to equal a plain chat_id being hit
+        # twice (plain chats collapse to one key anyway).
+        cancelled = 0
         key = chat_key(update.effective_chat.id, thread_id)
-        cancelled = executor.cancel_chat(key)
+        for candidate in _session_keys(update.effective_chat.id, thread_id):
+            cancelled = executor.cancel_chat(candidate)
+            if cancelled:
+                key = candidate
+                break
         if cancelled:
             log.info(
                 "Cancelled %d in-flight task(s) for chat %s via /stop",
@@ -461,6 +500,17 @@ async def run_telegram_bot(
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+
+
+async def run_telegram_bot(
+    app: Application,
+    executor: Executor,
+    config: BaseConfig,
+    runtime: RuntimeConfig,
+) -> None:
+    """Start the bot using non-blocking polling (compatible with asyncio.gather)."""
+
+    register_handlers(app, executor, config, runtime)
 
     await app.initialize()
     await app.start()
