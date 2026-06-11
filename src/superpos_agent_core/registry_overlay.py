@@ -8,11 +8,14 @@ skills.
 
 Design goals (from the proposal):
 
-- **Flag-gated, default OFF** — ``PLATFORM_REGISTRY_SERVE_SKILLS_MODULES``.
-  When off the agent's behaviour is *exactly* today's baked-in path:
-  zero registry calls, zero filesystem changes from this module.  This
-  is the instant-rollback guarantee — flip the flag off and the next
-  restart is back to baked-in.
+- **Flag-gated, default ON** — ``PLATFORM_REGISTRY_SERVE_SKILLS_MODULES``.
+  The overlay is on by default; agents fetch and overlay the
+  registry-served set without needing an explicit env override.  Setting
+  the flag to an explicit falsey value (``0``/``false``/``no``/``off``)
+  restores *exactly* today's baked-in path: zero registry calls, zero
+  filesystem changes from this module.  This is the instant-rollback
+  guarantee — set the flag explicitly false and the next restart is back
+  to baked-in.
 
 - **Overlay precedence** — a registry item wins over a baked-in one of
   the same slug (replace), while baked-in items absent from the registry
@@ -64,10 +67,11 @@ from .module_setup import symlink_module_scripts, update_agents_md
 log = logging.getLogger(__name__)
 
 
-#: Env var that gates the whole Beat 2b overlay.  OFF by default — this is
-#: the instant-rollback guarantee.  Accepts ``1``/``true``/``yes``/``on``
-#: (case-insensitive), matching the convention used elsewhere in the
-#: package (e.g. ``SUPERPOS_KNOWLEDGE_INJECT``).
+#: Env var that gates the whole Beat 2b overlay.  ON by default — agents
+#: overlay the registry-served set without needing an env override.  An
+#: explicit falsey value (``0``/``false``/``no``/``off``, case-insensitive)
+#: disables the overlay; this is the instant-rollback guarantee.  Truthy
+#: values (``1``/``true``/``yes``/``on``) and unset both enable it.
 FEATURE_FLAG_ENV = "PLATFORM_REGISTRY_SERVE_SKILLS_MODULES"
 
 #: Structured log record emitted when a module fails to install after the
@@ -98,15 +102,16 @@ _MODULE_INSTALL_BACKOFF_SECONDS = 0.5
 
 
 def feature_enabled(env: dict[str, str] | None = None) -> bool:
-    """Return True iff ``PLATFORM_REGISTRY_SERVE_SKILLS_MODULES`` is truthy.
+    """Return True unless ``PLATFORM_REGISTRY_SERVE_SKILLS_MODULES`` is falsey.
 
-    Anything other than ``1``/``true``/``yes``/``on`` — including unset —
-    disables the overlay, matching the proposal's "default OFF" rollback
-    requirement.
+    Default-ON: an unset / empty var enables the overlay.  Only an explicit
+    falsey value (``0``/``false``/``no``/``off``, case-insensitive and
+    whitespace-trimmed) disables it — this is the rollback path.  Truthy
+    values (``1``/``true``/``yes``/``on``) also enable it.
     """
     src = env if env is not None else os.environ
     value = (src.get(FEATURE_FLAG_ENV, "") or "").strip().lower()
-    return value in ("1", "true", "yes", "on")
+    return value not in ("0", "false", "no", "off")
 
 
 def _is_safe_slug(slug: str) -> bool:

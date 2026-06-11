@@ -79,18 +79,23 @@ def _agents_md(tmp_path: Path) -> Path:
     return p
 
 
-# ── Flag default-off / parsing ───────────────────────────────────────
+# ── Flag default-on / parsing ────────────────────────────────────────
 
 
-def test_flag_defaults_off():
-    assert feature_enabled({}) is False
-    assert feature_enabled({FEATURE_FLAG_ENV: ""}) is False
-    assert feature_enabled({FEATURE_FLAG_ENV: "false"}) is False
-    assert feature_enabled({FEATURE_FLAG_ENV: "0"}) is False
+def test_flag_defaults_on():
+    # Default-ON: unset / empty enables the overlay.
+    assert feature_enabled({}) is True
+    assert feature_enabled({FEATURE_FLAG_ENV: ""}) is True
+
+
+def test_flag_explicit_falsey_disables():
+    # The rollback path: only an explicit falsey value disables the overlay.
+    for v in ("0", "false", "FALSE", "no", "off", "  off  ", "Off"):
+        assert feature_enabled({FEATURE_FLAG_ENV: v}) is False
 
 
 def test_flag_truthy_values():
-    for v in ("1", "true", "TRUE", "yes", "on"):
+    for v in ("1", "true", "TRUE", "yes", "on", "  on  "):
         assert feature_enabled({FEATURE_FLAG_ENV: v}) is True
 
 
@@ -101,10 +106,10 @@ def test_flag_off_apply_overlay_is_noop(tmp_path: Path, monkeypatch):
     """Flag OFF → apply_registry_overlay touches nothing and reports skipped.
 
     This is the instant-rollback guarantee proof at the overlay level:
-    even handed a fully-populated payload, with the flag off nothing is
-    written.
+    even handed a fully-populated payload, with the flag explicitly off
+    nothing is written.
     """
-    monkeypatch.delenv(FEATURE_FLAG_ENV, raising=False)
+    monkeypatch.setenv(FEATURE_FLAG_ENV, "false")
     skills_dir = tmp_path / "skills"
     modules_dir = tmp_path / "modules"
 
@@ -122,9 +127,10 @@ def test_flag_off_apply_overlay_is_noop(tmp_path: Path, monkeypatch):
 def test_run_setup_flag_off_never_fetches_and_matches_baked_in(
     tmp_path: Path, monkeypatch
 ):
-    """run_setup with the flag OFF must not call the registry fetch and must
-    leave only baked-in modules in the doc — identical to today."""
-    monkeypatch.delenv(FEATURE_FLAG_ENV, raising=False)
+    """run_setup with the flag explicitly OFF must not call the registry
+    fetch and must leave only baked-in modules in the doc — identical to
+    today."""
+    monkeypatch.setenv(FEATURE_FLAG_ENV, "false")
 
     # Sentinel: if the overlay path ever fetches with the flag off, fail.
     called = {"fetch": False}
@@ -160,8 +166,8 @@ def test_run_setup_flag_off_doc_identical_with_and_without_payload(
 ):
     """The rendered module doc must be byte-identical whether or not a
     registry payload is supplied, proving the payload is fully inert when
-    the flag is off."""
-    monkeypatch.delenv(FEATURE_FLAG_ENV, raising=False)
+    the flag is explicitly off."""
+    monkeypatch.setenv(FEATURE_FLAG_ENV, "false")
 
     def _render(with_payload: bool) -> str:
         agents_md = tmp_path / f"CLAUDE_{with_payload}.md"
@@ -749,9 +755,9 @@ def test_cli_main_fetches_resolved_when_flag_on_without_skills_dir(
 
 
 def test_cli_main_does_not_fetch_when_flag_off(tmp_path: Path, monkeypatch):
-    """Flag OFF → CLI ``main()`` makes zero registry fetches regardless of
-    whether ``--skills-dir`` is passed."""
-    monkeypatch.delenv(FEATURE_FLAG_ENV, raising=False)
+    """Flag explicitly OFF → CLI ``main()`` makes zero registry fetches
+    regardless of whether ``--skills-dir`` is passed."""
+    monkeypatch.setenv(FEATURE_FLAG_ENV, "false")
     modules_dir = tmp_path / "modules"
     agents_md = _agents_md(tmp_path)
 
@@ -805,8 +811,8 @@ def test_flag_on_install_then_flag_off_restart_removes_registry_module(
     assert "registry-only-mod" in agents_md.read_text()
 
     # 2) Flag OFF — restart against the SAME dirs.  No payload (the CLI never
-    #    even fetches when the flag is off).
-    monkeypatch.delenv(FEATURE_FLAG_ENV, raising=False)
+    #    even fetches when the flag is off).  Explicit false = the rollback.
+    monkeypatch.setenv(FEATURE_FLAG_ENV, "false")
     module_setup.run_setup(
         str(modules_dir),
         str(agents_md),
@@ -851,7 +857,7 @@ def test_flag_off_rollback_preserves_bundled_and_hand_authored_modules(
     (reg / "scripts" / "reg-cli").write_text("#!/bin/sh\necho reg\n")
     (reg / REGISTRY_MANAGED_MARKER).write_text("")
 
-    monkeypatch.delenv(FEATURE_FLAG_ENV, raising=False)
+    monkeypatch.setenv(FEATURE_FLAG_ENV, "false")
     module_setup.run_setup(
         str(modules_dir), str(agents_md), bin_dir=str(bin_dir),
     )
