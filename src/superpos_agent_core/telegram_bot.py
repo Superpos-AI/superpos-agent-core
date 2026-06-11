@@ -129,6 +129,7 @@ def register_handlers(
 
     allowed = set(config.telegram_allowed_users)
     bound_thread = config.telegram_thread_id
+    legacy_session_keys = config.telegram_legacy_session_keys
     known_models = type(runtime).KNOWN_MODELS
     effort_levels = type(runtime).EFFORT_LEVELS
 
@@ -170,29 +171,35 @@ def register_handlers(
     def _session_keys(chat_id: int, thread_id: int | None) -> list[str]:
         """Keys to address for clear/cancel, newest-contract first.
 
-        Returns the topic-scoped ``chat:thread`` key for forum messages,
-        plus the legacy ``str(chat_id)`` key as a migration fallback.  An
-        executor that has already switched to ``req.chat_key`` stores its
-        session/task under the composite key; one still on ``req.chat_id``
-        stores under the bare chat_id.  We don't know which an executor
-        uses, so we address both — otherwise ``/new`` and ``/stop`` in a
-        topic would silently miss un-migrated executors (their work keeps
-        running under ``str(chat_id)``).  For plain chats both keys are
-        identical, so this collapses to a single key.
+        Always returns the topic-scoped ``chat:thread`` key for the calling
+        conversation.  An executor that has switched to ``req.chat_key``
+        stores its session/task under that composite key, so addressing it
+        keeps ``/new``/``/stop`` strictly topic-scoped.
+
+        Only when ``telegram_legacy_session_keys`` is enabled do we *also*
+        address the bare ``str(chat_id)`` key, as a migration bridge for an
+        executor still keyed on ``req.chat_id`` (whose topic work lives
+        under the bare chat_id).  This is opt-in because on a migrated
+        executor the bare key is the legitimate General/plain-chat session
+        for the same chat — addressing it from a topic command would clear
+        or cancel unrelated work there.  For plain chats the composite key
+        already *is* the bare key, so the list collapses to a single key
+        regardless of this flag.
         """
         keys = [chat_key(chat_id, thread_id)]
-        legacy = chat_key(chat_id)
-        if legacy not in keys:
-            keys.append(legacy)
+        if legacy_session_keys:
+            legacy = chat_key(chat_id)
+            if legacy not in keys:
+                keys.append(legacy)
         return keys
 
     async def cmd_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         in_scope, thread_id = gate(update)
         if not in_scope:
             return
-        # Clear under both the topic key and the legacy chat_id key so the
-        # session is dropped whether or not the executor has migrated to
-        # req.chat_key.  clear_session is a no-op for an unknown key.
+        # Clear the topic-scoped key (and, only when legacy mode is on, the
+        # bare chat_id key as a migration bridge).  clear_session is a no-op
+        # for an unknown key.
         for key in _session_keys(update.effective_chat.id, thread_id):
             executor.clear_session(key)
         await update.message.reply_text(
@@ -240,12 +247,11 @@ def register_handlers(
         reply_target = update.effective_message
         if reply_target is None:
             return
-        # Try the topic-scoped key first; if nothing was tracked there,
-        # fall back to the legacy str(chat_id) key so /stop still cancels
-        # work on executors that haven't migrated to req.chat_key.  We
-        # stop at the first key that cancels something to avoid an executor
-        # whose composite key happens to equal a plain chat_id being hit
-        # twice (plain chats collapse to one key anyway).
+        # Try the topic-scoped key first; only when legacy mode is enabled
+        # do we fall back to the bare str(chat_id) key so /stop still cancels
+        # work on executors that haven't migrated to req.chat_key.  We stop
+        # at the first key that cancels something so a migrated executor
+        # isn't double-cancelled (plain chats collapse to one key anyway).
         cancelled = 0
         key = chat_key(update.effective_chat.id, thread_id)
         for candidate in _session_keys(update.effective_chat.id, thread_id):

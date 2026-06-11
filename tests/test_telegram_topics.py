@@ -126,6 +126,20 @@ def test_topic_id_loaded_from_env(monkeypatch):
     assert BaseConfig.from_env().telegram_topic_id == "77"
 
 
+def test_legacy_session_keys_defaults_false():
+    assert BaseConfig().telegram_legacy_session_keys is False
+
+
+def test_legacy_session_keys_loaded_from_env(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_LEGACY_SESSION_KEYS", "true")
+    assert BaseConfig.from_env().telegram_legacy_session_keys is True
+
+
+def test_legacy_session_keys_env_falsey_stays_false(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_LEGACY_SESSION_KEYS", "no")
+    assert BaseConfig.from_env().telegram_legacy_session_keys is False
+
+
 # ── streamer routes output into the topic ─────────────────────────────
 
 
@@ -193,13 +207,19 @@ async def test_gateway_omits_none_thread_id():
     assert "message_thread_id" not in bot.send_message.await_args.kwargs
 
 
-# ── /new and /stop migration fallback ─────────────────────────────────
+# ── /new and /stop key scoping (strict default + legacy opt-in) ───────
 #
-# An executor that hasn't migrated to ``req.chat_key`` stores its session
-# and tracks its in-flight task under ``str(chat_id)``.  When /new or /stop
-# fires inside a forum topic, the bot addresses the composite "chat:thread"
-# key — so without a legacy fallback the clear/cancel silently misses the
-# un-migrated executor's state.  These tests pin the fallback behaviour.
+# By default, topic-scoped /new and /stop address ONLY the composite
+# "chat:thread" key, so they never touch the bare str(chat_id) session —
+# which, on a migrated executor, is the legitimate General/plain-chat
+# conversation for the same chat.
+#
+# An executor that hasn't migrated to ``req.chat_key`` instead stores its
+# session and tracks its in-flight task under ``str(chat_id)`` even inside a
+# topic.  For those, the operator opts in with
+# ``telegram_legacy_session_keys=True`` (env TELEGRAM_LEGACY_SESSION_KEYS),
+# which makes the bot also address the bare chat_id key as a migration
+# bridge.  These tests pin both modes.
 
 
 class _RecordingExecutor:
@@ -224,11 +244,14 @@ class _RecordingExecutor:
         return self._active
 
 
-def _build_handlers(executor, *, bound_thread: int | None = None):
+def _build_handlers(
+    executor, *, bound_thread: int | None = None, legacy_keys: bool = False
+):
     """Register handlers on a real Application and return them by command."""
     config = BaseConfig(
         telegram_bot_token="123:dummy",
         telegram_topic_id=str(bound_thread) if bound_thread is not None else "",
+        telegram_legacy_session_keys=legacy_keys,
     )
     runtime = RuntimeConfig(model="m", effort="medium", path="/tmp/rc.json")
     app = Application.builder().token("123:dummy").build()
@@ -261,12 +284,22 @@ def _command_update(*, chat_id: int = -100123, thread_id: int | None = None):
     )
 
 
-async def test_cmd_new_in_topic_clears_topic_and_legacy_keys():
+async def test_cmd_new_in_topic_clears_only_topic_key_by_default():
+    # Default (migrated executor): /new in a topic is strictly topic-scoped.
+    # The bare str(chat_id) key — the General/plain-chat session — is left
+    # untouched so unrelated work there isn't cleared.
     ex = _RecordingExecutor()
     handlers = _build_handlers(ex)
     await handlers["new"](_command_update(thread_id=42), None)
-    # Both the composite topic key and the legacy str(chat_id) key are cleared
-    # so un-migrated executors (keyed by chat_id) also drop the session.
+    assert ex.cleared == ["-100123:42"]
+
+
+async def test_cmd_new_in_topic_clears_legacy_key_when_enabled():
+    # Opt-in migration bridge: also clear the bare chat_id key so an
+    # un-migrated executor (keyed by chat_id) drops the session too.
+    ex = _RecordingExecutor()
+    handlers = _build_handlers(ex, legacy_keys=True)
+    await handlers["new"](_command_update(thread_id=42), None)
     assert ex.cleared == ["-100123:42", "-100123"]
 
 
@@ -278,10 +311,32 @@ async def test_cmd_new_plain_chat_clears_single_key():
     assert ex.cleared == ["-100123"]
 
 
-async def test_cmd_stop_in_topic_falls_back_to_legacy_key():
-    # Un-migrated executor: work is tracked under the bare chat_id.
+async def test_cmd_new_plain_chat_single_key_even_with_legacy_enabled():
+    # The legacy flag only affects topics; plain chats are identical either
+    # way (composite key already IS the bare key).
+    ex = _RecordingExecutor()
+    handlers = _build_handlers(ex, legacy_keys=True)
+    await handlers["new"](_command_update(thread_id=None), None)
+    assert ex.cleared == ["-100123"]
+
+
+async def test_cmd_stop_in_topic_only_consults_topic_key_by_default():
+    # Default: /stop in a topic must NOT fall back to the bare chat_id key,
+    # so it can never cancel the chat's separate General/plain-chat work.
     ex = _RecordingExecutor(cancel_keys={"-100123"})
     handlers = _build_handlers(ex)
+    update = _command_update(thread_id=42)
+    await handlers["stop"](update, None)
+    # Only the topic key is consulted; the bare-key work is left running.
+    assert ex.cancelled == ["-100123:42"]
+    reply = update.effective_message.reply_text
+    assert "Nothing to stop" in reply.await_args.args[0]
+
+
+async def test_cmd_stop_in_topic_falls_back_to_legacy_key_when_enabled():
+    # Opt-in: un-migrated executor tracks work under the bare chat_id.
+    ex = _RecordingExecutor(cancel_keys={"-100123"})
+    handlers = _build_handlers(ex, legacy_keys=True)
     update = _command_update(thread_id=42)
     await handlers["stop"](update, None)
     # Topic key tried first (miss), then legacy key (hit).
@@ -291,20 +346,21 @@ async def test_cmd_stop_in_topic_falls_back_to_legacy_key():
 
 
 async def test_cmd_stop_in_topic_prefers_topic_key_for_migrated_executor():
-    # Migrated executor: work tracked under the composite key. The topic key
-    # cancels, so we must NOT also hit the legacy key (no double-cancel).
+    # Even with legacy mode on, a migrated executor's work is tracked under
+    # the composite key.  The topic key cancels, so we must NOT also hit the
+    # legacy key (no double-cancel).
     ex = _RecordingExecutor(cancel_keys={"-100123:42"})
-    handlers = _build_handlers(ex)
+    handlers = _build_handlers(ex, legacy_keys=True)
     await handlers["stop"](_command_update(thread_id=42), None)
     assert ex.cancelled == ["-100123:42"]
 
 
 async def test_cmd_stop_nothing_running_tries_both_keys_then_reports():
+    # Legacy mode: both keys consulted; nothing cancelled anywhere.
     ex = _RecordingExecutor(cancel_keys=set())
-    handlers = _build_handlers(ex)
+    handlers = _build_handlers(ex, legacy_keys=True)
     update = _command_update(thread_id=42)
     await handlers["stop"](update, None)
-    # Both keys consulted; nothing cancelled anywhere.
     assert ex.cancelled == ["-100123:42", "-100123"]
     reply = update.effective_message.reply_text
     assert "Nothing to stop" in reply.await_args.args[0]

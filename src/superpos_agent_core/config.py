@@ -49,6 +49,16 @@ class BaseConfig:
     # task streams, disk alerts, permission warnings — into it, so several
     # agents can share one forum group with a topic each.
     telegram_topic_id: str = ""
+    # Migration bridge for topic-scoped /new and /stop.  When an executor
+    # has NOT yet switched its session/task keys from ``req.chat_id`` to
+    # ``req.chat_key``, its work in a forum topic is stored under the bare
+    # ``str(chat_id)`` instead of the composite ``chat:thread`` key, so a
+    # topic-scoped clear/cancel would silently miss it.  Set this to True
+    # for such un-migrated executors to also address the bare chat_id key.
+    # Leave False (default) on migrated executors: there the bare key is the
+    # legitimate General/plain-chat session, and addressing it from a topic
+    # command would clear/cancel unrelated work in that same chat.
+    telegram_legacy_session_keys: bool = False
 
     # ── Executor (LLM-agnostic) ───────────────────────────────────────
     executor_kind: str = "generic"  # subclasses set this: "claude", "codex", "gemini", …
@@ -119,6 +129,10 @@ class BaseConfig:
             ],
             telegram_chat_id=os.environ.get("TELEGRAM_CHAT_ID", ""),
             telegram_topic_id=os.environ.get("TELEGRAM_TOPIC_ID", ""),
+            telegram_legacy_session_keys=os.environ.get(
+                "TELEGRAM_LEGACY_SESSION_KEYS", "false"
+            ).lower()
+            in ("1", "true", "yes"),
             executor_working_dir=working_dir,
             executor_worktree_isolation=worktree_isolation,
             executor_max_parallel=int(os.environ.get("EXECUTOR_MAX_PARALLEL", "3")),
