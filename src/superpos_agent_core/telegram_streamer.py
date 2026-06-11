@@ -145,9 +145,17 @@ class TelegramStreamer:
     _FINISH_DRAIN_TIMEOUT = 30.0
     _ERROR_SEND_TIMEOUT = 5.0
 
-    def __init__(self, gateway: TelegramGateway | None, chat_id: int | str) -> None:
+    def __init__(
+        self,
+        gateway: TelegramGateway | None,
+        chat_id: int | str,
+        thread_id: int | None = None,
+    ) -> None:
         self._gateway = gateway
         self._chat_id = chat_id
+        # Forum topic (message_thread_id) all output lands in; None sends
+        # to the chat top-level as before.
+        self._thread_id = thread_id
         self._messages: list[int] = []
         self._buffer = ""
         self._last_edit: float = 0.0
@@ -176,7 +184,10 @@ class TelegramStreamer:
 
     async def _safe_chat_action(self) -> None:
         try:
-            await self._gateway.send_chat_action(self._chat_id, ChatAction.TYPING)
+            await self._gateway.send_chat_action(
+                self._chat_id, ChatAction.TYPING,
+                message_thread_id=self._thread_id,
+            )
         except Exception:
             pass
 
@@ -326,7 +337,10 @@ class TelegramStreamer:
         status_text = f"⏳ {self._status_description} ({elapsed})"
         try:
             if self._status_msg_id is None:
-                msg = await self._gateway.send_message(self._chat_id, status_text)
+                msg = await self._gateway.send_message(
+                    self._chat_id, status_text,
+                    message_thread_id=self._thread_id,
+                )
                 if msg is not None:
                     self._status_msg_id = msg.message_id
             else:
@@ -349,6 +363,7 @@ class TelegramStreamer:
             await asyncio.wait_for(
                 self._gateway.send_message(
                     self._chat_id, f"❌ {redact(error_text)}",
+                    message_thread_id=self._thread_id,
                 ),
                 timeout=self._ERROR_SEND_TIMEOUT,
             )
@@ -365,10 +380,14 @@ class TelegramStreamer:
                 self._chat_id,
                 md_to_telegram(text),
                 parse_mode=ParseMode.MARKDOWN_V2,
+                message_thread_id=self._thread_id,
             )
         except BadRequest:
             try:
-                return await self._gateway.send_message(self._chat_id, text)
+                return await self._gateway.send_message(
+                    self._chat_id, text,
+                    message_thread_id=self._thread_id,
+                )
             except Exception:
                 return None
 

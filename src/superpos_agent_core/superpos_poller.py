@@ -490,6 +490,7 @@ async def run_superpos_poller(
                         source="superpos",
                         superpos_task_id=task_id,
                         branch=branch,
+                        thread_id=config.telegram_thread_id,
                     )
                     await executor.queue.put(req)
                     log.info("Enqueued superpos task %s (queue=%d)", task_id, executor.pending)

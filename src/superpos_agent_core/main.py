@@ -88,7 +88,10 @@ async def _warn_missing_permissions(
     lines.append("Grant them in the Superpos dashboard and restart the agent.")
 
     try:
-        await gateway.send_message(config.telegram_chat_id, "\n".join(lines))
+        await gateway.send_message(
+            config.telegram_chat_id, "\n".join(lines),
+            message_thread_id=config.telegram_thread_id,
+        )
     except Exception:
         log.debug("Failed to send missing-permissions warning to Telegram", exc_info=True)
 
@@ -130,7 +133,10 @@ async def _monitor_disk(
                         f"free up disk on the host before the agent loses context."
                     )
                     try:
-                        await gateway.send_message(config.telegram_chat_id, msg)
+                        await gateway.send_message(
+                            config.telegram_chat_id, msg,
+                            message_thread_id=config.telegram_thread_id,
+                        )
                     except Exception:
                         log.debug("Failed to send disk warning", exc_info=True)
                 alerted = True
@@ -141,6 +147,7 @@ async def _monitor_disk(
                         await gateway.send_message(
                             config.telegram_chat_id,
                             f"✅ Agent disk recovered to {usage:.0%}.",
+                            message_thread_id=config.telegram_thread_id,
                         )
                     except Exception:
                         pass
