@@ -87,6 +87,69 @@ Link sources to the pages that summarise them: a `source_page` body
 should `[[source:<ULID>]]` (or carry the ULID in `frontmatter.source_sha256`)
 so the raw → summary chain is traceable.
 
+## Body template
+
+Every page body follows the same shape. The curator's lint pass flags
+pages that don't:
+
+1. **First line: `# <Title>`** — a single H1 with the page's human title.
+2. **Second paragraph: a one-line summary** — what this page is, in one
+   sentence (this is also what a `topic`/`trend` page should mirror into
+   `frontmatter.summary`).
+3. **`## Sources`** — a list of `[[source:<ULID>]]` references to the raw
+   materials the page is derived from. Write `_(none)_` when the page is
+   synthesised rather than sourced, so the omission is intentional, not an
+   oversight.
+4. **`## Related`** — `[[wikilinks]]` to sibling pages (the entities a
+   topic mentions, the topics an entity appears in, etc.).
+5. **Free-form body** — any additional `## …` sections (rationale,
+   invariants, worked examples).
+
+```markdown
+# redis-cluster-prod
+
+The production Redis cluster backing the task queue and cache.
+
+## Sources
+
+- [[source:01HX…]]
+
+## Related
+
+- [[topic:cache-strategy]]
+
+## Notes
+
+Sharded across 3 nodes; failover is handled by Sentinel.
+```
+
+## Refresh cadence
+
+When a page is *refreshed* depends on its type — match the cadence so the
+wiki stays current without churn:
+
+- **`entity`** — refresh when the underlying facts change (a rename, an
+  owner change, a status promotion). Update `frontmatter.status`
+  (`tentative` → `established`) as confidence grows.
+- **`topic`** — refresh when a **new source contradicts** the synthesised
+  claim, or materially extends it. A topic is the *current best
+  synthesis*, so rewrite the body in place rather than appending.
+- **`trend`** — **append** a dated observation; never rewrite history.
+  Keep `frontmatter.first_observed` / `last_refreshed` current.
+- **`log`** — **append-only**. One `## YYYY-MM-DD` heading per day; never
+  edit a past entry.
+- **`source_page`** — effectively immutable once written (the raw source
+  it summarises is itself immutable); only re-touch to fix a broken
+  `[[…]]` link.
+- **`procedure`** — reviewed every `frontmatter.review_after_days`. The
+  curator dispatches a refresh task to the page owner when the last
+  refresh is older than that window.
+
+When you garden (a fillin pass), prefer **updating an existing page** over
+creating a near-duplicate sibling: re-emit the same `type`+`slug` to
+rewrite the body in place. Use the in-wiki `index` / `log` listing the
+fillin prompt shows you to spot stale pages (`last refresh Nd, stale`).
+
 ## Source visibility (§6.8)
 
 Raw sources are visible **only through a referencing page**. A source
