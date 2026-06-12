@@ -1181,6 +1181,29 @@ class SuperposClient:
             "DELETE", f"/api/v1/hives/{hive}/tracks/{slug}/issues/{issue_id}",
         )
 
+    async def list_track_issues(
+        self, slug: str, *, page: int | None = None, per_page: int | None = None,
+    ) -> dict[str, Any]:
+        """``GET /tracks/{slug}/issues`` — paginated list of issues linked to a track.
+
+        Returns the full envelope (``{"data": [...], "meta": {...}}``) so callers
+        can paginate via ``meta.has_more`` / ``meta.current_page``. This is the
+        read-side counterpart to ``link_track_issue`` / ``unlink_track_issue``;
+        closes the gap that ``get_track_by_slug`` only returns the track record
+        (the dashboard's linked-issues panel reads from this endpoint).
+        """
+        hive = self._config.superpos_hive_id
+        params: dict[str, Any] = {}
+        if page is not None:
+            params["page"] = page
+        if per_page is not None:
+            params["per_page"] = per_page
+        resp = await self._request(
+            "GET", f"/api/v1/hives/{hive}/tracks/{slug}/issues",
+            params=params or None,
+        )
+        return resp.json()
+
     # ── Issue types ───────────────────────────────────────────────────
 
     async def list_issue_types(self) -> list[dict[str, Any]]:

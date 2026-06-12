@@ -310,6 +310,50 @@ async def test_unlink_track_issue_sends_delete():
     await client.close()
 
 
+# ── list_track_issues ────────────────────────────────────────────────────
+
+
+async def test_list_track_issues_returns_full_envelope():
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return _envelope(
+            [
+                {"id": "i1", "number": 1, "title": "Phase A", "state": "done"},
+                {"id": "i2", "number": 2, "title": "Phase B", "state": "open"},
+            ],
+            meta={"per_page": 15, "current_page": 1, "has_more": False},
+        )
+
+    client = _make_client(handler)
+    result = await client.list_track_issues("k1")
+
+    req = captured[0]
+    assert req.method == "GET"
+    assert req.url.path == "/api/v1/hives/hive-x/tracks/k1/issues"
+    # Envelope preserved so callers can paginate via meta.has_more
+    assert result["meta"] == {"per_page": 15, "current_page": 1, "has_more": False}
+    assert [row["number"] for row in result["data"]] == [1, 2]
+    await client.close()
+
+
+async def test_list_track_issues_forwards_pagination_params():
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return _envelope([], meta={"per_page": 5, "current_page": 2, "has_more": True})
+
+    client = _make_client(handler)
+    await client.list_track_issues("k1", page=2, per_page=5)
+
+    req = captured[0]
+    assert req.url.params["page"] == "2"
+    assert req.url.params["per_page"] == "5"
+    await client.close()
+
+
 # ── Auth header is sent on track requests ────────────────────────────────
 
 
