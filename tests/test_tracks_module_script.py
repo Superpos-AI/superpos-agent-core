@@ -329,6 +329,41 @@ async def test_unlink_issue_dispatches_to_unlink_track_issue(monkeypatch, capsys
     assert out == {"ok": True, "track_slug": "k1", "issue_id": "i1"}
 
 
+async def test_list_issues_dispatches_to_list_track_issues(monkeypatch, capsys):
+    _set_env(monkeypatch)
+    mod = _load_script()
+    envelope = {
+        "data": [{"id": "i1", "number": 49, "title": "Wiki view"}],
+        "meta": {"per_page": 15, "current_page": 1, "has_more": False},
+    }
+    mock_list = AsyncMock(return_value=envelope)
+
+    with patch.object(mod.SuperposClient, "list_track_issues", mock_list), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        rc = await mod._run(mod._build_parser().parse_args(["list-issues", "k1"]))
+
+    assert rc == 0
+    assert mock_list.await_args.args == ("k1",)
+    assert mock_list.await_args.kwargs == {}
+    out = json.loads(capsys.readouterr().out)
+    # Envelope preserved so callers can paginate via meta.has_more
+    assert out == envelope
+
+
+async def test_list_issues_forwards_pagination_flags(monkeypatch):
+    _set_env(monkeypatch)
+    mod = _load_script()
+    mock_list = AsyncMock(return_value={"data": [], "meta": {"has_more": False}})
+
+    with patch.object(mod.SuperposClient, "list_track_issues", mock_list), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        await mod._run(mod._build_parser().parse_args(
+            ["list-issues", "k1", "--page", "2", "--per-page", "5"],
+        ))
+
+    assert mock_list.await_args.kwargs == {"page": 2, "per_page": 5}
+
+
 # ── env validation ──────────────────────────────────────────────────────
 
 

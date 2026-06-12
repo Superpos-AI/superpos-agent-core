@@ -34,8 +34,9 @@ stdout that you can `jq` over.
 
 ### Coverage
 
-The CLI covers list / get / create / patch on tracks and link /
-unlink on track-issue edges. **State transitions** are driven through
+The CLI covers list / get / create / patch on tracks, link / unlink
+on track-issue edges, and list-issues for the read-side of the
+track↔issue relationship. **State transitions** are driven through
 `POST /tracks/{slug}/transition` (not exposed here) and the
 dashboard's track editor at `/dashboard/tracks/{slug}`.
 
@@ -129,6 +130,27 @@ itself is not touched.
 ```bash
 superpos-tracks unlink-issue agent-capabilities 01HXYZ...
 ```
+
+### `superpos-tracks list-issues <track-slug>`
+
+List the issues linked to a track. The full envelope is returned
+(`{"data": [...], "meta": {...}}`) so callers can paginate via
+`meta.has_more` / `meta.current_page`. Closes the read-side gap
+that `get` only returns the track record.
+
+```bash
+superpos-tracks list-issues k1
+superpos-tracks list-issues k1 --page 2 --per-page 50
+```
+
+Flags:
+- `--page` — 1-based page index (forwarded as `?page=`)
+- `--per-page` — page size (forwarded as `?per_page=`; server caps
+  at 100)
+
+The default page is whatever the server returns first (1, with the
+default `per_page`). The list of linked issues also drives the
+dashboard's track panel; this command is the CLI equivalent.
 
 ## Bootstrap runbook (proposal → track → issues)
 
@@ -227,6 +249,6 @@ existing track.
 ## Requirements
 
 - `SUPERPOS_*` env vars (already set in the container)
-- `issues.read` for `list` / `get`
+- `issues.read` for `list` / `get` / `list-issues`
 - `issues.manage` for `create` / `patch` / `link-issue` /
   `unlink-issue`

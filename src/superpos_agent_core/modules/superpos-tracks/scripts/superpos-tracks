@@ -115,6 +115,14 @@ async def _run(args: argparse.Namespace) -> int:
             await client.unlink_track_issue(args.track_slug, args.issue_id)
             _print({"ok": True, "track_slug": args.track_slug, "issue_id": args.issue_id})
 
+        elif args.cmd == "list-issues":
+            kwargs: dict[str, Any] = {}
+            if args.page is not None:
+                kwargs["page"] = args.page
+            if args.per_page is not None:
+                kwargs["per_page"] = args.per_page
+            _print(await client.list_track_issues(args.slug, **kwargs))
+
         else:
             print(f"Unknown subcommand: {args.cmd}", file=sys.stderr)
             return 2
@@ -196,6 +204,20 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_unlink.add_argument("track_slug", help="Track slug to unlink from")
     p_unlink.add_argument("issue_id", help="Issue ULID to unlink")
+
+    # list-issues
+    p_list_issues = sub.add_parser(
+        "list-issues", help="List issues linked to a track (paginated envelope)",
+    )
+    p_list_issues.add_argument("slug", help="Track slug, e.g. 'k1'")
+    p_list_issues.add_argument(
+        "--page", type=int,
+        help="1-based page index (forwarded as ?page=; see meta.current_page)",
+    )
+    p_list_issues.add_argument(
+        "--per-page", type=int,
+        help="Page size (forwarded as ?per_page=; server caps at 100)",
+    )
 
     return parser
 
