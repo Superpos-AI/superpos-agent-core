@@ -3,7 +3,7 @@
 
 Subcommands mirror the client API:
   list, get, create, patch,
-  link-issue, add-issue, unlink-issue
+  link-issue, add-issue, unlink-issue, list-issues
 
 Prints JSON to stdout, errors to stderr.  Designed for the LLM to call
 via Bash and pipe through ``jq`` for follow-up queries.

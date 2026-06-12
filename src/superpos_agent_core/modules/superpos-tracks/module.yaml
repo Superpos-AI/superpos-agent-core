@@ -1,4 +1,4 @@
-description: "Superpos tracks — list, get, create, patch tracks and link or unlink issues; the bootstrap container for proposals (proposal → track → issues)."
+description: "Superpos tracks — list, get, create, patch tracks and link, unlink, or list issues; the bootstrap container for proposals (proposal → track → issues)."
 env:
   - SUPERPOS_BASE_URL
   - SUPERPOS_HIVE_ID

@@ -8,6 +8,7 @@ no network.  Mirrors ``test_issues_module_script.py``.
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import json
 from importlib.machinery import SourceFileLoader
@@ -377,3 +378,38 @@ def test_main_errors_when_env_missing(monkeypatch, capsys):
     assert exc.value.code == 2
     err = capsys.readouterr().err
     assert "SUPERPOS_BASE_URL" in err and "SUPERPOS_HIVE_ID" in err
+
+
+# ── doc / summary accuracy ──────────────────────────────────────────────
+
+
+def _registered_subcommands(mod):
+    """Every subcommand name registered on the argparse parser."""
+    parser = mod._build_parser()
+    sub_action = next(
+        a for a in parser._actions if isinstance(a, argparse._SubParsersAction)
+    )
+    return set(sub_action.choices)
+
+
+def test_module_yaml_description_lists_list_issues():
+    """The generated module summary must mention the read-side subcommand."""
+    import yaml
+
+    meta = yaml.safe_load(
+        (_SCRIPT.parents[1] / "module.yaml").read_text(encoding="utf-8")
+    )
+    assert "list issues" in meta["description"].lower()
+
+
+def test_docstring_mentions_list_issues():
+    mod = _load_script()
+    assert "list-issues" in (mod.__doc__ or "")
+
+
+def test_docstring_covers_every_subcommand():
+    """Guard against the docstring drifting from the registered subcommands."""
+    mod = _load_script()
+    doc = mod.__doc__ or ""
+    missing = [cmd for cmd in _registered_subcommands(mod) if cmd not in doc]
+    assert not missing, f"docstring omits subcommands: {missing}"
