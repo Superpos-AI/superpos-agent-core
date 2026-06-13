@@ -27,6 +27,7 @@ from .runtime_config import RuntimeConfig
 from .session_store import SessionStore
 from .superpos_client import GitHubDiscoveryForbidden, SuperposClient
 from .superpos_poller import run_superpos_poller
+from .task import Task
 from .telegram_bot import build_telegram_app, run_telegram_bot
 from .telegram_gateway import Priority, TelegramGateway
 from .telegram_streamer import TelegramStreamer
@@ -55,6 +56,7 @@ __all__ = [
     "SessionStore",
     "SkillOverlayResult",
     "SuperposClient",
+    "Task",
     "TaskSummary",
     "TelegramGateway",
     "TelegramStreamer",
