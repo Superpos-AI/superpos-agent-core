@@ -42,3 +42,26 @@ if __name__ == "__main__":
 ```
 
 See `Slim-Agent-Gemini/` for a complete working example.
+
+## CLI helpers
+
+`superpos_task.py` ships a `superpos-task` console helper agents shell out to
+for task/schedule operations. Hive, base URL and token are resolved from the
+standard `SUPERPOS_*` environment variables.
+
+- `superpos-task create --prompt …` — create a task (broadcast by default;
+  `--self-target` pins it to the calling agent).
+- `superpos-task schedule …` — create a one-off / interval / cron schedule.
+- `superpos-task schedules` / `delete-schedule --id …` — manage schedules.
+- `superpos-task list [filters]` — list tasks in the hive. All filters are
+  AND-combined server-side and optional: `--status`, `--type`,
+  `--target-agent-id`, `--target-capability`, `--creator-id`,
+  `--parent-task-id`, `--created-after`, `--created-before`, `--q`, plus
+  `--page` / `--per-page` (max 100). Prints a compact summary by default, or the
+  raw `data` list as JSON with `--json`. (Consumes
+  `GET /api/v1/hives/{hive}/tasks`, exposed in the SDK as
+  `SuperposClient.list_tasks`.)
+- `superpos-task show <task-id> [--json]` — show a single task by ID
+  (`GET /api/v1/hives/{hive}/tasks/{task}`, SDK `SuperposClient.get_task`).
+- `superpos-task memory --content … [--mode append|prepend|replace]` — update
+  the active persona's MEMORY document.
