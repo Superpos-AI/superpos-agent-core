@@ -1844,6 +1844,44 @@ class SuperposClient:
         resp = await self._request("GET", f"/api/v1/hives/{hive}/tasks/{task_id}")
         return resp.json()
 
+    async def update_task(
+        self,
+        task_id: str,
+        *,
+        fields: dict[str, Any],
+        audit_reason: str | None = None,
+        hive_id: str | None = None,
+    ) -> dict[str, Any]:
+        """``PATCH /tasks/{task}`` — partial update of a not-yet-terminal task.
+
+        ``fields`` is the JSON body sent verbatim; build it from only the
+        attributes you want to change so the server's shallow-merge
+        semantics apply (an omitted key is left untouched). The mutable
+        fields the backend accepts are ``target_agent_id`` (str|null —
+        null broadcasts), ``target_capability`` (str|null), ``priority``
+        (int 0-4), ``payload`` (object, shallow-merged; a null value
+        deletes a key), ``timeout_seconds`` (int), ``max_retries`` (int),
+        ``expires_at`` (ISO8601|null) and ``failure_policy`` (object).
+        Sending an immutable field returns 422, patching a terminal-state
+        task returns 409, and the endpoint is rate-limited to 60/min per
+        (hive, task) → 429 — all surface as ``httpx.HTTPStatusError``.
+
+        When ``audit_reason`` is given it is sent as the ``X-Audit-Reason``
+        header and recorded verbatim by the backend; it is omitted entirely
+        when ``None``. ``hive_id`` overrides the config default for
+        cross-hive callers, mirroring the other task methods.
+        """
+        hive = hive_id if hive_id is not None else self._config.superpos_hive_id
+        headers = {"X-Audit-Reason": audit_reason} if audit_reason is not None else None
+        resp = await self._request(
+            "PATCH",
+            f"/api/v1/hives/{hive}/tasks/{task_id}",
+            json=fields,
+            headers=headers,
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
     async def get_task_trace(self, task_id: str) -> dict[str, Any]:
         """``GET /tasks/{task}/trace`` — full execution trace."""
         hive = self._config.superpos_hive_id

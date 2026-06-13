@@ -7,6 +7,7 @@ to ``superpos-task create --prompt …`` etc. when it needs to spawn a subtask.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 
@@ -173,6 +174,105 @@ def delete_schedule(schedule_id: str) -> None:
             sys.exit(1)
 
 
+def _parse_json_object(raw: str, flag: str) -> dict:
+    """Parse a CLI JSON-object argument, erroring cleanly on bad input."""
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        print(f"Error: {flag} is not valid JSON: {exc}", file=sys.stderr)
+        sys.exit(1)
+    if not isinstance(value, dict):
+        print(f"Error: {flag} must be a JSON object, got {type(value).__name__}", file=sys.stderr)
+        sys.exit(1)
+    return value
+
+
+def _build_update_fields(args: argparse.Namespace) -> dict:
+    """Build the PATCH body from ONLY the flags the caller actually passed.
+
+    argparse leaves unspecified options at their ``None`` default, so an
+    omitted flag is dropped from the body entirely (preserving the
+    server's shallow-merge: untouched attributes stay put). For the
+    nullable string fields a flag passed with an empty value (``''``) is
+    sent as JSON ``null`` — that is how ``--target-agent-id ''`` becomes a
+    broadcast and ``--expires-at ''`` clears the expiry.
+    """
+    fields: dict = {}
+
+    # Nullable strings: '' → null, any other value → the string, omit if not passed.
+    for flag_attr, key in (
+        ("target_agent_id", "target_agent_id"),
+        ("target_capability", "target_capability"),
+        ("expires_at", "expires_at"),
+    ):
+        val = getattr(args, flag_attr)
+        if val is not None:
+            fields[key] = None if val == "" else val
+
+    if args.priority is not None:
+        fields["priority"] = args.priority
+    if args.timeout_seconds is not None:
+        fields["timeout_seconds"] = args.timeout_seconds
+    if args.max_retries is not None:
+        fields["max_retries"] = args.max_retries
+    if args.payload is not None:
+        fields["payload"] = _parse_json_object(args.payload, "--payload")
+    if args.failure_policy is not None:
+        fields["failure_policy"] = _parse_json_object(args.failure_policy, "--failure-policy")
+
+    return fields
+
+
+def update_task(task_id: str, fields: dict, audit_reason: str | None = None) -> None:
+    """Partially update a task via ``PATCH /tasks/{task}`` (issue #97).
+
+    ``fields`` must already be built from ONLY the flags the caller
+    actually passed, so the backend's shallow-merge semantics apply: an
+    omitted attribute is left untouched, while an explicit ``None`` value
+    (e.g. ``target_agent_id=None``) is sent as JSON ``null`` to broadcast
+    the task / clear the field. ``audit_reason`` is sent as the
+    ``X-Audit-Reason`` header when provided.
+    """
+    base_url, hive_id, _, token = _base_config()
+
+    headers = _headers(token)
+    if audit_reason is not None:
+        headers["X-Audit-Reason"] = audit_reason
+
+    with httpx.Client(base_url=base_url, timeout=30.0, follow_redirects=True) as client:
+        resp = client.patch(
+            f"/api/v1/hives/{hive_id}/tasks/{task_id}",
+            json=fields,
+            headers=headers,
+        )
+        if resp.status_code in (200, 201):
+            data = resp.json()
+            task_data = data.get("data", data) if isinstance(data, dict) else data
+            print(json.dumps(task_data, indent=2, sort_keys=True))
+            return
+        if resp.status_code == 422:
+            print(
+                f"Error: invalid update (422) — an immutable or invalid field was "
+                f"sent: {resp.text}",
+                file=sys.stderr,
+            )
+        elif resp.status_code == 409:
+            print(
+                f"Error: task is in a terminal state and can no longer be updated "
+                f"(409): {resp.text}",
+                file=sys.stderr,
+            )
+        elif resp.status_code == 429:
+            print(
+                f"Error: rate limited (429) — too many updates to this task; "
+                f"retry shortly: {resp.text}",
+                file=sys.stderr,
+            )
+        else:
+            print(f"Error updating task: {resp.status_code} {resp.text}", file=sys.stderr)
+        sys.exit(1)
+
+
 def update_memory(content: str, message: str | None = None, mode: str = "append") -> None:
     """Update the MEMORY document in the active persona."""
     base_url = os.environ.get("SUPERPOS_BASE_URL", "").rstrip("/")
@@ -231,6 +331,33 @@ def main() -> None:
     sched_create.add_argument("--overlap", default="skip", choices=["skip", "allow", "cancel_previous"])
     sched_create.add_argument("--self-target", action="store_true")
 
+    update = sub.add_parser(
+        "update",
+        help="Partially update a task (re-target, re-prioritise, etc.)",
+    )
+    update.add_argument("task_id", help="ID of the task to update")
+    update.add_argument(
+        "--target-agent-id",
+        help="Pin the task to an agent; pass '' to clear (broadcast)",
+    )
+    update.add_argument(
+        "--target-capability",
+        help="Route by capability; pass '' to clear",
+    )
+    update.add_argument("--priority", type=int, help="Priority 0-4")
+    update.add_argument("--payload", help="JSON object, shallow-merged into payload")
+    update.add_argument("--timeout-seconds", type=int, help="Claim timeout in seconds")
+    update.add_argument("--max-retries", type=int, help="Max retry attempts")
+    update.add_argument(
+        "--expires-at",
+        help="ISO8601 expiry; pass '' to clear",
+    )
+    update.add_argument("--failure-policy", help="JSON object")
+    update.add_argument(
+        "--audit-reason",
+        help="Reason recorded in the audit log (recommended)",
+    )
+
     sub.add_parser("schedules", help="List schedules")
 
     sched_del = sub.add_parser("delete-schedule", help="Delete a schedule")
@@ -267,6 +394,23 @@ def main() -> None:
             self_target=args.self_target,
             overlap_policy=args.overlap,
         )
+    elif args.command == "update":
+        fields = _build_update_fields(args)
+        if not fields:
+            print(
+                "Error: no fields to update — pass at least one of "
+                "--target-agent-id, --target-capability, --priority, --payload, "
+                "--timeout-seconds, --max-retries, --expires-at, --failure-policy.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if not args.audit_reason:
+            print(
+                "Warning: no --audit-reason given; an audit reason is strongly "
+                "recommended for task updates.",
+                file=sys.stderr,
+            )
+        update_task(args.task_id, fields, audit_reason=args.audit_reason)
     elif args.command == "schedules":
         list_schedules()
     elif args.command == "delete-schedule":
