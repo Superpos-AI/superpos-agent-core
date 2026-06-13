@@ -41,11 +41,17 @@ def create_task(
     task_type: str = "default",
     capability: str | None = None,
     priority: int = 2,
-    self_target: bool = True,
+    self_target: bool = False,
     payload_extra: dict | None = None,
     timeout_seconds: int = 1800,
 ) -> None:
-    """Create a task in Superpos."""
+    """Create a task in Superpos.
+
+    By default the task is broadcast (no ``target_agent_id``) so any agent
+    with the right capability can claim it. Pass ``self_target=True`` to
+    pin the task to the calling agent — useful for self-routed follow-up
+    work, but the rare case in a multi-agent hive.
+    """
     base_url, hive_id, agent_id, token = _base_config()
 
     body: dict = {
@@ -84,7 +90,7 @@ def create_schedule(
     cron_expression: str | None = None,
     interval_seconds: int | None = None,
     run_at: str | None = None,
-    self_target: bool = True,
+    self_target: bool = False,
     overlap_policy: str = "skip",
 ) -> None:
     """Create a task schedule in Superpos."""
@@ -209,7 +215,7 @@ def main() -> None:
     create.add_argument("--capability", help="Required agent capability")
     create.add_argument("--priority", type=int, default=2, help="Priority 0-4 (default: 2)")
     create.add_argument("--timeout", type=int, default=1800, help="Claim timeout in seconds (default: 1800)")
-    create.add_argument("--no-self-target", action="store_true", help="Don't target this agent")
+    create.add_argument("--self-target", action="store_true", help="Pin the task to this agent (default: broadcast)")
 
     sched_create = sub.add_parser("schedule", help="Create a schedule")
     sched_create.add_argument("--name", required=True, help="Schedule name")
@@ -223,7 +229,7 @@ def main() -> None:
     sched_create.add_argument("--interval", type=int, help="Interval in seconds")
     sched_create.add_argument("--run-at", help="ISO8601 datetime (for trigger=once)")
     sched_create.add_argument("--overlap", default="skip", choices=["skip", "allow", "cancel_previous"])
-    sched_create.add_argument("--no-self-target", action="store_true")
+    sched_create.add_argument("--self-target", action="store_true")
 
     sub.add_parser("schedules", help="List schedules")
 
@@ -246,7 +252,7 @@ def main() -> None:
             task_type=args.type,
             capability=args.capability,
             priority=args.priority,
-            self_target=not args.no_self_target,
+            self_target=args.self_target,
             timeout_seconds=args.timeout,
         )
     elif args.command == "schedule":
@@ -258,7 +264,7 @@ def main() -> None:
             cron_expression=args.cron,
             interval_seconds=args.interval,
             run_at=args.run_at,
-            self_target=not args.no_self_target,
+            self_target=args.self_target,
             overlap_policy=args.overlap,
         )
     elif args.command == "schedules":
