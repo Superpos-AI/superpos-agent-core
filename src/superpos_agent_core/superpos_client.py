@@ -1838,6 +1838,60 @@ class SuperposClient:
 
     # ── Task tracing / replay ─────────────────────────────────────────
 
+    async def list_tasks(
+        self,
+        hive_id: str,
+        *,
+        status: str | None = None,
+        type: str | None = None,
+        target_agent_id: str | None = None,
+        target_capability: str | None = None,
+        creator_id: str | None = None,
+        parent_task_id: str | None = None,
+        created_after: str | None = None,
+        created_before: str | None = None,
+        q: str | None = None,
+        page: int | None = None,
+        per_page: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """``GET /tasks`` — paginated list of task summaries with optional filters.
+
+        Filters are AND-combined server-side; only the non-``None`` ones are
+        sent as query params. Returns the ``data`` list unwrapped from the
+        ``{data, meta, errors}`` envelope (mirrors ``list_dead_letter`` /
+        ``list_schedules``). Pagination is controlled via ``page`` / ``per_page``
+        (``per_page`` capped at 100 server-side); use ``get_task`` for a single
+        task if you need the full ``meta``.
+        """
+        params: dict[str, Any] = {}
+        if status is not None:
+            params["status"] = status
+        if type is not None:
+            params["type"] = type
+        if target_agent_id is not None:
+            params["target_agent_id"] = target_agent_id
+        if target_capability is not None:
+            params["target_capability"] = target_capability
+        if creator_id is not None:
+            params["creator_id"] = creator_id
+        if parent_task_id is not None:
+            params["parent_task_id"] = parent_task_id
+        if created_after is not None:
+            params["created_after"] = created_after
+        if created_before is not None:
+            params["created_before"] = created_before
+        if q is not None:
+            params["q"] = q
+        if page is not None:
+            params["page"] = page
+        if per_page is not None:
+            params["per_page"] = per_page
+        resp = await self._request(
+            "GET", f"/api/v1/hives/{hive_id}/tasks", params=params or None,
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
     async def get_task(self, task_id: str) -> dict[str, Any]:
         """``GET /tasks/{task}`` — single task by ID, same shape as claim/complete."""
         hive = self._config.superpos_hive_id

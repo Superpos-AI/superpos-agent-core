@@ -273,6 +273,108 @@ def update_task(task_id: str, fields: dict, audit_reason: str | None = None) -> 
         sys.exit(1)
 
 
+def list_tasks(
+    status: str | None = None,
+    task_type: str | None = None,
+    target_agent_id: str | None = None,
+    target_capability: str | None = None,
+    creator_id: str | None = None,
+    parent_task_id: str | None = None,
+    created_after: str | None = None,
+    created_before: str | None = None,
+    q: str | None = None,
+    page: int | None = None,
+    per_page: int | None = None,
+    as_json: bool = False,
+) -> None:
+    """List tasks in the hive, with optional filters (AND-combined server-side).
+
+    Only the filters that are set are sent as query params. Prints a compact
+    human-readable summary by default, or the raw ``data`` list as JSON with
+    ``--json``.
+    """
+    base_url, hive_id, _, token = _base_config()
+
+    params: dict = {}
+    if status is not None:
+        params["status"] = status
+    if task_type is not None:
+        params["type"] = task_type
+    if target_agent_id is not None:
+        params["target_agent_id"] = target_agent_id
+    if target_capability is not None:
+        params["target_capability"] = target_capability
+    if creator_id is not None:
+        params["creator_id"] = creator_id
+    if parent_task_id is not None:
+        params["parent_task_id"] = parent_task_id
+    if created_after is not None:
+        params["created_after"] = created_after
+    if created_before is not None:
+        params["created_before"] = created_before
+    if q is not None:
+        params["q"] = q
+    if page is not None:
+        params["page"] = page
+    if per_page is not None:
+        params["per_page"] = per_page
+
+    with httpx.Client(base_url=base_url, timeout=30.0, follow_redirects=True) as client:
+        resp = client.get(
+            f"/api/v1/hives/{hive_id}/tasks",
+            params=params or None,
+            headers=_headers(token),
+        )
+        if resp.status_code != 200:
+            print(f"Error listing tasks: {resp.status_code} {resp.text}", file=sys.stderr)
+            sys.exit(1)
+        data = resp.json()
+        tasks = data.get("data", data) if isinstance(data, dict) else data
+        if as_json:
+            print(json.dumps(tasks, indent=2))
+            return
+        if not tasks:
+            print("No tasks found.")
+            return
+        for t in tasks:
+            tid = t.get("id", "?")
+            ttype = t.get("type", "?")
+            tstatus = t.get("status", "?")
+            prio = t.get("priority", "?")
+            target = t.get("target_agent_id") or t.get("target_capability") or "broadcast"
+            created = t.get("created_at", "n/a")
+            print(f"  [{tstatus}] {tid}  {ttype}  (p{prio}, {target}, {created})")
+
+
+def show_task(task_id: str, as_json: bool = False) -> None:
+    """Show a single task by ID (``GET /tasks/{task}``)."""
+    base_url, hive_id, _, token = _base_config()
+
+    with httpx.Client(base_url=base_url, timeout=30.0, follow_redirects=True) as client:
+        resp = client.get(
+            f"/api/v1/hives/{hive_id}/tasks/{task_id}",
+            headers=_headers(token),
+        )
+        if resp.status_code != 200:
+            print(f"Error fetching task: {resp.status_code} {resp.text}", file=sys.stderr)
+            sys.exit(1)
+        data = resp.json()
+        task = data.get("data", data) if isinstance(data, dict) else data
+        if as_json:
+            print(json.dumps(task, indent=2))
+            return
+        if not isinstance(task, dict):
+            print(str(task))
+            return
+        for key in (
+            "id", "type", "status", "priority", "target_agent_id",
+            "target_capability", "creator_id", "parent_task_id",
+            "created_at", "updated_at",
+        ):
+            if key in task:
+                print(f"  {key}: {task[key]}")
+
+
 def update_memory(content: str, message: str | None = None, mode: str = "append") -> None:
     """Update the MEMORY document in the active persona."""
     base_url = os.environ.get("SUPERPOS_BASE_URL", "").rstrip("/")
@@ -358,6 +460,24 @@ def main() -> None:
         help="Reason recorded in the audit log (recommended)",
     )
 
+    list_p = sub.add_parser("list", help="List tasks in the hive (with filters)")
+    list_p.add_argument("--status", help="Filter by task status")
+    list_p.add_argument("--type", help="Filter by task type")
+    list_p.add_argument("--target-agent-id", help="Filter by target agent ID")
+    list_p.add_argument("--target-capability", help="Filter by target capability")
+    list_p.add_argument("--creator-id", help="Filter by creator ID")
+    list_p.add_argument("--parent-task-id", help="Filter by parent task ID")
+    list_p.add_argument("--created-after", help="Filter: created at or after (ISO8601)")
+    list_p.add_argument("--created-before", help="Filter: created at or before (ISO8601)")
+    list_p.add_argument("--q", help="Free-text search")
+    list_p.add_argument("--page", type=int, help="Page number (1-based)")
+    list_p.add_argument("--per-page", type=int, help="Items per page (max 100)")
+    list_p.add_argument("--json", action="store_true", dest="as_json", help="Output raw JSON")
+
+    show_p = sub.add_parser("show", help="Show a single task by ID")
+    show_p.add_argument("task_id", help="Task ID")
+    show_p.add_argument("--json", action="store_true", dest="as_json", help="Output raw JSON")
+
     sub.add_parser("schedules", help="List schedules")
 
     sched_del = sub.add_parser("delete-schedule", help="Delete a schedule")
@@ -411,6 +531,23 @@ def main() -> None:
                 file=sys.stderr,
             )
         update_task(args.task_id, fields, audit_reason=args.audit_reason)
+    elif args.command == "list":
+        list_tasks(
+            status=args.status,
+            task_type=args.type,
+            target_agent_id=args.target_agent_id,
+            target_capability=args.target_capability,
+            creator_id=args.creator_id,
+            parent_task_id=args.parent_task_id,
+            created_after=args.created_after,
+            created_before=args.created_before,
+            q=args.q,
+            page=args.page,
+            per_page=args.per_page,
+            as_json=args.as_json,
+        )
+    elif args.command == "show":
+        show_task(args.task_id, as_json=args.as_json)
     elif args.command == "schedules":
         list_schedules()
     elif args.command == "delete-schedule":
