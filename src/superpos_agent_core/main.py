@@ -58,6 +58,16 @@ def setup_logging(log_dir: str) -> None:
     file_handler.setLevel(logging.INFO)
     logging.getLogger().addHandler(file_handler)
 
+    # httpx/httpcore log one INFO line per HTTP request.  An agent makes
+    # tens of thousands a day (poll, heartbeat, persona, Telegram edits),
+    # so at INFO they bury the signal that matters — failed polls, CLI
+    # crashes — under a wall of routine "HTTP Request: ... 200 OK" lines,
+    # and a 4xx/5xx reads identically to a success unless you go hunting.
+    # Lift them to WARNING: real transport failures still surface, the
+    # agent's own loggers keep logging at INFO.
+    for noisy in ("httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
 
 async def _warn_missing_permissions(
     gateway: TelegramGateway | None, config: BaseConfig,
