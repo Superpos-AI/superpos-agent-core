@@ -341,6 +341,140 @@ async def test_multiple_questions_advance_in_sequence():
     assert [a["selected"] for a in answers["answers"]] == [["a1"], ["b2"]]
 
 
+# ── stale taps on already-answered / resolved questions rejected ──────
+
+
+async def test_stale_tap_on_answered_question_rejected():
+    """A second tap on an earlier (already-answered) question is rejected:
+    it must not overwrite the recorded answer nor re-advance."""
+    reg = PendingQuestions()
+    gw = _gateway()
+    questions = [
+        {"question": "Q1", "options": [{"label": "a1"}, {"label": "a2"}]},
+        {"question": "Q2", "options": [{"label": "b1"}, {"label": "b2"}]},
+    ]
+    task = asyncio.create_task(
+        ask_user_question(chat_id=1, thread_id=None, questions=questions,
+                          gateway=gw, timeout=5, registry=reg)
+    )
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    pending = reg.get_by_chat(1, None)
+    ask_id = pending.ask_id
+
+    # Answer Q0 → advance to Q1; current_q_idx tracks the active question.
+    r1 = handle_callback(f"{ask_id}:0:0", reg)
+    assert r1.advance_to_q_idx == 1
+    assert pending.current_q_idx == 1
+    assert pending.selections[0] == {0}
+
+    # A stale second tap on Q0 (a different option) is rejected.
+    r_stale = handle_callback(f"{ask_id}:0:1", reg)
+    assert r_stale.handled is True
+    assert r_stale.toast == "This question was already answered."
+    assert r_stale.advance_to_q_idx is None
+    # The recorded answer for Q0 is untouched.
+    assert pending.selections[0] == {0}
+
+    # Q1 still resolves normally.
+    r2 = handle_callback(f"{ask_id}:1:1", reg)
+    assert r2.resolved is True
+    answers = await asyncio.wait_for(task, timeout=2)
+    assert [a["selected"] for a in answers["answers"]] == [["a1"], ["b2"]]
+
+
+async def test_tap_after_resolution_rejected():
+    """Once the final question resolves the future, late taps are rejected
+    (future.done() path) and do not mutate selections."""
+    reg = PendingQuestions()
+    gw = _gateway()
+    task = asyncio.create_task(
+        ask_user_question(chat_id=1, thread_id=None, questions=_single_q(),
+                          gateway=gw, timeout=5, registry=reg)
+    )
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    pending = reg.get_by_chat(1, None)
+    ask_id = pending.ask_id
+
+    # Resolve via tapping option 0.
+    r = handle_callback(f"{ask_id}:0:0", reg)
+    assert r.resolved is True
+    assert pending.future.done()
+    assert pending.selections[0] == {0}
+
+    # A late tap (different option) is rejected and does not mutate selections.
+    r_late = handle_callback(f"{ask_id}:0:1", reg)
+    assert r_late.handled is True
+    assert r_late.toast == "This question was already answered."
+    assert r_late.resolved is False
+    assert pending.selections[0] == {0}
+
+    answers = await asyncio.wait_for(task, timeout=2)
+    assert answers["answers"][0]["selected"] == ["A"]
+
+
+async def test_two_question_single_select_flow_tracks_active_index():
+    """A normal two-question single-select flow advances then resolves,
+    with current_q_idx tracking the active question."""
+    reg = PendingQuestions()
+    gw = _gateway()
+    questions = [
+        {"question": "Q1", "options": [{"label": "a1"}, {"label": "a2"}]},
+        {"question": "Q2", "options": [{"label": "b1"}, {"label": "b2"}]},
+    ]
+    task = asyncio.create_task(
+        ask_user_question(chat_id=1, thread_id=None, questions=questions,
+                          gateway=gw, timeout=5, registry=reg)
+    )
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    pending = reg.get_by_chat(1, None)
+    ask_id = pending.ask_id
+    assert pending.current_q_idx == 0
+
+    # Q0 tap advances to Q1.
+    r1 = handle_callback(f"{ask_id}:0:0", reg)
+    assert r1.advance_to_q_idx == 1
+    assert r1.resolved is False
+    assert pending.current_q_idx == 1
+
+    # Q1 tap resolves.
+    r2 = handle_callback(f"{ask_id}:1:0", reg)
+    assert r2.resolved is True
+
+    answers = await asyncio.wait_for(task, timeout=2)
+    assert [a["selected"] for a in answers["answers"]] == [["a1"], ["b1"]]
+
+
+async def test_multi_select_on_active_question_still_works():
+    """Multi-select toggles on the active question (q_idx == current_q_idx)
+    still work, and Done resolves as before."""
+    reg = PendingQuestions()
+    gw = _gateway()
+    task = asyncio.create_task(
+        ask_user_question(chat_id=1, thread_id=None, questions=_multi_q(),
+                          gateway=gw, timeout=5, registry=reg)
+    )
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    pending = reg.get_by_chat(1, None)
+    ask_id = pending.ask_id
+    assert pending.current_q_idx == 0
+
+    r1 = handle_callback(f"{ask_id}:0:0", reg)
+    assert r1.rerender_q_idx == 0
+    r2 = handle_callback(f"{ask_id}:0:2", reg)
+    assert r2.rerender_q_idx == 0
+    assert pending.selections[0] == {0, 2}
+
+    rd = handle_callback(f"{ask_id}:0:done", reg)
+    assert rd.resolved is True
+
+    answers = await asyncio.wait_for(task, timeout=2)
+    assert sorted(answers["answers"][0]["selected"]) == ["X", "Z"]
+
+
 # ── Question.from_dict accepts both casings ───────────────────────────
 
 

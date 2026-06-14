@@ -140,6 +140,10 @@ class _PendingAsk:
     selections: dict[int, set[int]] = field(default_factory=dict)
     # Set True when resolved by cancel_chat (/stop) rather than a user answer.
     cancelled: bool = False
+    # Index of the question currently awaiting an answer.  Taps on any other
+    # question (already answered, or not yet sent) are rejected so a stale tap
+    # cannot overwrite a recorded answer or re-send the next question.
+    current_q_idx: int = 0
 
 
 class PendingQuestions:
@@ -455,6 +459,14 @@ def handle_callback(
     if q_idx < 0 or q_idx >= len(pending.questions):
         return CallbackResult(handled=True, toast="This question expired.")
 
+    # Reject taps once the ask is resolved, or on a question that is no longer
+    # the active one — otherwise a second tap on an earlier question would
+    # overwrite its recorded answer and re-send the following question.
+    if pending.future.done() or q_idx != pending.current_q_idx:
+        return CallbackResult(
+            handled=True, toast="This question was already answered."
+        )
+
     q = pending.questions[q_idx]
 
     if q.multi_select:
@@ -484,6 +496,7 @@ def _resolve_or_advance(
     """After a question is answered, either send the next one or resolve."""
     next_idx = q_idx + 1
     if next_idx < len(pending.questions):
+        pending.current_q_idx = next_idx
         return CallbackResult(handled=True, advance_to_q_idx=next_idx)
     # Last question answered — resolve the future.
     if not pending.future.done():
