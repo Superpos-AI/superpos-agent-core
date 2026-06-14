@@ -8,21 +8,33 @@ import os
 import re
 import signal
 import subprocess
+from typing import TYPE_CHECKING
 
 import httpx
-from telegram import Message, Update
+from telegram import CallbackQuery, Message, Update
 from telegram.constants import ChatType
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
     filters,
 )
 
+from .ask_user import (
+    PENDING_QUESTIONS,
+    PendingQuestions,
+    _keyboard,
+    _send_question,
+    handle_callback,
+)
 from .config import BaseConfig
 from .executor import Executor, ExecutionRequest, chat_key
 from .runtime_config import RuntimeConfig
+
+if TYPE_CHECKING:
+    from .telegram_gateway import TelegramGateway
 
 log = logging.getLogger(__name__)
 
@@ -119,13 +131,21 @@ def register_handlers(
     executor: Executor,
     config: BaseConfig,
     runtime: RuntimeConfig,
+    gateway: "TelegramGateway | None" = None,
+    pending_questions: PendingQuestions | None = None,
 ) -> None:
     """Wire all command/message handlers onto ``app``.
 
     Split out from :func:`run_telegram_bot` so the handler logic (which
     lives in closures over ``executor``/``config``) can be exercised in
     tests without standing up polling or touching the network.
+
+    ``gateway`` and ``pending_questions`` power the ``CallbackQueryHandler``
+    that resolves interactive :func:`~.ask_user.ask_user_question` prompts.
+    When ``gateway`` is None (e.g. older callers / pure command tests) the
+    callback handler is skipped.
     """
+    pending_registry = pending_questions or PENDING_QUESTIONS
 
     allowed = set(config.telegram_allowed_users)
     bound_thread = config.telegram_thread_id
@@ -494,6 +514,58 @@ def register_handlers(
             filename, update.effective_user.id, executor.pending,
         )
 
+    async def handle_callback_query(
+        update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Resolve an interactive ask_user_question inline-keyboard tap.
+
+        Gated through the same allowlist/topic check as every other handler
+        so only authorized users in the bound topic can answer.  Routing is
+        by ``ask_id`` embedded in ``callback_data`` (not by chat), so a stale
+        tap from an expired question is answered "expired" and ignored.
+        """
+        query: CallbackQuery | None = update.callback_query
+        if query is None or gateway is None:
+            return
+        if not gate(update)[0]:
+            # Out-of-scope / unauthorized: ack quietly so the spinner clears.
+            try:
+                await gateway.answer_callback_query(query.id)
+            except Exception:
+                pass
+            return
+
+        data = query.data or ""
+        result = handle_callback(data, pending_registry)
+
+        try:
+            await gateway.answer_callback_query(query.id, text=result.toast)
+        except Exception:
+            log.debug("Failed to answer callback query", exc_info=True)
+
+        if not result.handled:
+            return
+
+        pending = pending_registry.get_by_ask_id(data.split(":", 1)[0])
+
+        if result.rerender_q_idx is not None and pending is not None:
+            message_id = pending.message_ids.get(result.rerender_q_idx)
+            if message_id is not None:
+                try:
+                    await gateway.edit_message_reply_markup(
+                        pending.chat_id,
+                        message_id,
+                        reply_markup=_keyboard(pending, result.rerender_q_idx),
+                    )
+                except Exception:
+                    log.debug("Failed to re-render keyboard", exc_info=True)
+
+        if result.advance_to_q_idx is not None and pending is not None:
+            try:
+                await _send_question(gateway, pending, result.advance_to_q_idx)
+            except Exception:
+                log.debug("Failed to send next question", exc_info=True)
+
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("new", cmd_new))
@@ -506,6 +578,8 @@ def register_handlers(
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    if gateway is not None:
+        app.add_handler(CallbackQueryHandler(handle_callback_query))
 
 
 async def run_telegram_bot(
@@ -513,14 +587,21 @@ async def run_telegram_bot(
     executor: Executor,
     config: BaseConfig,
     runtime: RuntimeConfig,
+    gateway: "TelegramGateway | None" = None,
 ) -> None:
     """Start the bot using non-blocking polling (compatible with asyncio.gather)."""
 
-    register_handlers(app, executor, config, runtime)
+    register_handlers(app, executor, config, runtime, gateway=gateway)
 
     await app.initialize()
     await app.start()
-    await app.updater.start_polling(drop_pending_updates=True)
+    # ``callback_query`` is included in PTB's default allowed_updates, so the
+    # inline-keyboard taps for ask_user_question arrive without extra config.
+    # Pass it explicitly anyway to be robust against a future default change.
+    await app.updater.start_polling(
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES,
+    )
 
     log.info("Telegram bot started polling")
 

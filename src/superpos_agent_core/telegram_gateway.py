@@ -85,6 +85,7 @@ class TelegramGateway:
         *,
         parse_mode: str | None = None,
         message_thread_id: int | None = None,
+        reply_markup: Any | None = None,
         priority: Priority = Priority.HIGH,
     ) -> Any:
         return await self._submit(
@@ -94,6 +95,7 @@ class TelegramGateway:
                 "text": text,
                 "parse_mode": parse_mode,
                 "message_thread_id": message_thread_id,
+                "reply_markup": reply_markup,
             },
             priority=priority,
         )
@@ -105,6 +107,7 @@ class TelegramGateway:
         text: str,
         *,
         parse_mode: str | None = None,
+        reply_markup: Any | None = None,
         priority: Priority = Priority.LOW,
     ) -> Any:
         return await self._submit(
@@ -114,9 +117,59 @@ class TelegramGateway:
                 "message_id": message_id,
                 "text": text,
                 "parse_mode": parse_mode,
+                "reply_markup": reply_markup,
             },
             priority=priority,
             supersede_key=f"edit:{chat_id}:{message_id}",
+        )
+
+    async def edit_message_reply_markup(
+        self,
+        chat_id: int | str,
+        message_id: int,
+        *,
+        reply_markup: Any | None = None,
+        priority: Priority = Priority.LOW,
+    ) -> Any:
+        """Replace a message's inline keyboard (e.g. to show a ✓ toggle).
+
+        Passing ``reply_markup=None`` removes the keyboard entirely.  Because
+        the gateway strips None kwargs before dispatch, an explicit removal
+        cannot be expressed here — use :meth:`edit_message_text` if you need
+        to clear the markup while also changing the text.
+        """
+        return await self._submit(
+            method="edit_message_reply_markup",
+            kwargs={
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "reply_markup": reply_markup,
+            },
+            priority=priority,
+            supersede_key=f"editmarkup:{chat_id}:{message_id}",
+        )
+
+    async def answer_callback_query(
+        self,
+        callback_query_id: str,
+        *,
+        text: str | None = None,
+        show_alert: bool | None = None,
+        priority: Priority = Priority.HIGH,
+    ) -> Any:
+        """Acknowledge a tapped inline-keyboard button.
+
+        Telegram shows a spinner on the button until the callback query is
+        answered; always answer promptly (optionally with a toast ``text``).
+        """
+        return await self._submit(
+            method="answer_callback_query",
+            kwargs={
+                "callback_query_id": callback_query_id,
+                "text": text,
+                "show_alert": show_alert,
+            },
+            priority=priority,
         )
 
     async def delete_message(

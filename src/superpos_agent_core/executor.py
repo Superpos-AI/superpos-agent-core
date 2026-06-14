@@ -195,11 +195,22 @@ class Executor(abc.ABC):
         subprocess, send a Telegram "stopped" message, mark the Superpos
         task as failed) should override and call ``super().cancel_chat``
         to keep the asyncio cancellation path uniform.
+
+        Also resolves any pending interactive question
+        (:func:`~.ask_user.ask_user_question`) for this chat/topic so a
+        ``/stop`` mid-question doesn't leak the awaiting Future — the parked
+        ``ask_user_question`` coroutine sees the cancellation, cleans up its
+        Telegram message, and returns a no-response result.  Counted toward
+        the return value so ``/stop`` reports it did something even when the
+        only outstanding work is a parked question.
         """
+        # Local import avoids a module-load cycle (ask_user imports executor).
+        from .ask_user import PENDING_QUESTIONS
+
+        cancelled = PENDING_QUESTIONS.cancel_chat(chat_id)
         bucket = self._chat_tasks.get(str(chat_id))
         if not bucket:
-            return 0
-        cancelled = 0
+            return cancelled
         for task in list(bucket):
             if not task.done():
                 task.cancel()

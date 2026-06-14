@@ -207,6 +207,62 @@ async def test_gateway_omits_none_thread_id():
     assert "message_thread_id" not in bot.send_message.await_args.kwargs
 
 
+async def test_gateway_forwards_reply_markup():
+    bot = SimpleNamespace(send_message=AsyncMock(return_value="ok"))
+    sentinel = object()
+    await _roundtrip_send(bot, reply_markup=sentinel)
+    assert bot.send_message.await_args.kwargs["reply_markup"] is sentinel
+
+
+async def test_gateway_omits_none_reply_markup():
+    bot = SimpleNamespace(send_message=AsyncMock(return_value="ok"))
+    await _roundtrip_send(bot)
+    assert "reply_markup" not in bot.send_message.await_args.kwargs
+
+
+async def test_gateway_answer_callback_query_forwards_and_strips_none():
+    bot = SimpleNamespace(answer_callback_query=AsyncMock(return_value="ok"))
+    gw = TelegramGateway(bot, min_interval=0.0)
+    run_task = asyncio.create_task(gw.run())
+    try:
+        await asyncio.wait_for(
+            gw.answer_callback_query("cbq1", text="Selected: A"), timeout=5,
+        )
+    finally:
+        run_task.cancel()
+        try:
+            await run_task
+        except asyncio.CancelledError:
+            pass
+    kwargs = bot.answer_callback_query.await_args.kwargs
+    assert kwargs["callback_query_id"] == "cbq1"
+    assert kwargs["text"] == "Selected: A"
+    # show_alert was None → stripped.
+    assert "show_alert" not in kwargs
+
+
+async def test_gateway_edit_message_reply_markup_forwards():
+    bot = SimpleNamespace(edit_message_reply_markup=AsyncMock(return_value="ok"))
+    gw = TelegramGateway(bot, min_interval=0.0)
+    run_task = asyncio.create_task(gw.run())
+    sentinel = object()
+    try:
+        await asyncio.wait_for(
+            gw.edit_message_reply_markup(123, 9, reply_markup=sentinel),
+            timeout=5,
+        )
+    finally:
+        run_task.cancel()
+        try:
+            await run_task
+        except asyncio.CancelledError:
+            pass
+    kwargs = bot.edit_message_reply_markup.await_args.kwargs
+    assert kwargs["chat_id"] == 123
+    assert kwargs["message_id"] == 9
+    assert kwargs["reply_markup"] is sentinel
+
+
 # ── /new and /stop key scoping (strict default + legacy opt-in) ───────
 #
 # By default, topic-scoped /new and /stop address ONLY the composite
