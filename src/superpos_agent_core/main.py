@@ -291,7 +291,7 @@ async def run_agent(
     # Build task list
     tasks: list[Awaitable] = [executor.run()]
     if bot_app and gateway:
-        tasks.append(run_telegram_bot(bot_app, executor, config, runtime))
+        tasks.append(run_telegram_bot(bot_app, executor, config, runtime, gateway))
         tasks.append(gateway.run())
         tasks.append(_monitor_disk(gateway, config))
     if superpos:

@@ -1,5 +1,14 @@
 """Slim-agent core runtime: shared code for every Superpos LLM-backed agent."""
 
+from .ask_user import (
+    NO_RESPONSE,
+    AskAlreadyPending,
+    Option,
+    PendingQuestions,
+    PENDING_QUESTIONS,
+    Question,
+    ask_user_question,
+)
 from .config import BaseConfig
 from .executor import Executor, ExecutionRequest
 from .knowledge import KnowledgeClient, KnowledgeNotFound
@@ -41,10 +50,17 @@ from .worktree_manager import (
 )
 
 __all__ = [
+    "NO_RESPONSE",
+    "PENDING_QUESTIONS",
+    "AskAlreadyPending",
     "BaseConfig",
     "Executor",
     "ExecutionRequest",
     "ExecutorFactory",
+    "Option",
+    "PendingQuestions",
+    "Question",
+    "ask_user_question",
     "GitHubDiscoveryForbidden",
     "KnowledgeClient",
     "KnowledgeNotFound",
