@@ -407,8 +407,20 @@ def update_memory(content: str, message: str | None = None, mode: str = "append"
             sys.exit(1)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Superpos task & schedule helper")
+def build_parser() -> argparse.ArgumentParser:
+    """Construct the argument parser.
+
+    Factored out of :func:`main` so the same parser object can be
+    introspected to auto-generate the CLI reference documentation (see
+    :mod:`superpos_agent_core.task_cli_doc`). Keeping a single source of
+    truth means the docs can never drift from the real flags — a past
+    incident where a hand-written ``CLAUDE.md`` kept documenting a removed
+    ``--no-self-target`` flag after the CLI was inverted to ``--self-target``.
+    """
+    parser = argparse.ArgumentParser(
+        prog="superpos-task",
+        description="Superpos task & schedule helper",
+    )
     sub = parser.add_subparsers(dest="command")
 
     create = sub.add_parser("create", help="Create a new task")
@@ -491,6 +503,11 @@ def main() -> None:
         help="Write mode (default: append)",
     )
 
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
     args = parser.parse_args()
 
     if args.command == "create":

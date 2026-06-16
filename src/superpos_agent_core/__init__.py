@@ -21,6 +21,7 @@ from .module_loader import (
 )
 from .module_setup import run_setup as run_module_setup
 from .module_setup import symlink_module_scripts
+from .task_cli_doc import render_task_cli_reference
 from .registry_overlay import (
     ModuleOverlayResult,
     RegistryOverlayResult,
@@ -88,6 +89,7 @@ __all__ = [
     "prune_worktrees",
     "redact",
     "remove_registry_overlay_modules",
+    "render_task_cli_reference",
     "report_progress",
     "run_agent",
     "run_module_setup",

@@ -202,7 +202,12 @@ def run_setup(
     if bin_dir:
         symlink_module_scripts(modules_dir, bin_dir)
 
-    doc = generate_modules_doc(modules)
+    # The auto-generated block leads with the superpos-task CLI reference
+    # (rendered from the live argparse parser, so it can never drift from the
+    # installed flags) followed by the discovered-modules listing.
+    from .task_cli_doc import render_task_cli_reference
+
+    doc = render_task_cli_reference() + "\n" + generate_modules_doc(modules)
     update_agents_md(doc, agents_md_path)
 
     # Beat 2b: overlay registry-served skills + modules on top of baked-in.
