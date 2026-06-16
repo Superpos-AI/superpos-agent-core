@@ -61,8 +61,12 @@ from pathlib import Path
 
 import yaml
 
-from .module_loader import discover_modules, generate_modules_doc
-from .module_setup import symlink_module_scripts, update_agents_md
+from .module_loader import discover_modules
+from .module_setup import (
+    render_modules_block,
+    symlink_module_scripts,
+    update_agents_md,
+)
 
 log = logging.getLogger(__name__)
 
@@ -590,7 +594,12 @@ def apply_registry_overlay(
             merged = discover_modules(
                 modules_dir if os.path.isdir(modules_dir) else None
             )
-            update_agents_md(generate_modules_doc(merged), agents_md_path)
+            # Re-render the WHOLE block via the shared helper so the
+            # superpos-task CLI reference that run_setup prepended survives
+            # this overlay re-render — otherwise a registry-backed startup
+            # would replace the block with module docs only and the
+            # anti-drift CLI reference would vanish immediately.
+            update_agents_md(render_modules_block(merged), agents_md_path)
 
     return RegistryOverlayResult(
         skipped=False,
