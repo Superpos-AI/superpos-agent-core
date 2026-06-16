@@ -24,6 +24,7 @@ from superpos_agent_core import module_setup
 from superpos_agent_core.registry_overlay import (
     FEATURE_FLAG_ENV,
     MODULE_INSTALL_FAILED_EVENT,
+    RESOLVED_EMPTY_NO_FALLBACK_EVENT,
     apply_registry_overlay,
     feature_enabled,
     overlay_modules,
@@ -135,7 +136,7 @@ def test_run_setup_flag_off_never_fetches_and_matches_baked_in(
     # Sentinel: if the overlay path ever fetches with the flag off, fail.
     called = {"fetch": False}
 
-    def _boom():
+    def _boom(*args, **kwargs):
         called["fetch"] = True
         raise AssertionError("registry fetch must not happen when flag is off")
 
@@ -732,7 +733,7 @@ def test_cli_main_fetches_resolved_when_flag_on_without_skills_dir(
 
     called = {"fetch": 0}
 
-    def _fake_fetch():
+    def _fake_fetch(*args, **kwargs):
         called["fetch"] += 1
         return _resolved_payload()
 
@@ -761,7 +762,7 @@ def test_cli_main_does_not_fetch_when_flag_off(tmp_path: Path, monkeypatch):
     modules_dir = tmp_path / "modules"
     agents_md = _agents_md(tmp_path)
 
-    def _boom():
+    def _boom(*args, **kwargs):
         raise AssertionError("must not fetch when flag off")
 
     monkeypatch.setattr(module_setup, "_fetch_registry_resolved", _boom)
@@ -969,3 +970,262 @@ def test_flag_on_fetch_failure_does_not_reconcile_away_existing_module(
     )
     assert (modules_dir / "registry-only-mod" / "module.yaml").is_file()
     assert (bin_dir / "regmod-cli").is_symlink()
+
+
+# ── Beat 4 prereq: resilient fetch (cache + retry + degraded-empty) ───
+
+
+def _fetch_env(monkeypatch):
+    """Set the env the resilient fetch needs to attempt a live GET."""
+    monkeypatch.setenv(FEATURE_FLAG_ENV, "true")
+    monkeypatch.setenv("SUPERPOS_BASE_URL", "https://example.test")
+    monkeypatch.setenv("SUPERPOS_API_TOKEN", "tok")
+
+
+def test_successful_fetch_writes_cache_then_failure_loads_it(
+    tmp_path: Path, monkeypatch
+):
+    """A 200 fetch persists the last-good cache; a later all-fail fetch loads
+    + returns it (tagged ``_from_cache``) instead of None."""
+    _fetch_env(monkeypatch)
+    modules_dir = tmp_path / "modules"
+    modules_dir.mkdir()
+    cache = tmp_path / "cache.json"
+    monkeypatch.setenv(module_setup.REGISTRY_RESOLVED_CACHE_ENV, str(cache))
+
+    payload = _resolved_payload()
+
+    # Live fetch succeeds → cache written, payload returned verbatim.
+    monkeypatch.setattr(
+        module_setup, "_live_fetch_registry_resolved",
+        lambda base, tok: payload,
+    )
+    got = module_setup._fetch_registry_resolved(str(modules_dir))
+    assert got == payload
+    assert cache.is_file()
+
+    # Now the live fetch fails on every attempt → cache is loaded.
+    monkeypatch.setattr(
+        module_setup, "_live_fetch_registry_resolved",
+        lambda base, tok: None,
+    )
+    cached = module_setup._fetch_registry_resolved(
+        str(modules_dir), retries=0, backoff_seconds=0,
+    )
+    assert cached is not None
+    assert cached["_from_cache"] is True
+    assert cached["modules"][0]["slug"] == "registry-only-mod"
+
+
+def test_cached_payload_drives_overlay(tmp_path: Path, monkeypatch):
+    """The cache-sourced payload overlays exactly like a live one."""
+    _fetch_env(monkeypatch)
+    modules_dir = tmp_path / "modules"
+    modules_dir.mkdir()
+    skills_dir = tmp_path / "skills"
+    cache = tmp_path / "cache.json"
+    monkeypatch.setenv(module_setup.REGISTRY_RESOLVED_CACHE_ENV, str(cache))
+
+    cache.write_text(__import__("json").dumps(_resolved_payload()))
+    monkeypatch.setattr(
+        module_setup, "_live_fetch_registry_resolved",
+        lambda base, tok: None,
+    )
+    resolved = module_setup._fetch_registry_resolved(
+        str(modules_dir), retries=0, backoff_seconds=0,
+    )
+    result = apply_registry_overlay(
+        resolved, modules_dir=str(modules_dir), skills_dir=str(skills_dir),
+    )
+    assert not result.fetch_failed
+    assert not result.degraded_empty
+    assert (modules_dir / "registry-only-mod" / "module.yaml").is_file()
+    assert (skills_dir / "deep-research.md").is_file()
+
+
+def test_fetch_failure_no_cache_returns_none(tmp_path: Path, monkeypatch):
+    """Live fetch fails AND no cache → returns None (caller degrades)."""
+    _fetch_env(monkeypatch)
+    cache = tmp_path / "missing.json"
+    monkeypatch.setenv(module_setup.REGISTRY_RESOLVED_CACHE_ENV, str(cache))
+    monkeypatch.setattr(
+        module_setup, "_live_fetch_registry_resolved",
+        lambda base, tok: None,
+    )
+    got = module_setup._fetch_registry_resolved(
+        str(tmp_path / "modules"), retries=0, backoff_seconds=0,
+    )
+    assert got is None
+    assert not cache.exists()
+
+
+def test_retry_transient_then_success_within_budget(tmp_path: Path, monkeypatch):
+    """Transient failures then a success → succeeds inside the retry budget,
+    and never sleeps longer than the bounded backoff schedule."""
+    _fetch_env(monkeypatch)
+    modules_dir = tmp_path / "modules"
+    modules_dir.mkdir()
+    monkeypatch.setenv(
+        module_setup.REGISTRY_RESOLVED_CACHE_ENV, str(tmp_path / "c.json")
+    )
+
+    calls = {"n": 0}
+
+    def _flaky(base, tok):
+        calls["n"] += 1
+        return _resolved_payload() if calls["n"] >= 3 else None
+
+    slept: list[float] = []
+    monkeypatch.setattr(module_setup, "_live_fetch_registry_resolved", _flaky)
+    got = module_setup._fetch_registry_resolved(
+        str(modules_dir), retries=2, backoff_seconds=0.01, sleep=slept.append,
+    )
+    assert got is not None and "_from_cache" not in got
+    assert calls["n"] == 3
+    # 1.0,2.0 style schedule with base 0.01 → 0.01 + 0.02
+    assert len(slept) == 2
+
+
+def test_retry_all_fail_falls_to_cache(tmp_path: Path, monkeypatch):
+    """All attempts fail → falls back to the last-good cache."""
+    _fetch_env(monkeypatch)
+    modules_dir = tmp_path / "modules"
+    modules_dir.mkdir()
+    cache = tmp_path / "c.json"
+    monkeypatch.setenv(module_setup.REGISTRY_RESOLVED_CACHE_ENV, str(cache))
+    cache.write_text(__import__("json").dumps(_resolved_payload()))
+
+    monkeypatch.setattr(
+        module_setup, "_live_fetch_registry_resolved", lambda base, tok: None
+    )
+    slept: list[float] = []
+    got = module_setup._fetch_registry_resolved(
+        str(modules_dir), retries=2, backoff_seconds=0.01, sleep=slept.append,
+    )
+    assert got is not None and got["_from_cache"] is True
+    assert len(slept) == 2  # retried before giving up
+
+
+def test_degraded_empty_boots_and_logs(tmp_path: Path, monkeypatch, caplog):
+    """Fetch failed + no cache + nothing baked-in → degraded-empty result,
+    the agent still 'boots' (no raise), and the structured event is logged."""
+    monkeypatch.setenv(FEATURE_FLAG_ENV, "true")
+    modules_dir = tmp_path / "modules"
+    skills_dir = tmp_path / "skills"
+
+    # Simulate the Beat 4 lean image: no baked-in modules discoverable.
+    import superpos_agent_core.registry_overlay as ro
+    monkeypatch.setattr(ro, "discover_modules", lambda *a, **k: [])
+
+    with caplog.at_level("WARNING"):
+        result = apply_registry_overlay(
+            None, modules_dir=str(modules_dir), skills_dir=str(skills_dir),
+        )
+
+    assert result.fetch_failed is True
+    assert result.degraded_empty is True
+    assert any(
+        RESOLVED_EMPTY_NO_FALLBACK_EVENT in r.message for r in caplog.records
+    )
+
+
+def test_degraded_empty_when_baked_in_present_is_benign(
+    tmp_path: Path, monkeypatch
+):
+    """Fetch failed + no cache but baked-in modules exist → benign degrade,
+    NOT degraded-empty."""
+    monkeypatch.setenv(FEATURE_FLAG_ENV, "true")
+    # Real package bundled modules are discoverable → has_baked_in is True.
+    result = apply_registry_overlay(
+        None, modules_dir=str(tmp_path / "modules"),
+        skills_dir=str(tmp_path / "skills"),
+    )
+    assert result.fetch_failed is True
+    assert result.degraded_empty is False
+
+
+def test_run_setup_degraded_empty_does_not_raise(tmp_path: Path, monkeypatch):
+    """A degraded-empty boot must never crash run_setup."""
+    monkeypatch.setenv(FEATURE_FLAG_ENV, "true")
+    import superpos_agent_core.registry_overlay as ro
+    monkeypatch.setattr(ro, "discover_modules", lambda *a, **k: [])
+    # Should simply return.
+    module_setup.run_setup(
+        str(tmp_path / "modules"),
+        str(_agents_md(tmp_path)),
+        registry_resolved=None,
+        skills_dir=str(tmp_path / "skills"),
+    )
+
+
+def test_failed_fetch_does_not_purge_installed_registry_module(
+    tmp_path: Path, monkeypatch
+):
+    """Reconcile safety: a fetch failure (resolved=None) short-circuits the
+    destructive reconcile, so an already-installed registry module survives."""
+    monkeypatch.setenv(FEATURE_FLAG_ENV, "true")
+    modules_dir = tmp_path / "modules"
+    bin_dir = tmp_path / "bin"
+    skills_dir = tmp_path / "skills"
+    agents_md = _agents_md(tmp_path)
+
+    # First install a registry module from a good payload.
+    apply_registry_overlay(
+        _resolved_payload(), modules_dir=str(modules_dir),
+        skills_dir=str(skills_dir), agents_md_path=str(agents_md),
+        bin_dir=str(bin_dir),
+    )
+    assert (modules_dir / "registry-only-mod" / "module.yaml").is_file()
+
+    # Now a failed fetch → must NOT remove the installed registry module.
+    result = apply_registry_overlay(
+        None, modules_dir=str(modules_dir), skills_dir=str(skills_dir),
+        agents_md_path=str(agents_md), bin_dir=str(bin_dir),
+    )
+    assert result.fetch_failed is True
+    assert (modules_dir / "registry-only-mod" / "module.yaml").is_file()
+
+
+def test_flag_off_never_fetches_or_touches_cache(tmp_path: Path, monkeypatch):
+    """Flag OFF → main() makes zero fetches and never writes the cache."""
+    monkeypatch.setenv(FEATURE_FLAG_ENV, "false")
+    modules_dir = tmp_path / "modules"
+    cache = tmp_path / "cache.json"
+    monkeypatch.setenv(module_setup.REGISTRY_RESOLVED_CACHE_ENV, str(cache))
+
+    def _boom(base, tok):
+        raise AssertionError("must not live-fetch when flag off")
+
+    monkeypatch.setattr(module_setup, "_live_fetch_registry_resolved", _boom)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "module_setup",
+            "--modules-dir", str(modules_dir),
+            "--agents-md", str(_agents_md(tmp_path)),
+        ],
+    )
+    module_setup.main()
+    assert not cache.exists()
+
+
+def test_cache_write_is_atomic_via_replace(tmp_path: Path, monkeypatch):
+    """The cache write must go through a temp file + os.replace (atomic)."""
+    import os as _os
+
+    replaced: list[tuple] = []
+    real_replace = _os.replace
+
+    def _spy_replace(src, dst):
+        replaced.append((src, dst))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(module_setup.os, "replace", _spy_replace)
+    cache = tmp_path / "out" / "cache.json"
+    monkeypatch.setenv(module_setup.REGISTRY_RESOLVED_CACHE_ENV, str(cache))
+
+    module_setup._write_registry_resolved_cache(_resolved_payload(), None)
+    assert cache.is_file()
+    assert replaced and Path(replaced[-1][1]) == cache
+    # The temp source must not linger.
+    assert not Path(replaced[-1][0]).exists()
