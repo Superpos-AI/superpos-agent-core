@@ -15,11 +15,14 @@ modules should declare their Python deps in core's own ``pyproject.toml``.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import stat
 import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 from .module_loader import (
@@ -33,6 +36,21 @@ log = logging.getLogger(__name__)
 
 BEGIN_MARKER = "<!-- MODULES:BEGIN -->"
 END_MARKER = "<!-- MODULES:END -->"
+
+#: Env override for the last-good ``/registry/resolved`` cache file.  When
+#: unset the cache lands beside the workspace modules dir (see
+#: :func:`_registry_resolved_cache_path`).  This is the resilience anchor for
+#: the Beat 4 lean image: a registry outage at startup falls back to the last
+#: payload we successfully fetched instead of an empty / None resolve.
+REGISTRY_RESOLVED_CACHE_ENV = "SUPERPOS_REGISTRY_RESOLVED_CACHE"
+
+#: Number of *extra* live-fetch attempts after the first (total attempts =
+#: 1 + _REGISTRY_FETCH_RETRIES).  Bounded so startup never hangs.
+_REGISTRY_FETCH_RETRIES = 2
+
+#: Initial backoff (seconds) between live-fetch attempts; doubled each retry.
+#: With 2 retries the worst-case total sleep is ~1+2 = 3s, well under ~30s.
+_REGISTRY_FETCH_BACKOFF_SECONDS = 1.0
 
 
 def render_modules_block(modules: list[ModuleInfo]) -> str:
@@ -249,24 +267,71 @@ def run_setup(
         )
 
 
-def _fetch_registry_resolved() -> dict | None:
-    """Sync fetch of ``/registry/resolved`` for the CLI entrypoint path.
+def _registry_resolved_cache_path(modules_dir: str | None = None) -> Path:
+    """Path of the last-good ``/registry/resolved`` cache file.
 
-    Mirrors ``sub_agent_sync.fetch_runtime_bundle``'s defensive style:
-    returns ``None`` on any transport / status / parse failure so the
-    caller falls back entirely to baked-in.  Only called when the Beat 2b
-    flag is on and ``SUPERPOS_BASE_URL`` / ``SUPERPOS_API_TOKEN`` are set.
+    ``SUPERPOS_REGISTRY_RESOLVED_CACHE`` wins when set.  Otherwise the cache
+    lands beside the persistent workspace ``modules_dir`` (where the overlay
+    already writes registry-managed module dirs), so it survives container
+    restarts the same way those installs do.  When no modules dir is known
+    we fall back to ``$HOME/.superpos`` — the same persistent state root the
+    GitHub credential cache uses.
     """
+    override = os.environ.get(REGISTRY_RESOLVED_CACHE_ENV)
+    if override:
+        return Path(override)
+    if modules_dir:
+        # Sibling of the modules dir, not inside it — so it is never mistaken
+        # for a module dir by discover/reconcile.
+        return Path(modules_dir).parent / ".registry-resolved.json"
+    root = os.environ.get("SUPERPOS_STATE_DIR") or os.path.join(
+        os.environ.get("HOME", "/tmp"), ".superpos"
+    )
+    return Path(root) / "registry-resolved.json"
+
+
+def _write_registry_resolved_cache(payload: dict, modules_dir: str | None) -> None:
+    """Atomically persist a freshly-fetched resolved payload as last-good.
+
+    Writes to a temp file in the same directory and ``os.replace``s it into
+    place so a crash mid-write never leaves a truncated cache.  Failures are
+    logged and swallowed — a cache-write problem must never break startup.
+    """
+    path = _registry_resolved_cache_path(modules_dir)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(
+            prefix=".registry-resolved.", suffix=".tmp", dir=str(path.parent)
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        log.debug("Cached registry resolved payload to %s", path)
+    except Exception as exc:  # noqa: BLE001 — cache write is best-effort
+        log.warning("Could not write registry resolved cache %s: %s", path, exc)
+
+
+def _load_registry_resolved_cache(modules_dir: str | None) -> dict | None:
+    """Load the last-good resolved payload, or ``None`` when absent/corrupt."""
+    path = _registry_resolved_cache_path(modules_dir)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _live_fetch_registry_resolved(base_url: str, token: str) -> dict | None:
+    """Single live GET of ``/registry/resolved``; ``None`` on any failure."""
     import httpx
 
-    base_url = os.environ.get("SUPERPOS_BASE_URL", "").rstrip("/")
-    token = os.environ.get("SUPERPOS_API_TOKEN", "")
-    if not base_url or not token:
-        log.warning(
-            "Registry overlay flag on but SUPERPOS_BASE_URL/SUPERPOS_API_TOKEN "
-            "unset; falling back to baked-in.",
-        )
-        return None
     try:
         with httpx.Client(
             base_url=base_url, timeout=30.0, follow_redirects=True,
@@ -280,16 +345,82 @@ def _fetch_registry_resolved() -> dict | None:
             )
         if resp.status_code != 200:
             log.warning(
-                "Registry resolved returned %s; falling back to baked-in.",
-                resp.status_code,
+                "Registry resolved returned %s.", resp.status_code,
             )
             return None
         data = resp.json()
-    except Exception as exc:  # noqa: BLE001 — degrade to baked-in on any error
-        log.warning("Registry resolved fetch failed (%s); baked-in only.", exc)
+    except Exception as exc:  # noqa: BLE001 — degrade on any transport/parse error
+        log.warning("Registry resolved live fetch failed (%s).", exc)
         return None
     payload = data.get("data", data) if isinstance(data, dict) else None
     return payload if isinstance(payload, dict) else None
+
+
+def _fetch_registry_resolved(
+    modules_dir: str | None = None,
+    *,
+    retries: int = _REGISTRY_FETCH_RETRIES,
+    backoff_seconds: float = _REGISTRY_FETCH_BACKOFF_SECONDS,
+    sleep=time.sleep,
+) -> dict | None:
+    """Resolve ``/registry/resolved`` resiliently for the CLI entrypoint path.
+
+    Strategy (Beat 4 lean-image prerequisite):
+
+    1. Try the live GET up to ``1 + retries`` times with bounded exponential
+       backoff (total sleep ≤ ~30s) — a transient blip should not drop us to
+       the fallback.
+    2. On a successful fetch, persist the raw payload as the **last-good**
+       cache (atomically) and return it.
+    3. On an all-attempts failure, load + return the last-good cache (tagged
+       with ``_from_cache=True`` so the caller / logs can tell it apart from
+       a live resolve) — so a registry outage keeps the agent's registry
+       skills + modules instead of wiping them.
+    4. Only return ``None`` when the live fetch failed AND there is no cache.
+
+    Only called when the Beat 2b flag is on.  Returns ``None`` immediately
+    (no cache use) when ``SUPERPOS_BASE_URL`` / ``SUPERPOS_API_TOKEN`` are
+    unset, matching today's behaviour.
+    """
+    base_url = os.environ.get("SUPERPOS_BASE_URL", "").rstrip("/")
+    token = os.environ.get("SUPERPOS_API_TOKEN", "")
+    if not base_url or not token:
+        log.warning(
+            "Registry overlay flag on but SUPERPOS_BASE_URL/SUPERPOS_API_TOKEN "
+            "unset; falling back to baked-in.",
+        )
+        return None
+
+    delay = backoff_seconds
+    for attempt in range(retries + 1):
+        payload = _live_fetch_registry_resolved(base_url, token)
+        if payload is not None:
+            _write_registry_resolved_cache(payload, modules_dir)
+            return payload
+        if attempt < retries:
+            log.warning(
+                "Registry resolved fetch attempt %d/%d failed; retrying in %.1fs.",
+                attempt + 1, retries + 1, delay,
+            )
+            if delay > 0:
+                sleep(delay)
+            delay *= 2
+
+    # Live fetch exhausted — fall back to the last-good cache before giving up.
+    cached = _load_registry_resolved_cache(modules_dir)
+    if cached is not None:
+        log.warning(
+            "Registry resolved live fetch failed after %d attempt(s); "
+            "using last-good cache from %s.",
+            retries + 1, _registry_resolved_cache_path(modules_dir),
+        )
+        cached["_from_cache"] = True
+        return cached
+    log.warning(
+        "Registry resolved live fetch failed and no cache available; "
+        "falling back to baked-in.",
+    )
+    return None
 
 
 def main() -> None:
@@ -333,7 +464,7 @@ def main() -> None:
     # half when no skills dir is available.
     registry_resolved = None
     if feature_enabled():
-        registry_resolved = _fetch_registry_resolved()
+        registry_resolved = _fetch_registry_resolved(args.modules_dir)
 
     run_setup(
         args.modules_dir,

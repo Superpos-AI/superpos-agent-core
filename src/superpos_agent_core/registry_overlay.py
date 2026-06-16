@@ -71,6 +71,15 @@ from .module_setup import (
 log = logging.getLogger(__name__)
 
 
+#: Structured log record emitted when the flag is ON, the live fetch failed,
+#: there is no last-good cache, AND nothing baked-in is available — the
+#: "degraded-empty" boot.  The agent still comes up and keeps polling so it
+#: can self-heal once the registry recovers; it just has zero registry-served
+#: skills/modules for now.  Asserted by tests; grep-able in production logs.
+#: This is the safety net the Beat 4 lean (no baked-in) image relies on.
+RESOLVED_EMPTY_NO_FALLBACK_EVENT = "registry.resolved_empty_no_fallback"
+
+
 #: Env var that gates the whole Beat 2b overlay.  ON by default — agents
 #: overlay the registry-served set without needing an env override.  An
 #: explicit falsey value (``0``/``false``/``no``/``off``, case-insensitive)
@@ -474,6 +483,28 @@ def remove_registry_overlay_modules(
 # ── Top-level overlay entry point ────────────────────────────────────
 
 
+def _has_baked_in_fallback(modules_dir: str, skills_dir: str | None) -> bool:
+    """True when *something* is already on disk to fall back to.
+
+    Used only on a failed fetch with no cache to decide between a benign
+    "degrade to baked-in" and the "degraded-empty" boot.  We count any
+    discoverable module (bundled or workspace) and any ``<slug>.md`` skill
+    already written under ``skills_dir``.  Beat 4 drops the baked-in
+    artifacts, so on the lean image this returns False and the degraded-empty
+    path lights up — exactly the case this PR makes safe.
+    """
+    try:
+        if discover_modules(modules_dir if os.path.isdir(modules_dir) else None):
+            return True
+    except Exception:  # noqa: BLE001 — discovery must never break the boot decision
+        pass
+    if skills_dir:
+        skills_root = Path(skills_dir)
+        if skills_root.is_dir() and any(skills_root.glob("*.md")):
+            return True
+    return False
+
+
 @dataclass
 class RegistryOverlayResult:
     """Outcome of :func:`apply_registry_overlay`.
@@ -481,10 +512,15 @@ class RegistryOverlayResult:
     ``skipped`` is True when the feature flag is off — the instant-rollback
     state.  ``fetch_failed`` is True when the flag was on but the resolved
     payload was missing (fetch/parse failure) and we fell back to baked-in.
+    ``degraded_empty`` is True in the worst case: fetch failed, no last-good
+    cache, AND nothing baked-in available — the agent boots with zero
+    registry skills/modules and keeps polling so it self-heals once the
+    registry recovers.  It implies ``fetch_failed``.
     """
 
     skipped: bool = False
     fetch_failed: bool = False
+    degraded_empty: bool = False
     skills: SkillOverlayResult = field(default_factory=SkillOverlayResult)
     modules: ModuleOverlayResult = field(default_factory=ModuleOverlayResult)
 
@@ -534,14 +570,35 @@ def apply_registry_overlay(
         return RegistryOverlayResult(skipped=True)
 
     if resolved is None:
-        # Fetch / HTTP / parse failure — degrade to baked-in.  The agent
-        # still starts; baked-in modules + skills (already installed by the
-        # caller's run_setup) remain the source of truth.
+        # Live fetch failed AND no last-good cache (the fetch layer already
+        # tried the cache before handing us ``None``).  We never raise here:
+        # a polling agent MUST come up even with zero skills/modules so it can
+        # self-heal once the registry recovers.  The destructive reconcile is
+        # *not* run on this path, so a transient outage can't wipe a
+        # previously-installed registry module.
+        if _has_baked_in_fallback(modules_dir, skills_dir):
+            # Benign degrade — baked-in (bundled / already-installed) artifacts
+            # remain the source of truth, exactly as today.
+            log.warning(
+                "Registry resolved fetch failed; falling back entirely to "
+                "baked-in skills + modules (agent still starts)."
+            )
+            return RegistryOverlayResult(fetch_failed=True)
+        # Degraded-empty: nothing live, nothing cached, nothing baked-in.
+        # Boot anyway with zero registry artifacts and keep polling.
         log.warning(
-            "Registry resolved fetch failed; falling back entirely to "
-            "baked-in skills + modules (agent still starts)."
+            "%s — registry fetch failed, no last-good cache, and no baked-in "
+            "skills/modules available; booting DEGRADED with zero registry "
+            "artifacts and continuing to poll (will self-heal when the "
+            "registry recovers).",
+            RESOLVED_EMPTY_NO_FALLBACK_EVENT,
+            extra={
+                "event": RESOLVED_EMPTY_NO_FALLBACK_EVENT,
+                "modules_dir": modules_dir,
+                "skills_dir": skills_dir,
+            },
         )
-        return RegistryOverlayResult(fetch_failed=True)
+        return RegistryOverlayResult(fetch_failed=True, degraded_empty=True)
 
     skill_items = resolved.get("skills") or []
     module_items = resolved.get("modules") or []
@@ -614,6 +671,7 @@ __all__ = [
     "MODULE_INSTALL_FAILED_EVENT",
     "MODULE_REMOVED_EVENT",
     "REGISTRY_MANAGED_MARKER",
+    "RESOLVED_EMPTY_NO_FALLBACK_EVENT",
     "ModuleOverlayResult",
     "RegistryOverlayResult",
     "SkillOverlayResult",
