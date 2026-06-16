@@ -31,6 +31,7 @@ superpos_agent_core = [
     "modules/**/*.yaml",
     "modules/**/*.md",
     "modules/**/scripts/*",
+    "skills/*.md",
     "wiki/*.md",
     "superpos_task_SKILL.md",
 ]
