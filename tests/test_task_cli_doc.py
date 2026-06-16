@@ -13,10 +13,12 @@ The whole point of :mod:`superpos_agent_core.task_cli_doc` is that the docs
 from __future__ import annotations
 
 import argparse
+import subprocess
+import sys
 from pathlib import Path
 
-from superpos_agent_core import render_task_cli_reference
 from superpos_agent_core.superpos_task import build_parser
+from superpos_agent_core.task_cli_doc import render_task_cli_reference
 
 
 def _subparsers(parser: argparse.ArgumentParser):
@@ -127,3 +129,37 @@ def test_run_module_setup_injects_reference_into_system_prompt(tmp_path: Path):
     assert "--self-target" in block
     # The discovered-modules listing still follows the CLI reference.
     assert "Installed Modules" in block
+
+
+def test_module_runs_as_main_without_runtime_warning():
+    """``python -m superpos_agent_core.task_cli_doc`` is the documented way to
+    preview the reference. It must run cleanly.
+
+    Re-exporting ``render_task_cli_reference`` from the package ``__init__``
+    pulls ``task_cli_doc`` into ``sys.modules`` while runpy imports the parent
+    package, so executing the same module as ``__main__`` afterwards trips a
+    ``RuntimeWarning`` ("found in sys.modules ... prior to execution"). We keep
+    the renderer importable only from the submodule to avoid that; ``-W
+    error::RuntimeWarning`` turns any regression into a non-zero exit."""
+    result = subprocess.run(
+        [sys.executable, "-W", "error::RuntimeWarning", "-m",
+         "superpos_agent_core.task_cli_doc"],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, (
+        f"running the module as __main__ failed (likely a RuntimeWarning "
+        f"escalated to an error):\n{result.stderr}"
+    )
+    assert "RuntimeWarning" not in result.stderr, result.stderr
+    assert "`superpos-task` CLI" in result.stdout
+
+
+def test_renderer_not_reexported_from_package_root():
+    """Guard the fix: the renderer must NOT be re-exported from the package
+    root, because the eager import is exactly what triggers the runpy
+    RuntimeWarning. Callers import it from the submodule instead."""
+    import superpos_agent_core
+
+    assert not hasattr(superpos_agent_core, "render_task_cli_reference")
+    assert "render_task_cli_reference" not in superpos_agent_core.__all__
