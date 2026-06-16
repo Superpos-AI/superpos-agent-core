@@ -222,6 +222,46 @@ def test_flag_on_installs_skills_and_modules(tmp_path: Path, monkeypatch):
     doc = agents_md.read_text()
     assert "registry-only-mod" in doc
     assert "superpos-github" in doc  # baked-in not in registry → remains
+    # The overlay re-render must KEEP the superpos-task CLI reference that
+    # run_setup prepended — it must not be replaced by module docs only.
+    assert "`superpos-task` CLI" in doc
+    assert "--self-target" in doc
+
+
+def test_registry_overlay_preserves_task_cli_reference(tmp_path: Path, monkeypatch):
+    """Regression for the overlay dropping the CLI reference.
+
+    When the flag is ON and the resolved payload contains a registry module,
+    run_setup prepends the superpos-task CLI reference and then the overlay
+    re-renders the MODULES block.  That re-render must include the CLI
+    reference, not module docs only — otherwise the anti-drift doc vanishes
+    on every registry-backed startup.
+    """
+    monkeypatch.setenv(FEATURE_FLAG_ENV, "true")
+    modules_dir = tmp_path / "modules"
+    skills_dir = tmp_path / "skills"
+    agents_md = _agents_md(tmp_path)
+
+    module_setup.run_setup(
+        str(modules_dir),
+        str(agents_md),
+        bin_dir=str(tmp_path / "bin"),
+        registry_resolved=_resolved_payload(),
+        skills_dir=str(skills_dir),
+    )
+
+    content = agents_md.read_text()
+    begin = content.index(BEGIN)
+    end = content.index(END)
+    block = content[begin:end]
+
+    # The CLI reference survived the overlay re-render…
+    assert "`superpos-task` CLI" in block
+    assert "--self-target" in block
+    # …and it still leads the block, with the modules listing after it.
+    assert block.index("`superpos-task` CLI") < block.index("Installed Modules")
+    # The registry module is also present (overlay actually ran).
+    assert "registry-only-mod" in block
 
 
 def test_flag_on_registry_module_wins_on_slug_collision(tmp_path: Path, monkeypatch):

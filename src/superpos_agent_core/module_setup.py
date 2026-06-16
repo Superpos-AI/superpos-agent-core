@@ -23,6 +23,7 @@ import sys
 from pathlib import Path
 
 from .module_loader import (
+    ModuleInfo,
     bundled_modules_dir,
     discover_modules,
     generate_modules_doc,
@@ -32,6 +33,24 @@ log = logging.getLogger(__name__)
 
 BEGIN_MARKER = "<!-- MODULES:BEGIN -->"
 END_MARKER = "<!-- MODULES:END -->"
+
+
+def render_modules_block(modules: list[ModuleInfo]) -> str:
+    """Render the full MODULES block: superpos-task CLI reference + modules doc.
+
+    The auto-generated block always leads with the ``superpos-task`` CLI
+    reference (rendered from the live argparse parser, so it can never drift
+    from the installed flags) followed by the discovered-modules listing.
+
+    This is the single source of truth for the block's content so every code
+    path that re-renders it — the baked-in :func:`run_setup` and the registry
+    overlay's :func:`registry_overlay.apply_registry_overlay` — keeps the CLI
+    reference instead of one path silently dropping it.
+    """
+    # Imported lazily to avoid a circular import at module load time.
+    from .task_cli_doc import render_task_cli_reference
+
+    return render_task_cli_reference() + "\n" + generate_modules_doc(modules)
 
 
 def run_setup_scripts(modules_dir: str) -> None:
@@ -202,8 +221,10 @@ def run_setup(
     if bin_dir:
         symlink_module_scripts(modules_dir, bin_dir)
 
-    doc = generate_modules_doc(modules)
-    update_agents_md(doc, agents_md_path)
+    # The auto-generated block leads with the superpos-task CLI reference
+    # (rendered from the live argparse parser, so it can never drift from the
+    # installed flags) followed by the discovered-modules listing.
+    update_agents_md(render_modules_block(modules), agents_md_path)
 
     # Beat 2b: overlay registry-served skills + modules on top of baked-in.
     # Imported lazily to avoid a circular import (registry_overlay imports
