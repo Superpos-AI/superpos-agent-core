@@ -43,12 +43,17 @@ def get_skill(name: str) -> str:
     """Return the absolute on-disk path to the bundled ``<name>.md`` skill.
 
     Raises :class:`FileNotFoundError` with a helpful message listing the
-    available skills if no such skill is bundled.
+    available skills if no such skill is bundled.  Only known bundled
+    slugs are accepted: path-like or absolute ``name`` values (e.g.
+    ``"/tmp/x"`` or ``"../x"``) are rejected even if a matching ``.md``
+    file happens to exist on disk, so this helper cannot be used to read
+    arbitrary files outside the bundled skills directory.
     """
-    path = Path(bundled_skills_dir()) / f"{name}.md"
-    if not path.is_file():
-        available = ", ".join(list_bundled_skills()) or "(none)"
+    root = Path(bundled_skills_dir())
+    available = list_bundled_skills()
+    if name not in available:
+        available_msg = ", ".join(available) or "(none)"
         raise FileNotFoundError(
-            f"no bundled skill named {name!r}; available skills: {available}"
+            f"no bundled skill named {name!r}; available skills: {available_msg}"
         )
-    return str(path)
+    return str(root / f"{name}.md")
