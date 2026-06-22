@@ -25,6 +25,8 @@ from pathlib import Path
 import httpx
 import yaml
 
+from .persona_overlay import read_memory
+
 log = logging.getLogger(__name__)
 
 MANAGED_MARKER = "<!-- managed-by: superpos-sync -->"
@@ -311,6 +313,7 @@ def sync_sub_agents(
     skills_dir: str | None = None,
     definitions: list[dict] | None = None,
     memory: str | None = None,
+    memory_snapshot_dir: str | None = None,
 ) -> int:
     """Sync SubAgentDefinitions from Superpos to the subagents directory.
 
@@ -318,6 +321,11 @@ def sync_sub_agents(
     (useful when the caller already has the data, e.g. from an async
     ``SuperposClient.get_runtime_bundle()`` call).  Otherwise, fetches
     from the API using sync HTTP.
+
+    When ``memory_snapshot_dir`` is provided (and ``inject_memory`` is set),
+    the MEMORY read is routed through the AG-10 snapshot overlay: a Superpos
+    outage degrades to the read-only workspace snapshot instead of dropping
+    MEMORY injection, and a reachable read re-syncs that snapshot.
 
     Returns the number of definitions synced.
     """
@@ -350,6 +358,25 @@ def sync_sub_agents(
                 memory = fetch_persona_memory(base_url, token)
     elif not inject_memory:
         memory = None
+
+    # AG-10 memory doubling: route the read through the snapshot overlay so a
+    # Superpos outage degrades to the read-only snapshot instead of dropping
+    # MEMORY injection, and a reachable read re-syncs the workspace snapshot.
+    # ttl_seconds=0 forces a fresh fetch every sync (we already hold the live
+    # value); the overlay only owns the success-resync / outage-fallback edges.
+    if inject_memory and memory_snapshot_dir is not None:
+        fetched_memory = memory
+        mem_result = read_memory(
+            lambda: fetched_memory,
+            snapshot_dir=memory_snapshot_dir,
+            ttl_seconds=0,
+        )
+        memory = mem_result.content
+        if mem_result.fetch_failed:
+            log.warning(
+                "MEMORY unavailable from Superpos; using %s snapshot",
+                mem_result.source,
+            )
 
     if memory:
         log.info("Agent MEMORY: %d chars", len(memory))
@@ -435,6 +462,10 @@ def main() -> None:
         "--skills-dir",
         help="Skills directory to scan",
     )
+    parser.add_argument(
+        "--memory-snapshot-dir",
+        help="Snapshot dir for MEMORY read fallback (AG-10 doubling)",
+    )
 
     args = parser.parse_args()
     base_url, token = _base_config()
@@ -446,6 +477,7 @@ def main() -> None:
         inject_memory=args.inject_memory,
         modules_dir=args.modules_dir if args.inject_modules else None,
         skills_dir=args.skills_dir if args.inject_modules else None,
+        memory_snapshot_dir=args.memory_snapshot_dir,
     )
 
     print(f"Synced {count} sub-agent definition(s)")

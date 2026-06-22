@@ -10,6 +10,7 @@ import time
 
 from .config import BaseConfig
 from .executor import Executor, ExecutionRequest
+from .persona_overlay import apply_persona_overlay
 from .sub_agent_sync import sync_sub_agents as _sync_sub_agents
 from .superpos_client import SuperposClient
 from .worktree_manager import infer_branch
@@ -219,6 +220,7 @@ def _resync_sub_agents(
                 inject_memory=True,
                 modules_dir=modules_dir,
                 skills_dir=skills_dir,
+                memory_snapshot_dir=os.path.join(working_dir, ".persona-snapshot"),
             )
             if count:
                 log.info("Re-synced %d sub-agent definition(s) after persona bump", count)
@@ -282,16 +284,38 @@ async def run_superpos_poller(
                 )
                 if persona_changed:
                     new_persona = await superpos.get_persona_assembled()
-                    executor.update_persona(new_persona, version=server_version)
-                    persona_version = server_version
-                    if server_platform_version is not None:
-                        platform_context_version = server_platform_version
-                    if server_environment_version is not None:
-                        environment_version = server_environment_version
-                    log.info(
-                        "Persona refreshed (version=%s, platform=%s, env=%s)",
-                        persona_version, platform_context_version, environment_version,
+                    # AG-10 persona doubling: re-sync the workspace snapshot on a reachable
+                    # fetch and, on an outage, fall back to the last-known-good snapshot
+                    # instead of pushing None into the live executor (which would degrade the
+                    # agent to no persona).  Flag OFF → passthrough of today's behaviour.
+                    persona_snapshot_dir = os.path.join(
+                        config.executor_working_dir, ".persona-snapshot"
                     )
+                    persona_result = apply_persona_overlay(
+                        new_persona, snapshot_dir=persona_snapshot_dir
+                    )
+                    effective_persona = (
+                        new_persona if persona_result.skipped else persona_result.persona
+                    )
+                    executor.update_persona(effective_persona, version=server_version)
+                    if persona_result.fetch_failed:
+                        # Served a snapshot — do NOT advance tracked versions so the next
+                        # reachable poll re-fetches and re-syncs the workspace snapshot.
+                        log.warning(
+                            "Persona unavailable from Superpos during refresh; using %s "
+                            "snapshot (will retry next poll)",
+                            persona_result.source,
+                        )
+                    else:
+                        persona_version = server_version
+                        if server_platform_version is not None:
+                            platform_context_version = server_platform_version
+                        if server_environment_version is not None:
+                            environment_version = server_environment_version
+                        log.info(
+                            "Persona refreshed (version=%s, platform=%s, env=%s)",
+                            persona_version, platform_context_version, environment_version,
+                        )
                 else:
                     # Seed local tracking for first-run / pre-existing state so
                     # subsequent polls correctly compare known→server values.
