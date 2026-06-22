@@ -60,7 +60,8 @@ revision.
 ### Visibility & active state
 
 - New items are **hive**-visible by default; pass `--private` to make them
-  owner-only.
+  owner-only. A private create resolves the owner from `SUPERPOS_AGENT_ID`
+  (or an explicit `--owner-agent-id`); it errors if neither is set.
 - On update, `--private` / `--hive` change visibility and `--is-active` /
   `--draft` toggle whether the item is live or a draft.
 

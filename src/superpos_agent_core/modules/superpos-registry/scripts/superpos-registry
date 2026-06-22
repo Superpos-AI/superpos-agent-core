@@ -190,6 +190,19 @@ async def _run(args: argparse.Namespace) -> int:
                 )
                 return 2
             visibility = "private" if args.private else None
+            # A private item is owner-scoped server-side; the API rejects a
+            # private create that carries no owner (422). Default the owner to
+            # this agent's id when --owner-agent-id wasn't supplied.
+            owner_agent_id = args.owner_agent_id
+            if args.private and owner_agent_id is None:
+                owner_agent_id = config.superpos_agent_id or None
+            if args.private and owner_agent_id is None:
+                print(
+                    "Error: --private requires an owner; set SUPERPOS_AGENT_ID "
+                    "or pass --owner-agent-id.",
+                    file=sys.stderr,
+                )
+                return 2
             try:
                 _print(await client.create_registry_item(
                     args.kind,
@@ -198,7 +211,7 @@ async def _run(args: argparse.Namespace) -> int:
                     payload=payload,
                     description=args.description,
                     visibility=visibility,
-                    owner_agent_id=args.owner_agent_id,
+                    owner_agent_id=owner_agent_id,
                     message=args.message,
                 ))
             except ValueError as e:

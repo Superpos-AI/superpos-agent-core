@@ -108,19 +108,64 @@ async def test_create_dispatches_with_payload_and_body(monkeypatch, tmp_path):
     assert kw["visibility"] is None
 
 
-async def test_create_private_sets_visibility(monkeypatch):
+async def test_create_private_defaults_owner_to_agent_id(monkeypatch):
     _set_env(monkeypatch)
+    monkeypatch.setenv("SUPERPOS_AGENT_ID", "agent-007")
     mod = _load_script()
     mock_create = AsyncMock(return_value={"id": "r1"})
 
     with patch.object(mod.SuperposClient, "create_registry_item", mock_create), \
          patch.object(mod.SuperposClient, "close", AsyncMock()):
-        await mod._run(mod._build_parser().parse_args([
+        rc = await mod._run(mod._build_parser().parse_args([
             "create", "--kind", "module", "--slug", "foo", "--name", "Foo",
             "--payload", '{"manifest": {}}', "--private",
         ]))
 
-    assert mock_create.await_args.kwargs["visibility"] == "private"
+    assert rc == 0
+    kw = mock_create.await_args.kwargs
+    assert kw["visibility"] == "private"
+    # --private with no --owner-agent-id falls back to SUPERPOS_AGENT_ID.
+    assert kw["owner_agent_id"] == "agent-007"
+
+
+async def test_create_private_without_owner_errors(monkeypatch, capsys):
+    _set_env(monkeypatch)
+    # No SUPERPOS_AGENT_ID and no --owner-agent-id → cannot resolve an owner.
+    monkeypatch.delenv("SUPERPOS_AGENT_ID", raising=False)
+    mod = _load_script()
+    mock_create = AsyncMock()
+
+    with patch.object(mod.SuperposClient, "create_registry_item", mock_create), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        rc = await mod._run(mod._build_parser().parse_args([
+            "create", "--kind", "module", "--slug", "foo", "--name", "Foo",
+            "--payload", '{"manifest": {}}', "--private",
+        ]))
+
+    assert rc == 2
+    assert not mock_create.called
+    assert "--private requires an owner" in capsys.readouterr().err
+
+
+async def test_create_private_explicit_owner_wins(monkeypatch):
+    _set_env(monkeypatch)
+    monkeypatch.setenv("SUPERPOS_AGENT_ID", "agent-007")
+    mod = _load_script()
+    mock_create = AsyncMock(return_value={"id": "r1"})
+
+    with patch.object(mod.SuperposClient, "create_registry_item", mock_create), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        rc = await mod._run(mod._build_parser().parse_args([
+            "create", "--kind", "module", "--slug", "foo", "--name", "Foo",
+            "--payload", '{"manifest": {}}', "--private",
+            "--owner-agent-id", "explicit-99",
+        ]))
+
+    assert rc == 0
+    kw = mock_create.await_args.kwargs
+    assert kw["visibility"] == "private"
+    # Explicit --owner-agent-id overrides the SUPERPOS_AGENT_ID fallback.
+    assert kw["owner_agent_id"] == "explicit-99"
 
 
 async def test_create_without_payload_or_body_errors(monkeypatch, capsys):
