@@ -150,7 +150,12 @@ def fetch_persona_memory(base_url: str, token: str) -> str | None:
 
     - **Reachable** (HTTP 200) → return the document content, or ``None`` when
       the document is empty / blank.  ``None`` here means *reachable-empty*.
-    - **Outage** (transport error, or any non-200 status) → raise
+    - **Reachable-empty** (HTTP 404) → return ``None``.  The server's
+      ``PersonaController::document()`` returns ``notFound()`` for both "no
+      active persona for this agent" and "MEMORY document missing", so a 404 is
+      a reachable cleared state — NOT an outage.  Mirrors
+      :meth:`SuperposClient.get_persona_assembled`.
+    - **Outage** (transport error, or any other non-200 status) → raise
       :class:`MemoryFetchUnavailable` so callers fall back to the snapshot.
     """
     try:
@@ -164,6 +169,11 @@ def fetch_persona_memory(base_url: str, token: str) -> str | None:
         raise MemoryFetchUnavailable(
             f"MEMORY fetch transport error: {exc}"
         ) from exc
+    # 404 is the server's reachable "no active persona / no MEMORY document"
+    # state, NOT an outage — return reachable-empty so callers clear the stale
+    # snapshot instead of resurrecting it.
+    if resp.status_code == 404:
+        return None
     if resp.status_code != 200:
         raise MemoryFetchUnavailable(
             f"MEMORY endpoint returned {resp.status_code}"

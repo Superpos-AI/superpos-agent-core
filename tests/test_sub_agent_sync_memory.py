@@ -101,3 +101,39 @@ def test_outage_falls_back_to_snapshot(tmp_path, monkeypatch):
     assert "snap-mem" in content
     # Outage must not clear the snapshot.
     assert (snap_dir / MEMORY_SNAPSHOT_FILENAME).exists()
+
+
+def test_legacy_fallback_404_clears_stale_snapshot(tmp_path, monkeypatch):
+    """Regression (PR #53 review): in the legacy fallback path (no runtime
+    bundle), a 404 from the MEMORY endpoint is now reachable-empty
+    (``fetch_persona_memory`` returns ``None``), so an existing MEMORY snapshot
+    is cleared and NOT injected after MEMORY / the active persona was removed.
+    """
+    sub_dir = tmp_path / "subagents"
+    snap_dir = tmp_path / "snap"
+    snap_dir.mkdir(parents=True)
+    (snap_dir / MEMORY_SNAPSHOT_FILENAME).write_text("stale-mem", encoding="utf-8")
+
+    # Legacy path: no runtime bundle, definitions via the N+1 fetch, and the
+    # live MEMORY fetch returns None (reachable-empty 404, NOT an outage).
+    monkeypatch.setattr(sub_agent_sync, "fetch_runtime_bundle", lambda *a, **k: None)
+    monkeypatch.setattr(
+        sub_agent_sync, "fetch_sub_agent_definitions", lambda *a, **k: _DEFS
+    )
+    monkeypatch.setattr(
+        sub_agent_sync, "fetch_persona_memory", lambda *a, **k: None
+    )
+
+    sync_sub_agents(
+        subagents_dir=str(sub_dir),
+        base_url="http://fake",
+        token="fake",
+        inject_memory=True,
+        memory_snapshot_dir=str(snap_dir),
+    )
+
+    content = (sub_dir / "test.md").read_text()
+    # Reachable-empty 404 must NOT inject the stale snapshot ...
+    assert "stale-mem" not in content
+    # ... and must clear it so it can't be served on a later read.
+    assert not (snap_dir / MEMORY_SNAPSHOT_FILENAME).exists()

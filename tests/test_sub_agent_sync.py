@@ -433,6 +433,20 @@ class TestFetchPersonaMemory:
         # Reachable-but-empty → None (NOT an outage; must not raise).
         assert fetch_persona_memory("http://fake", "tok") is None
 
+    def test_reachable_empty_404_returns_none(self, monkeypatch):
+        import httpx
+
+        from superpos_agent_core.sub_agent_sync import fetch_persona_memory
+
+        def handler(url, headers):  # noqa: ARG001
+            # PersonaController::document() returns notFound() for both
+            # "no active persona" and "MEMORY document missing".
+            return httpx.Response(404, text="Not Found")
+
+        self._client_with(monkeypatch, handler)
+        # 404 is reachable-empty, NOT an outage → None (must not raise).
+        assert fetch_persona_memory("http://fake", "tok") is None
+
     def test_non_200_raises_outage(self, monkeypatch):
         import httpx
 
