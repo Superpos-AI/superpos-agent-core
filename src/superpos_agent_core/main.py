@@ -24,6 +24,7 @@ from typing import Awaitable, Callable
 
 from .config import BaseConfig
 from .executor import Executor
+from .persona_overlay import apply_persona_overlay
 from .runtime_config import RuntimeConfig
 from .superpos_client import SuperposClient
 from .superpos_poller import run_superpos_poller
@@ -267,6 +268,25 @@ async def run_agent(
                 log.info("No persona configured for this agent")
         except Exception:
             log.warning("Could not fetch persona at startup", exc_info=True)
+
+    # Persona doubling (AG-10): Superpos is primary; on an outage fall back to
+    # the re-synced workspace snapshot, else the bundled snapshot floor.  Flag
+    # OFF (PLATFORM_PERSONA_MEMORY_DOUBLING falsey) passes ``persona`` straight
+    # through — today's exact behaviour, no snapshot IO.  A reachable fetch
+    # re-syncs the workspace snapshot so the next outage has the latest persona.
+    persona_snapshot_dir = os.path.join(
+        config.executor_working_dir, ".persona-snapshot"
+    )
+    persona_result = apply_persona_overlay(
+        persona, snapshot_dir=persona_snapshot_dir
+    )
+    if not persona_result.skipped:
+        if persona_result.fetch_failed:
+            log.warning(
+                "Persona unavailable from Superpos; using %s snapshot",
+                persona_result.source,
+            )
+        persona = persona_result.persona
 
     log.info("Runtime: model=%s, effort=%s", runtime.model, runtime.effort)
 
