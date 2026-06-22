@@ -217,13 +217,30 @@ def apply_persona_overlay(
 # ── Memory (read-side doubling) ──────────────────────────────────────
 
 
+class MemoryFetchUnavailable(RuntimeError):
+    """The Superpos MEMORY read could not reach the API (a genuine outage).
+
+    ``fetch_fn`` (see :func:`read_memory`) must raise this — or any exception,
+    which is treated the same — to signal a *transport / API error*, as opposed
+    to a **reachable but empty** MEMORY document.  Only an outage falls back to
+    the snapshot; a reachable-empty document clears the snapshot/cache and
+    yields **no** injection.
+
+    Without this distinction, ``fetch_fn`` returning ``None`` is ambiguous (the
+    real :func:`sub_agent_sync.fetch_persona_memory` returns ``None`` for *both*
+    an outage and a cleared/blank document), so a cleared MEMORY would keep
+    serving — and injecting — the stale snapshot.
+    """
+
+
 @dataclass
 class MemoryReadResult:
     """Outcome of :func:`read_memory`.
 
-    ``source`` ∈ ``superpos`` / ``cache`` / ``snapshot_workspace`` /
-    ``snapshot_bundled`` / ``none``.  ``fetch_failed`` is True only when we had
-    to fall back to a snapshot because Superpos was unreachable.
+    ``source`` ∈ ``superpos`` / ``superpos_empty`` / ``cache`` /
+    ``snapshot_workspace`` / ``snapshot_bundled`` / ``none``.  ``fetch_failed``
+    is True only when we had to fall back to a snapshot because Superpos was
+    unreachable (a genuine outage), never for a reachable-empty document.
     """
 
     source: str = "none"
@@ -243,6 +260,24 @@ def _read_cache_ts(meta_path: Path) -> float | None:
         return None
 
 
+def _clear_memory_snapshot(mem_ws: Path, meta: Path, *, now: Callable[[], float]) -> None:
+    """Clear the workspace MEMORY snapshot + cache after a reachable-empty read.
+
+    A cleared/blank live MEMORY must *stop* serving the stale snapshot, so we
+    remove the snapshot file and refresh the cache timestamp (the cache now
+    legitimately means "reachable, empty").  Errors here never block the read —
+    worst case the next read re-fetches.
+    """
+    try:
+        mem_ws.unlink(missing_ok=True)
+    except OSError as exc:  # pragma: no cover — defensive
+        log.warning("Could not clear memory snapshot: %s", exc)
+    try:
+        _write_text_atomic(meta, json.dumps({"fetched_at": now()}))
+    except OSError as exc:  # pragma: no cover — defensive
+        log.warning("Could not persist memory cache meta: %s", exc)
+
+
 def read_memory(
     fetch_fn: Callable[[], str | None],
     *,
@@ -255,16 +290,29 @@ def read_memory(
     """Read the MEMORY document, preferring Superpos with a TTL cache.
 
     ``fetch_fn`` is a zero-arg callable that returns the Superpos MEMORY text
-    (e.g. wrapping ``GET /api/v1/persona/documents/MEMORY``) or ``None`` on an
-    outage.  Resolution:
+    (e.g. wrapping ``GET /api/v1/persona/documents/MEMORY``).  Its return value
+    disambiguates *reachable* from *outage*:
+
+    - **Reachable** → return the document text.  A non-empty string is injected
+      and re-synced to the snapshot.  An **empty / blank string or ``None``**
+      means a reachable-but-empty (e.g. cleared) document: the workspace
+      snapshot + cache are cleared and **no** content is injected
+      (``source="superpos_empty"``, ``fetch_failed=False``).
+    - **Outage** → *raise* :class:`MemoryFetchUnavailable` (or any exception).
+      Only then do we fall back to the snapshot.
+
+    Resolution:
 
     1. **Flag OFF** → pure passthrough of ``fetch_fn()`` (no cache, no snapshot).
     2. **Cache fresh** (within ``ttl_seconds``) → serve the workspace snapshot
        without calling ``fetch_fn`` (``source="cache"``).
-    3. **Cache stale / absent** → call ``fetch_fn``; on success re-sync the
-       workspace snapshot + cache timestamp (``source="superpos"``).
-    4. **Superpos down** → serve the workspace snapshot, else the bundled
-       snapshot — the *read-only default rules* (``fetch_failed=True``).
+    3. **Cache stale / absent** → call ``fetch_fn``; on a reachable non-empty
+       read re-sync the workspace snapshot + cache timestamp
+       (``source="superpos"``); on a reachable-empty read clear the snapshot +
+       cache (``source="superpos_empty"``, no injection).
+    4. **Superpos down** (``fetch_fn`` raised) → serve the workspace snapshot,
+       else the bundled snapshot — the *read-only default rules*
+       (``fetch_failed=True``).
     """
     if not feature_enabled(env):
         try:
@@ -285,38 +333,41 @@ def read_memory(
         if cached is not None:
             return MemoryReadResult(source="cache", content=cached)
 
-    fetched: str | None = None
     try:
         fetched = fetch_fn()
-    except Exception as exc:  # noqa: BLE001 — isolate fetch failure
+    except Exception as exc:  # noqa: BLE001 — outage: isolate + fall back
         log.warning(
             "%s error=%s", MEMORY_FETCH_FAILED_EVENT, exc,
             extra={"event": MEMORY_FETCH_FAILED_EVENT, "error": str(exc)},
         )
-        fetched = None
+        # Outage — serve the read-only snapshot (workspace preferred, bundled).
+        snap = _read_text(mem_ws)
+        source = "snapshot_workspace"
+        if snap is None:
+            bundled = Path(bundled_dir) if bundled_dir else bundled_snapshot_dir()
+            snap = _read_text(bundled / MEMORY_SNAPSHOT_FILENAME)
+            source = "snapshot_bundled" if snap is not None else "none"
 
-    if fetched is not None:
-        try:
-            _write_text_atomic(mem_ws, fetched)
-            _write_text_atomic(meta, json.dumps({"fetched_at": now()}))
-        except OSError as exc:  # pragma: no cover — defensive
-            log.warning("Could not persist memory snapshot: %s", exc)
-        return MemoryReadResult(source="superpos", content=fetched)
+        log.warning(
+            "%s serving memory snapshot source=%s (read-only)",
+            MEMORY_FETCH_FAILED_EVENT, source,
+            extra={"event": MEMORY_FETCH_FAILED_EVENT, "source": source},
+        )
+        return MemoryReadResult(source=source, content=snap, fetch_failed=True)
 
-    # Outage — serve the read-only snapshot (workspace preferred, bundled floor).
-    snap = _read_text(mem_ws)
-    source = "snapshot_workspace"
-    if snap is None:
-        bundled = Path(bundled_dir) if bundled_dir else bundled_snapshot_dir()
-        snap = _read_text(bundled / MEMORY_SNAPSHOT_FILENAME)
-        source = "snapshot_bundled" if snap is not None else "none"
+    # Reachable.  Distinguish a real document from a cleared / blank one.
+    if fetched is None or not fetched.strip():
+        # Reachable-empty (e.g. user cleared MEMORY) — clear the snapshot/cache
+        # so we stop injecting stale content, and inject nothing.
+        _clear_memory_snapshot(mem_ws, meta, now=now)
+        return MemoryReadResult(source="superpos_empty", content=None)
 
-    log.warning(
-        "%s serving memory snapshot source=%s (read-only)",
-        MEMORY_FETCH_FAILED_EVENT, source,
-        extra={"event": MEMORY_FETCH_FAILED_EVENT, "source": source},
-    )
-    return MemoryReadResult(source=source, content=snap, fetch_failed=True)
+    try:
+        _write_text_atomic(mem_ws, fetched)
+        _write_text_atomic(meta, json.dumps({"fetched_at": now()}))
+    except OSError as exc:  # pragma: no cover — defensive
+        log.warning("Could not persist memory snapshot: %s", exc)
+    return MemoryReadResult(source="superpos", content=fetched)
 
 
 # ── Memory (write-side: Superpos-only, no silent fallback) ───────────
@@ -361,6 +412,7 @@ __all__ = [
     "PERSONA_FETCH_FAILED_EVENT",
     "MEMORY_FETCH_FAILED_EVENT",
     "MEMORY_WRITE_NO_FALLBACK_EVENT",
+    "MemoryFetchUnavailable",
     "MemoryReadResult",
     "MemoryWriteUnavailable",
     "PersonaOverlayResult",

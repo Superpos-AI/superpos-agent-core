@@ -13,15 +13,22 @@ import pytest
 
 from superpos_agent_core.persona_overlay import (
     FEATURE_FLAG_ENV,
+    MEMORY_CACHE_META_FILENAME,
     MEMORY_SNAPSHOT_FILENAME,
     PERSONA_FETCH_FAILED_EVENT,
     PERSONA_SNAPSHOT_FILENAME,
+    MemoryFetchUnavailable,
     MemoryWriteUnavailable,
     apply_persona_overlay,
     feature_enabled,
     read_memory,
     write_memory,
 )
+
+
+def _outage():
+    """A ``fetch_fn`` that signals a genuine Superpos outage (transport/API)."""
+    raise MemoryFetchUnavailable("SUPERPOS_BASE_URL unreachable")
 
 
 # ── helpers ──────────────────────────────────────────────────────────
@@ -229,7 +236,7 @@ def test_memory_read_outage_serves_snapshot_readonly(tmp_path: Path):
     ws.mkdir()
     (ws / MEMORY_SNAPSHOT_FILENAME).write_text("LKG MEMORY", encoding="utf-8")
     result = read_memory(
-        lambda: None,  # outage
+        _outage,  # fetch_fn raises → genuine outage
         snapshot_dir=str(ws),
         bundled_dir=str(_bundled(tmp_path, memory="BUNDLED MEM")),
         env={FEATURE_FLAG_ENV: "on"},
@@ -238,11 +245,13 @@ def test_memory_read_outage_serves_snapshot_readonly(tmp_path: Path):
     assert result.fetch_failed is True
     assert result.source == "snapshot_workspace"
     assert result.content == "LKG MEMORY"
+    # Outage must NOT clear the workspace snapshot.
+    assert (ws / MEMORY_SNAPSHOT_FILENAME).read_text() == "LKG MEMORY"
 
 
 def test_memory_read_outage_falls_back_to_bundled(tmp_path: Path):
     result = read_memory(
-        lambda: None,
+        _outage,
         snapshot_dir=str(tmp_path / "ws"),
         bundled_dir=str(_bundled(tmp_path, memory="BUNDLED DEFAULTS")),
         env={FEATURE_FLAG_ENV: "on"},
@@ -251,6 +260,56 @@ def test_memory_read_outage_falls_back_to_bundled(tmp_path: Path):
     assert result.fetch_failed is True
     assert result.source == "snapshot_bundled"
     assert result.content == "BUNDLED DEFAULTS"
+
+
+def test_memory_read_reachable_empty_clears_stale_snapshot(tmp_path: Path):
+    """Regression: old snapshot present + live MEMORY reachable-but-empty →
+    NO injection AND the stale snapshot is cleared (not served)."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    # An old workspace snapshot + cache from a previous successful fetch.
+    (ws / MEMORY_SNAPSHOT_FILENAME).write_text("OLD STALE MEMORY", encoding="utf-8")
+    (ws / MEMORY_CACHE_META_FILENAME).write_text(
+        '{"fetched_at": 1000.0}', encoding="utf-8"
+    )
+
+    # ttl_seconds=0 forces a fresh fetch; the live document is now empty (user
+    # cleared MEMORY) — fetch_fn returns None to mean "reachable, empty".
+    result = read_memory(
+        lambda: None,
+        snapshot_dir=str(ws),
+        bundled_dir=str(_bundled(tmp_path, memory="BUNDLED MEM")),
+        env={FEATURE_FLAG_ENV: "on"},
+        now=lambda: 2000.0,
+        ttl_seconds=0,
+    )
+
+    # No injection, and it is NOT a snapshot fallback.
+    assert result.fetch_failed is False
+    assert result.source == "superpos_empty"
+    assert result.content is None
+    # The stale workspace snapshot must be gone so it can't be served again.
+    assert not (ws / MEMORY_SNAPSHOT_FILENAME).exists()
+
+
+def test_memory_read_reachable_blank_string_clears_snapshot(tmp_path: Path):
+    """A reachable whitespace-only document is also 'empty' → clears + no inject."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / MEMORY_SNAPSHOT_FILENAME).write_text("OLD", encoding="utf-8")
+
+    result = read_memory(
+        lambda: "   \n  ",
+        snapshot_dir=str(ws),
+        bundled_dir=str(_bundled(tmp_path, memory="BUNDLED")),
+        env={FEATURE_FLAG_ENV: "on"},
+        now=lambda: 10.0,
+        ttl_seconds=0,
+    )
+    assert result.fetch_failed is False
+    assert result.source == "superpos_empty"
+    assert result.content is None
+    assert not (ws / MEMORY_SNAPSHOT_FILENAME).exists()
 
 
 def test_memory_read_flag_off_is_passthrough(tmp_path: Path):

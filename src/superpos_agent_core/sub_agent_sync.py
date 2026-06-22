@@ -21,11 +21,12 @@ import logging
 import os
 import sys
 from pathlib import Path
+from typing import Callable
 
 import httpx
 import yaml
 
-from .persona_overlay import read_memory
+from .persona_overlay import MemoryFetchUnavailable, read_memory
 
 log = logging.getLogger(__name__)
 
@@ -141,18 +142,42 @@ def fetch_sub_agent_definitions(
 
 
 def fetch_persona_memory(base_url: str, token: str) -> str | None:
-    """Fetch the MEMORY document from the active persona (fallback)."""
-    with httpx.Client(base_url=base_url, timeout=30.0, follow_redirects=True) as client:
-        resp = client.get(
-            "/api/v1/persona/documents/MEMORY", headers=_headers(token),
+    """Fetch the MEMORY document from the active persona.
+
+    Distinguishes a *reachable* read from an *outage* so the AG-10 overlay can
+    tell "the user cleared MEMORY" (→ stop injecting) from "Superpos is down"
+    (→ serve the snapshot):
+
+    - **Reachable** (HTTP 200) → return the document content, or ``None`` when
+      the document is empty / blank.  ``None`` here means *reachable-empty*.
+    - **Outage** (transport error, or any non-200 status) → raise
+      :class:`MemoryFetchUnavailable` so callers fall back to the snapshot.
+    """
+    try:
+        with httpx.Client(
+            base_url=base_url, timeout=30.0, follow_redirects=True,
+        ) as client:
+            resp = client.get(
+                "/api/v1/persona/documents/MEMORY", headers=_headers(token),
+            )
+    except httpx.HTTPError as exc:
+        raise MemoryFetchUnavailable(
+            f"MEMORY fetch transport error: {exc}"
+        ) from exc
+    if resp.status_code != 200:
+        raise MemoryFetchUnavailable(
+            f"MEMORY endpoint returned {resp.status_code}"
         )
-        if resp.status_code != 200:
-            return None
+    try:
         data = resp.json()
-        payload = data.get("data", data) if isinstance(data, dict) else {}
-        if isinstance(payload, dict):
-            return _get_document_content(payload.get("content"))
-        return None
+    except ValueError as exc:
+        raise MemoryFetchUnavailable(
+            f"MEMORY response not JSON: {exc}"
+        ) from exc
+    payload = data.get("data", data) if isinstance(data, dict) else {}
+    if isinstance(payload, dict):
+        return _get_document_content(payload.get("content"))
+    return None
 
 
 # ── Document helpers ──────────────────────────────────────────────────
@@ -331,13 +356,23 @@ def sync_sub_agents(
     """
     Path(subagents_dir).mkdir(parents=True, exist_ok=True)
 
+    # MEMORY read for the doubling overlay.  ``fetch_fn`` must distinguish a
+    # *reachable-empty* document (returns ``None``/blank → clears the snapshot,
+    # no injection) from an *outage* (raises ``MemoryFetchUnavailable`` → serve
+    # the snapshot).  Default to a no-op reachable-empty fetch; the branches
+    # below replace it with the appropriate source.
+    memory_fetch_fn: Callable[[], str | None] = lambda: memory  # noqa: E731
+
     if definitions is None:
         bundle = fetch_runtime_bundle(base_url, token)
 
         if bundle is not None:
             definitions = bundle.get("definitions") or []
             if inject_memory:
+                # The bundle was reachable, so its memory value (possibly empty)
+                # is authoritative — never an outage.
                 memory = bundle.get("agent_memory")
+                memory_fetch_fn = lambda: bundle.get("agent_memory")  # noqa: E731
             log.info(
                 "Fetched runtime bundle: %d definition(s), memory=%s",
                 len(definitions), "yes" if memory else "no",
@@ -355,19 +390,22 @@ def sync_sub_agents(
                 )
                 return 0
             if inject_memory and definitions:
-                memory = fetch_persona_memory(base_url, token)
+                # Defer the fetch into ``fetch_fn`` so an outage raises *inside*
+                # read_memory (→ snapshot fallback) while a reachable-empty read
+                # returns None (→ clears the snapshot, no injection).
+                memory_fetch_fn = lambda: fetch_persona_memory(base_url, token)  # noqa: E731
     elif not inject_memory:
         memory = None
 
     # AG-10 memory doubling: route the read through the snapshot overlay so a
     # Superpos outage degrades to the read-only snapshot instead of dropping
-    # MEMORY injection, and a reachable read re-syncs the workspace snapshot.
-    # ttl_seconds=0 forces a fresh fetch every sync (we already hold the live
-    # value); the overlay only owns the success-resync / outage-fallback edges.
+    # MEMORY injection, a reachable read re-syncs the workspace snapshot, and a
+    # reachable-empty (cleared) document clears it so we stop injecting stale
+    # memory.  ttl_seconds=0 forces a fresh fetch every sync (the overlay only
+    # owns the success-resync / clear-on-empty / outage-fallback edges).
     if inject_memory and memory_snapshot_dir is not None:
-        fetched_memory = memory
         mem_result = read_memory(
-            lambda: fetched_memory,
+            memory_fetch_fn,
             snapshot_dir=memory_snapshot_dir,
             ttl_seconds=0,
         )
