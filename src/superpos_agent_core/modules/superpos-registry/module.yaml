@@ -1,0 +1,10 @@
+description: "Author Superpos registry items (skill, subagent, module, dynamic_workflow) on the server — list, show, create, update, delete via the agent-callable /registry API."
+env:
+  - SUPERPOS_BASE_URL
+  - SUPERPOS_HIVE_ID
+  - SUPERPOS_AGENT_ID
+  - SUPERPOS_API_TOKEN
+  - SUPERPOS_REFRESH_TOKEN
+deps:
+  python: []
+  system: []

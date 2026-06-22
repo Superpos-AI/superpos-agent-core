@@ -34,7 +34,7 @@ from .recent_tasks import RecentTasksLog, TaskSummary
 from .redactor import redact
 from .runtime_config import RuntimeConfig
 from .session_store import SessionStore
-from .superpos_client import GitHubDiscoveryForbidden, SuperposClient
+from .superpos_client import REGISTRY_KINDS, GitHubDiscoveryForbidden, SuperposClient
 from .superpos_poller import run_superpos_poller
 from .task import Task
 from .telegram_bot import build_telegram_app, run_telegram_bot
@@ -67,6 +67,7 @@ __all__ = [
     "ModuleOverlayResult",
     "Priority",
     "RecentTasksLog",
+    "REGISTRY_KINDS",
     "RegistryOverlayResult",
     "RuntimeConfig",
     "SessionStore",

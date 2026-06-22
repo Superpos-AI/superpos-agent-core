@@ -12,6 +12,12 @@ import httpx
 from .config import BaseConfig
 from .redactor import redact
 
+#: The registry item kinds the platform recognises, mirroring
+#: ``RegistryItem::KINDS`` server-side (superpos-app). The registry write
+#: methods validate ``kind`` against this set before issuing a request so a
+#: typo fails fast client-side instead of round-tripping to a 404.
+REGISTRY_KINDS: tuple[str, ...] = ("subagent", "skill", "module", "dynamic_workflow")
+
 
 def _redact_summary(summary: dict[str, Any] | None) -> dict[str, Any] | None:
     if not summary:
@@ -1643,6 +1649,145 @@ class SuperposClient:
         if not isinstance(payload, dict):
             return None
         return payload
+
+    # ── Registry authoring (write) ────────────────────────────────────
+    #
+    # Mirrors the agent-callable registry endpoints under
+    # ``/api/v1/registry`` (superpos-app RegistryApiController, route group
+    # ``routes/api.php``).  The hive is derived server-side from the
+    # ``auth:sanctum-agent`` token, so — unlike the hive-scoped knowledge /
+    # task endpoints — these paths are NOT prefixed with the hive id.  All
+    # methods validate ``kind`` against :data:`REGISTRY_KINDS` first so a
+    # bad kind fails fast client-side rather than as a server 404.
+
+    @staticmethod
+    def _validate_registry_kind(kind: str) -> None:
+        if kind not in REGISTRY_KINDS:
+            raise ValueError(
+                f"unknown registry kind {kind!r}; expected one of "
+                f"{', '.join(REGISTRY_KINDS)}",
+            )
+
+    async def create_registry_item(
+        self,
+        kind: str,
+        slug: str,
+        *,
+        name: str,
+        payload: dict[str, Any],
+        description: str | None = None,
+        visibility: str | None = None,
+        owner_agent_id: str | None = None,
+        message: str | None = None,
+    ) -> dict[str, Any]:
+        """``POST /registry/{kind}`` — author a new registry item.
+
+        The slug travels in the body (the create route is ``/{kind}``, not
+        ``/{kind}/{slug}`` — see ``routes/api.php``).  ``payload`` is the
+        kind-specific body the server stores as the item's first revision
+        (e.g. ``{frontmatter, instructions, files}`` for a skill,
+        ``{manifest, files, install, skill, source}`` for a module).
+
+        Required body fields mirror ``StoreRegistryItemRequest``: ``slug``,
+        ``name``, ``payload``.  ``visibility`` is one of ``hive`` / ``private``
+        (defaults server-side).  Returns the created item (envelope
+        unwrapped).
+        """
+        self._validate_registry_kind(kind)
+        body: dict[str, Any] = {"slug": slug, "name": name, "payload": payload}
+        if description is not None:
+            body["description"] = description
+        if visibility is not None:
+            body["visibility"] = visibility
+        if owner_agent_id is not None:
+            body["owner_agent_id"] = owner_agent_id
+        if message is not None:
+            body["message"] = message
+        resp = await self._request("POST", f"/api/v1/registry/{kind}", json=body)
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def update_registry_item(
+        self,
+        kind: str,
+        slug: str,
+        *,
+        name: str | None = None,
+        payload: dict[str, Any] | None = None,
+        description: str | None = None,
+        is_active: bool | None = None,
+        visibility: str | None = None,
+        message: str | None = None,
+    ) -> dict[str, Any]:
+        """``PATCH /registry/{kind}/{slug}`` — update a registry item.
+
+        Every field is optional (``UpdateRegistryItemRequest`` uses
+        ``sometimes`` rules); supply only what changes.  A new ``payload``
+        records a fresh revision server-side.  ``is_active`` toggles the
+        item's active/draft state.  Returns the updated item (envelope
+        unwrapped).
+        """
+        self._validate_registry_kind(kind)
+        body: dict[str, Any] = {}
+        if name is not None:
+            body["name"] = name
+        if payload is not None:
+            body["payload"] = payload
+        if description is not None:
+            body["description"] = description
+        if is_active is not None:
+            body["is_active"] = is_active
+        if visibility is not None:
+            body["visibility"] = visibility
+        if message is not None:
+            body["message"] = message
+        resp = await self._request(
+            "PATCH", f"/api/v1/registry/{kind}/{slug}", json=body,
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def delete_registry_item(self, kind: str, slug: str) -> None:
+        """``DELETE /registry/{kind}/{slug}`` — soft-delete (tombstone) an item."""
+        self._validate_registry_kind(kind)
+        await self._request("DELETE", f"/api/v1/registry/{kind}/{slug}")
+
+    async def get_registry_item(self, kind: str, slug: str) -> dict[str, Any]:
+        """``GET /registry/{kind}/{slug}`` — fetch a single item by slug.
+
+        Returns the full item (id, kind, slug, name, description, visibility,
+        owner_agent_id, payload, is_active, timestamps, revisions), envelope
+        unwrapped.
+        """
+        self._validate_registry_kind(kind)
+        resp = await self._request("GET", f"/api/v1/registry/{kind}/{slug}")
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def list_registry_items(
+        self,
+        kind: str,
+        *,
+        include_inactive: bool = False,
+        include_deleted: bool = False,
+    ) -> list[dict[str, Any]]:
+        """``GET /registry/{kind}`` — list items of a kind in this hive.
+
+        By default only active, non-deleted items the agent can see are
+        returned; pass ``include_inactive`` / ``include_deleted`` to widen
+        the listing (mirrors the controller's query flags).
+        """
+        self._validate_registry_kind(kind)
+        params: dict[str, Any] = {}
+        if include_inactive:
+            params["include_inactive"] = "true"
+        if include_deleted:
+            params["include_deleted"] = "true"
+        resp = await self._request(
+            "GET", f"/api/v1/registry/{kind}", params=params or None,
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
 
     # ── Service proxy ─────────────────────────────────────────────────
 
