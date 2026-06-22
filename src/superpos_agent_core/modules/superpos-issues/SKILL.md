@@ -33,11 +33,15 @@ stdout that you can `jq` over.
 The CLI covers the issue lifecycle (list / show / create / update /
 transition / close), linking (tasks, channels, **tracks**),
 dependencies, attachments, discussion comments, approval requests, and
-the issue-type catalogue. A track link is readable from both sides:
-`show` embeds the linked track (`track` / `track_id`), and the
-`superpos-tracks` module lists / unlinks track-issue edges. Known
-backend gap: there is **no atomic create-and-link-to-track** call —
-`create --track-slug` is a CLI-side two-call flow (create, then link).
+the issue-type catalogue. Once the superpos-app track-link read API
+(AG-8 / superpos-app#882) is deployed, a track link is readable from
+both sides: `show` embeds the linked track (`track` / `track_id`), and
+the `superpos-tracks` module lists / unlinks track-issue edges. Until
+that backend ships those `track` / `track_id` fields are absent from
+`show` — use `superpos-tracks list-issues` to read the relation in the
+meantime. Known backend gap: there is **no atomic
+create-and-link-to-track** call — `create --track-slug` is a CLI-side
+two-call flow (create, then link).
 
 ### `superpos-issues list`
 
@@ -63,6 +67,12 @@ Full issue with relations: type, recent tasks, dependencies, channel,
 thread, **track** (the linked track, if any — `track_id` plus a
 `{id, slug, name, state}` summary), pending approvals, allowed
 transitions.
+
+> **Pending backend deploy:** the `track` / `track_id` fields are only
+> populated once the superpos-app track-link read API (AG-8 /
+> superpos-app#882) is live. On backends predating that change `show`
+> omits them (absent / null), so don't rely on them yet — read the
+> link via `superpos-tracks list-issues` until the API ships.
 
 ```bash
 superpos-issues show 01HXYZ...
