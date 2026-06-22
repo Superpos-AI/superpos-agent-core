@@ -10,7 +10,7 @@ import time
 
 from .config import BaseConfig
 from .executor import Executor, ExecutionRequest
-from .persona_overlay import apply_persona_overlay
+from .persona_overlay import PersonaFetchUnavailable, apply_persona_overlay
 from .sub_agent_sync import sync_sub_agents as _sync_sub_agents
 from .superpos_client import SuperposClient
 from .worktree_manager import infer_branch
@@ -283,16 +283,25 @@ async def run_superpos_poller(
                     server_version is not None and server_version != persona_version
                 )
                 if persona_changed:
-                    new_persona = await superpos.get_persona_assembled()
-                    # AG-10 persona doubling: re-sync the workspace snapshot on a reachable
-                    # fetch and, on an outage, fall back to the last-known-good snapshot
-                    # instead of pushing None into the live executor (which would degrade the
-                    # agent to no persona).  Flag OFF → passthrough of today's behaviour.
+                    # AG-10 persona doubling: a reachable fetch re-syncs the workspace
+                    # snapshot; a genuine outage (PersonaFetchUnavailable) falls back to the
+                    # last-known-good snapshot instead of pushing None into the live executor
+                    # (which would degrade the agent to no persona); a reachable-EMPTY
+                    # (cleared / no active persona) clears the snapshot and serves no persona
+                    # — it never resurrects a stale one.  Flag OFF → passthrough.
+                    persona_outage = False
+                    try:
+                        new_persona = await superpos.get_persona_assembled()
+                    except PersonaFetchUnavailable:
+                        new_persona = None
+                        persona_outage = True
                     persona_snapshot_dir = os.path.join(
                         config.executor_working_dir, ".persona-snapshot"
                     )
                     persona_result = apply_persona_overlay(
-                        new_persona, snapshot_dir=persona_snapshot_dir
+                        new_persona,
+                        snapshot_dir=persona_snapshot_dir,
+                        outage=persona_outage,
                     )
                     effective_persona = (
                         new_persona if persona_result.skipped else persona_result.persona

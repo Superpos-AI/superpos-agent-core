@@ -24,7 +24,7 @@ from typing import Awaitable, Callable
 
 from .config import BaseConfig
 from .executor import Executor
-from .persona_overlay import apply_persona_overlay
+from .persona_overlay import PersonaFetchUnavailable, apply_persona_overlay
 from .runtime_config import RuntimeConfig
 from .superpos_client import SuperposClient
 from .superpos_poller import run_superpos_poller
@@ -257,8 +257,11 @@ async def run_agent(
     else:
         log.info("Telegram disabled (no TELEGRAM_BOT_TOKEN)")
 
-    # Fetch persona at startup
+    # Fetch persona at startup.  ``persona_outage`` tracks whether the fetch was
+    # a genuine outage (vs a reachable-but-empty / cleared persona) so the AG-10
+    # overlay below only resurrects the snapshot on a true outage.
     persona: str | None = None
+    persona_outage = False
     if superpos:
         try:
             persona = await superpos.get_persona_assembled()
@@ -266,19 +269,25 @@ async def run_agent(
                 log.info("Persona loaded (version from assembled endpoint)")
             else:
                 log.info("No persona configured for this agent")
+        except PersonaFetchUnavailable:
+            # Genuine outage — let the overlay fall back to the snapshot.
+            persona_outage = True
+            log.warning("Could not fetch persona at startup (outage)")
         except Exception:
+            persona_outage = True
             log.warning("Could not fetch persona at startup", exc_info=True)
 
     # Persona doubling (AG-10): Superpos is primary; on an outage fall back to
-    # the re-synced workspace snapshot, else the bundled snapshot floor.  Flag
-    # OFF (PLATFORM_PERSONA_MEMORY_DOUBLING falsey) passes ``persona`` straight
-    # through — today's exact behaviour, no snapshot IO.  A reachable fetch
-    # re-syncs the workspace snapshot so the next outage has the latest persona.
+    # the re-synced workspace snapshot, else the bundled snapshot floor.  A
+    # reachable-empty (cleared / no active persona) instead clears the snapshot
+    # and leaves the agent with no persona — it never resurrects a stale one.
+    # Flag OFF (PLATFORM_PERSONA_MEMORY_DOUBLING falsey) passes ``persona``
+    # straight through — today's exact behaviour, no snapshot IO.
     persona_snapshot_dir = os.path.join(
         config.executor_working_dir, ".persona-snapshot"
     )
     persona_result = apply_persona_overlay(
-        persona, snapshot_dir=persona_snapshot_dir
+        persona, snapshot_dir=persona_snapshot_dir, outage=persona_outage
     )
     if not persona_result.skipped:
         if persona_result.fetch_failed:

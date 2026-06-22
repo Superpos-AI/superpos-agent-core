@@ -17,7 +17,10 @@ from pathlib import Path
 import pytest
 
 from superpos_agent_core import superpos_poller as poller
-from superpos_agent_core.persona_overlay import PERSONA_SNAPSHOT_FILENAME
+from superpos_agent_core.persona_overlay import (
+    PERSONA_SNAPSHOT_FILENAME,
+    PersonaFetchUnavailable,
+)
 
 
 class _FakeClient:
@@ -37,6 +40,13 @@ class _FakeClient:
         return {"data": self._persona_versions.pop(0)}
 
     async def get_persona_assembled(self):
+        # An exception value models a genuine outage (the real client raises
+        # PersonaFetchUnavailable); any other value is a reachable result.
+        if isinstance(self._assembled, BaseException) or (
+            isinstance(self._assembled, type)
+            and issubclass(self._assembled, BaseException)
+        ):
+            raise self._assembled
         return self._assembled
 
     async def poll_tasks(self):
@@ -108,7 +118,7 @@ async def test_assembled_fetch_none_falls_back_to_snapshot(tmp_path, monkeypatch
             {"changed": True, "version": 7},
             {"changed": False, "version": 7},
         ],
-        assembled=None,  # outage
+        assembled=PersonaFetchUnavailable("outage"),  # genuine outage → raises
     )
     executor = _FakeExecutor()
     config = _make_config(tmp_path)
@@ -145,7 +155,7 @@ async def test_assembled_fetch_none_does_not_advance_version(tmp_path, monkeypat
             {"changed": True, "version": 9},
             {"changed": False, "version": 9},  # same version, still re-detected
         ],
-        assembled=None,
+        assembled=PersonaFetchUnavailable("outage"),
     )
     executor = _FakeExecutor()
     config = _make_config(tmp_path)
@@ -187,3 +197,41 @@ async def test_assembled_fetch_success_resyncs_snapshot(tmp_path, monkeypatch):
     snapshot_file = tmp_path / ".persona-snapshot" / PERSONA_SNAPSHOT_FILENAME
     assert snapshot_file.exists(), "workspace snapshot was not re-synced"
     assert snapshot_file.read_text(encoding="utf-8") == "fresh-assembled-persona"
+
+
+@pytest.mark.asyncio
+async def test_assembled_reachable_empty_clears_snapshot_no_resurrection(
+    tmp_path, monkeypatch
+):
+    """Changed persona + reachable-empty assembled (operator cleared it) →
+    push None to the executor, clear the stale snapshot, do NOT resurrect it.
+    """
+    monkeypatch.setattr(poller, "_resync_sub_agents", lambda *a, **k: None)
+
+    snapshot_dir = tmp_path / ".persona-snapshot"
+    snapshot_dir.mkdir(parents=True)
+    (snapshot_dir / PERSONA_SNAPSHOT_FILENAME).write_text(
+        "stale-persona", encoding="utf-8"
+    )
+
+    client = _FakeClient(
+        persona_versions=[
+            {"changed": True, "version": 5},
+            {"changed": False, "version": 5},
+        ],
+        assembled=None,  # reachable, no active persona (NOT an outage → no raise)
+    )
+    executor = _FakeExecutor()
+    config = _make_config(tmp_path)
+
+    await _run_until(
+        client, executor, config, until=lambda: bool(executor.persona_updates)
+    )
+
+    prompt, version = executor.persona_updates[0]
+    # No snapshot resurrection — the executor gets no persona.
+    assert prompt is None
+    # Reachable-empty is authoritative, so the version advances (not retried).
+    assert version == 5
+    # The stale snapshot was cleared so a later outage can't resurrect it.
+    assert not (snapshot_dir / PERSONA_SNAPSHOT_FILENAME).exists()

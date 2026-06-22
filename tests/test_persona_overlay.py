@@ -110,6 +110,7 @@ def test_fetch_fail_falls_back_to_workspace_snapshot(tmp_path: Path, caplog):
             snapshot_dir=str(ws),
             bundled_dir=str(_bundled(tmp_path, persona="BUNDLED")),
             env={FEATURE_FLAG_ENV: "on"},
+            outage=True,
         )
 
     assert result.fetch_failed is True
@@ -126,6 +127,7 @@ def test_fetch_fail_falls_back_to_bundled_floor(tmp_path: Path):
         snapshot_dir=str(ws),
         bundled_dir=str(_bundled(tmp_path, persona="BUNDLED FLOOR")),
         env={FEATURE_FLAG_ENV: "on"},
+        outage=True,
     )
 
     assert result.fetch_failed is True
@@ -142,6 +144,7 @@ def test_workspace_snapshot_preferred_over_bundled(tmp_path: Path):
         snapshot_dir=str(ws),
         bundled_dir=str(_bundled(tmp_path, persona="BUNDLED")),
         env={FEATURE_FLAG_ENV: "on"},
+        outage=True,
     )
     assert result.source == "snapshot_workspace"
     assert result.persona == "WORKSPACE WINS"
@@ -154,6 +157,7 @@ def test_fetch_fail_no_snapshot_anywhere_returns_none(tmp_path: Path):
         snapshot_dir=str(tmp_path / "ws"),
         bundled_dir=str(tmp_path / "empty-bundled"),
         env={FEATURE_FLAG_ENV: "on"},
+        outage=True,
     )
     assert result.fetch_failed is True
     assert result.source == "none"
@@ -167,7 +171,7 @@ def test_recovery_resyncs_after_outage(tmp_path: Path):
     env = {FEATURE_FLAG_ENV: "on"}
 
     # 1. Outage — bundled floor served, nothing re-synced yet.
-    r1 = apply_persona_overlay(None, snapshot_dir=str(ws), bundled_dir=str(bundled), env=env)
+    r1 = apply_persona_overlay(None, snapshot_dir=str(ws), bundled_dir=str(bundled), env=env, outage=True)
     assert r1.source == "snapshot_bundled"
 
     # 2. Recovery — workspace snapshot now reflects the live persona.
@@ -176,9 +180,96 @@ def test_recovery_resyncs_after_outage(tmp_path: Path):
     assert (ws / PERSONA_SNAPSHOT_FILENAME).read_text() == "RECOVERED"
 
     # 3. Next outage now serves the re-synced workspace snapshot, not bundled.
-    r3 = apply_persona_overlay(None, snapshot_dir=str(ws), bundled_dir=str(bundled), env=env)
+    r3 = apply_persona_overlay(None, snapshot_dir=str(ws), bundled_dir=str(bundled), env=env, outage=True)
     assert r3.source == "snapshot_workspace"
     assert r3.persona == "RECOVERED"
+
+
+# ── persona: reachable-empty vs outage (the None-conflation fix) ──────
+
+
+def test_persona_reachable_empty_does_not_resurrect_snapshot(tmp_path: Path):
+    """A reachable-empty persona (operator cleared it) must NOT serve a snapshot.
+
+    The whole point of the fix: a reachable empty/cleared persona is
+    authoritative — the agent ends with NO persona, even though a stale
+    workspace snapshot exists.  Only a genuine outage (``outage=True``) falls
+    back to the snapshot.
+    """
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / PERSONA_SNAPSHOT_FILENAME).write_text("STALE PERSONA", encoding="utf-8")
+
+    result = apply_persona_overlay(
+        None,  # reachable-empty (no outage)
+        snapshot_dir=str(ws),
+        bundled_dir=str(_bundled(tmp_path, persona="BUNDLED")),
+        env={FEATURE_FLAG_ENV: "on"},
+    )
+
+    assert result.source == "superpos_empty"
+    assert result.fetch_failed is False
+    # No snapshot resurrection — the agent runs with no persona.
+    assert result.persona is None
+    # The workspace snapshot was cleared so a *later* outage can't resurrect it.
+    assert not (ws / PERSONA_SNAPSHOT_FILENAME).exists()
+
+
+def test_persona_reachable_blank_string_is_empty_not_resurrected(tmp_path: Path):
+    """A reachable blank/whitespace persona is treated as cleared, not served."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / PERSONA_SNAPSHOT_FILENAME).write_text("STALE PERSONA", encoding="utf-8")
+
+    result = apply_persona_overlay(
+        "   \n  ",  # reachable blank
+        snapshot_dir=str(ws),
+        bundled_dir=str(_bundled(tmp_path, persona="BUNDLED")),
+        env={FEATURE_FLAG_ENV: "on"},
+    )
+    assert result.source == "superpos_empty"
+    assert result.persona is None
+    assert not (ws / PERSONA_SNAPSHOT_FILENAME).exists()
+
+
+def test_persona_reachable_empty_then_outage_serves_none_not_stale(tmp_path: Path):
+    """After a reachable-clear, a subsequent outage has no snapshot to resurrect."""
+    ws = tmp_path / "ws"
+    bundled = _bundled(tmp_path)  # no bundled floor
+    env = {FEATURE_FLAG_ENV: "on"}
+
+    # 1. A good persona is synced.
+    apply_persona_overlay("OLD PERSONA", snapshot_dir=str(ws), bundled_dir=str(bundled), env=env)
+    assert (ws / PERSONA_SNAPSHOT_FILENAME).read_text() == "OLD PERSONA"
+
+    # 2. Operator clears the persona; Superpos reachable-empty.
+    r2 = apply_persona_overlay(None, snapshot_dir=str(ws), bundled_dir=str(bundled), env=env)
+    assert r2.source == "superpos_empty"
+    assert r2.persona is None
+
+    # 3. Now an outage: the snapshot was cleared, so no stale persona resurfaces.
+    r3 = apply_persona_overlay(None, snapshot_dir=str(ws), bundled_dir=str(bundled), env=env, outage=True)
+    assert r3.fetch_failed is True
+    assert r3.source == "none"  # nothing to resurrect — not "OLD PERSONA"
+    assert r3.persona is None
+
+
+def test_persona_outage_still_falls_back_to_snapshot(tmp_path: Path):
+    """Regression guard: a genuine outage (outage=True) STILL serves the snapshot."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / PERSONA_SNAPSHOT_FILENAME).write_text("LAST KNOWN GOOD", encoding="utf-8")
+
+    result = apply_persona_overlay(
+        None,
+        snapshot_dir=str(ws),
+        bundled_dir=str(_bundled(tmp_path, persona="BUNDLED")),
+        env={FEATURE_FLAG_ENV: "on"},
+        outage=True,
+    )
+    assert result.fetch_failed is True
+    assert result.source == "snapshot_workspace"
+    assert result.persona == "LAST KNOWN GOOD"
 
 
 # ── memory read ──────────────────────────────────────────────────────

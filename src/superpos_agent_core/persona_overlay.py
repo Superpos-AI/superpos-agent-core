@@ -137,15 +137,36 @@ def _write_text_atomic(path: Path, content: str) -> None:
 # ── Persona ──────────────────────────────────────────────────────────
 
 
+class PersonaFetchUnavailable(RuntimeError):
+    """The Superpos persona read could not reach the API (a genuine outage).
+
+    The persona overlay must separate a *transport / API error* from a
+    **reachable but empty** persona (no active persona / the operator cleared
+    it).  Mirrors :class:`MemoryFetchUnavailable` for the MEMORY path.
+
+    The real fetch (:meth:`SuperposClient.get_persona_assembled`) returns
+    ``None`` for *both* an outage and a reachable-empty persona, so without this
+    distinction a cleared persona would resurrect — and keep serving — the
+    stale workspace/bundled snapshot.  Callers raise this (the client raises it
+    on network/5xx errors) so :func:`apply_persona_overlay` only falls back to a
+    snapshot on a true outage; a reachable-empty clears the snapshot and leaves
+    the agent with no persona.
+    """
+
+
 @dataclass
 class PersonaOverlayResult:
     """Outcome of :func:`apply_persona_overlay`.
 
     ``skipped`` — flag off; ``fetched_persona`` passed through untouched.
-    ``fetch_failed`` — flag on but Superpos returned nothing; the snapshot was
-    served.  ``source`` is one of ``superpos`` / ``snapshot_workspace`` /
-    ``snapshot_bundled`` / ``none``.  ``persona`` is the persona the caller
-    should actually use (may be ``None`` only when no snapshot exists either).
+    ``fetch_failed`` — flag on but Superpos was unreachable (a genuine outage);
+    the snapshot was served.  ``source`` is one of ``superpos`` /
+    ``superpos_empty`` / ``snapshot_workspace`` / ``snapshot_bundled`` /
+    ``none``.  ``superpos_empty`` is a *reachable-empty* persona (cleared / no
+    active persona): no snapshot was served, the snapshot was cleared, and the
+    agent runs with no persona.  ``persona`` is the persona the caller should
+    actually use (``None`` on a reachable-empty, or on an outage with no
+    snapshot anywhere).
     """
 
     skipped: bool = False
@@ -154,30 +175,55 @@ class PersonaOverlayResult:
     persona: str | None = None
 
 
+def _clear_persona_snapshot(persona_ws: Path) -> None:
+    """Clear the workspace persona snapshot after a reachable-empty read.
+
+    A cleared live persona must *stop* serving the stale snapshot, so we remove
+    the workspace snapshot file.  Errors here never block startup — worst case a
+    later outage re-reads whatever remains.  Mirrors
+    :func:`_clear_memory_snapshot`.
+    """
+    try:
+        persona_ws.unlink(missing_ok=True)
+    except OSError as exc:  # pragma: no cover — defensive
+        log.warning("Could not clear persona snapshot: %s", exc)
+
+
 def apply_persona_overlay(
     fetched_persona: str | None,
     *,
     snapshot_dir: str,
     bundled_dir: str | None = None,
     env: dict[str, str] | None = None,
+    outage: bool = False,
 ) -> PersonaOverlayResult:
     """Resolve the effective persona, re-syncing / falling back to a snapshot.
 
     Call this right after :meth:`SuperposClient.get_persona_assembled` at
-    startup, passing its result (``None`` on an outage).
+    startup.  ``outage`` disambiguates *reachable* from a transport / API
+    error, exactly mirroring the raise-contract :func:`read_memory` uses for
+    MEMORY:
+
+    - ``outage=False`` (default) → Superpos was **reachable**.  A non-empty
+      ``fetched_persona`` is served + re-synced (``source="superpos"``); an
+      empty / blank string or ``None`` is a **reachable-empty** persona (no
+      active persona / the operator cleared it): the workspace snapshot is
+      cleared and **no** persona is served (``source="superpos_empty"``,
+      ``fetch_failed=False``).  No snapshot resurrection.
+    - ``outage=True`` → a genuine outage: serve the workspace snapshot, else the
+      bundled snapshot (``fetch_failed=True``); the agent still starts.
+
+    Callers should pass ``outage=True`` when
+    :meth:`SuperposClient.get_persona_assembled` raised (e.g.
+    :class:`PersonaFetchUnavailable`), and ``outage=False`` otherwise.
 
     - **Flag OFF** → return immediately with ``skipped=True`` and
       ``persona=fetched_persona``: today's exact behaviour, zero snapshot IO.
-    - **Persona fetched** → persist it to the workspace snapshot (the re-sync)
-      and return it (``source="superpos"``).
-    - **Fetch failed** (``None``) → serve the workspace snapshot, else the
-      bundled snapshot; ``fetch_failed=True``, a warning is logged, the agent
-      still starts.
     """
     if not feature_enabled(env):
         return PersonaOverlayResult(
             skipped=True,
-            source="superpos" if fetched_persona is not None else "none",
+            source="superpos" if fetched_persona else "none",
             persona=fetched_persona,
         )
 
@@ -186,20 +232,27 @@ def apply_persona_overlay(
     bundled = Path(bundled_dir) if bundled_dir else bundled_snapshot_dir()
     persona_bundled = bundled / PERSONA_SNAPSHOT_FILENAME
 
-    if fetched_persona is not None:
-        # Re-sync the workspace snapshot to the last-known-good.  A write error
-        # here must never block startup — we already have the live persona.
-        try:
-            _write_text_atomic(persona_ws, fetched_persona)
-            log.info(
-                "%s bytes=%d", PERSONA_RESYNCED_EVENT, len(fetched_persona),
-                extra={"event": PERSONA_RESYNCED_EVENT, "bytes": len(fetched_persona)},
-            )
-        except OSError as exc:  # pragma: no cover — defensive
-            log.warning("Could not persist persona snapshot: %s", exc)
-        return PersonaOverlayResult(source="superpos", persona=fetched_persona)
+    if not outage:
+        # Reachable.  Distinguish a real persona from a cleared / blank one.
+        if fetched_persona and fetched_persona.strip():
+            # Re-sync the workspace snapshot to the last-known-good.  A write
+            # error here must never block startup — we have the live persona.
+            try:
+                _write_text_atomic(persona_ws, fetched_persona)
+                log.info(
+                    "%s bytes=%d", PERSONA_RESYNCED_EVENT, len(fetched_persona),
+                    extra={"event": PERSONA_RESYNCED_EVENT, "bytes": len(fetched_persona)},
+                )
+            except OSError as exc:  # pragma: no cover — defensive
+                log.warning("Could not persist persona snapshot: %s", exc)
+            return PersonaOverlayResult(source="superpos", persona=fetched_persona)
 
-    # Fetch failed — degrade to snapshot (workspace preferred, bundled floor).
+        # Reachable-empty (no active persona / operator cleared it) — clear the
+        # snapshot so a later outage can't resurrect it, and serve no persona.
+        _clear_persona_snapshot(persona_ws)
+        return PersonaOverlayResult(source="superpos_empty", persona=None)
+
+    # Outage — degrade to snapshot (workspace preferred, bundled floor).
     snapshot = _read_text(persona_ws)
     source = "snapshot_workspace"
     if snapshot is None:
@@ -415,6 +468,7 @@ __all__ = [
     "MemoryFetchUnavailable",
     "MemoryReadResult",
     "MemoryWriteUnavailable",
+    "PersonaFetchUnavailable",
     "PersonaOverlayResult",
     "apply_persona_overlay",
     "bundled_snapshot_dir",

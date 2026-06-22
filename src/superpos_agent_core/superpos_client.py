@@ -289,21 +289,47 @@ class SuperposClient:
     # ── Persona ───────────────────────────────────────────────────────
 
     async def get_persona_assembled(self) -> str | None:
-        """Fetch the pre-assembled persona system prompt. Returns None if unavailable."""
+        """Fetch the pre-assembled persona system prompt.
+
+        Distinguishes a *reachable* read from an *outage* so the AG-10 persona
+        overlay can tell "the operator cleared the persona / no active persona"
+        (→ run with no persona, clear the snapshot) from "Superpos is down"
+        (→ serve the last-known-good snapshot).  Mirrors
+        :func:`sub_agent_sync.fetch_persona_memory`:
+
+        - **Reachable** (HTTP 200) → return the assembled ``prompt``, or ``None``
+          when it is empty / missing.  ``None`` here means *reachable-empty*,
+          NOT an outage.
+        - **Outage** (transport error, or any non-200 status incl. 404) → raise
+          :class:`persona_overlay.PersonaFetchUnavailable` so callers fall back
+          to the snapshot instead of treating it as a cleared persona.
+        """
+        # Imported lazily to avoid a hard import-order dependency.
+        from .persona_overlay import PersonaFetchUnavailable
+
         try:
             resp = await self._request("GET", "/api/v1/persona/assembled")
-            data = resp.json()
-            persona_data = data.get("data", data) if isinstance(data, dict) else {}
-            return persona_data.get("prompt") or None
         except httpx.HTTPStatusError as e:
-            if e.response.status_code == 404:
-                log.debug("Persona endpoint not available (404); proceeding without it")
-            else:
-                log.warning("Failed to fetch persona; proceeding without it", exc_info=True)
-            return None
-        except Exception:
-            log.warning("Failed to fetch persona; proceeding without it", exc_info=True)
-            return None
+            log.warning(
+                "Persona endpoint returned %s; treating as outage",
+                e.response.status_code,
+            )
+            raise PersonaFetchUnavailable(
+                f"persona endpoint returned {e.response.status_code}"
+            ) from e
+        except httpx.HTTPError as e:
+            log.warning("Persona fetch transport error; treating as outage")
+            raise PersonaFetchUnavailable(
+                f"persona fetch transport error: {e}"
+            ) from e
+
+        try:
+            data = resp.json()
+        except ValueError as e:
+            raise PersonaFetchUnavailable(f"persona response not JSON: {e}") from e
+        persona_data = data.get("data", data) if isinstance(data, dict) else {}
+        # Reachable 200 — empty / missing prompt is a reachable-empty persona.
+        return persona_data.get("prompt") or None
 
     async def get_persona_version(
         self,
