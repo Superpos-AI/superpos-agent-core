@@ -33,6 +33,11 @@ log = logging.getLogger(__name__)
 MANAGED_MARKER = "<!-- managed-by: superpos-sync -->"
 DOCUMENT_ORDER = ("SOUL", "AGENT", "RULES", "STYLE", "EXAMPLES", "NOTES")
 
+# Sentinel for the ``memory`` argument so we can tell "caller omitted memory"
+# (no authoritative value — must NOT clear the snapshot) apart from "caller
+# explicitly passed an empty/cleared MEMORY" (authoritative reachable-empty).
+_MEMORY_OMITTED = object()
+
 
 class SubAgentFetchError(RuntimeError):
     """Raised when sub-agent definitions cannot be reliably fetched.
@@ -347,7 +352,7 @@ def sync_sub_agents(
     modules_dir: str | None = None,
     skills_dir: str | None = None,
     definitions: list[dict] | None = None,
-    memory: str | None = None,
+    memory: str | None = _MEMORY_OMITTED,  # type: ignore[assignment]
     memory_snapshot_dir: str | None = None,
 ) -> int:
     """Sync SubAgentDefinitions from Superpos to the subagents directory.
@@ -356,6 +361,13 @@ def sync_sub_agents(
     (useful when the caller already has the data, e.g. from an async
     ``SuperposClient.get_runtime_bundle()`` call).  Otherwise, fetches
     from the API using sync HTTP.
+
+    ``memory`` distinguishes *omitted* (default ``_MEMORY_OMITTED`` — no
+    authoritative value, e.g. the caller passed ``definitions`` directly but no
+    memory) from an *explicit* value (``str``/``None``, an authoritative
+    reachable read).  An omitted memory must NOT be treated as a reachable-empty
+    document — that would clear the workspace snapshot and lose the last-known-
+    good MEMORY fallback for a later outage.
 
     When ``memory_snapshot_dir`` is provided (and ``inject_memory`` is set),
     the MEMORY read is routed through the AG-10 snapshot overlay: a Superpos
@@ -369,9 +381,18 @@ def sync_sub_agents(
     # MEMORY read for the doubling overlay.  ``fetch_fn`` must distinguish a
     # *reachable-empty* document (returns ``None``/blank → clears the snapshot,
     # no injection) from an *outage* (raises ``MemoryFetchUnavailable`` → serve
-    # the snapshot).  Default to a no-op reachable-empty fetch; the branches
-    # below replace it with the appropriate source.
-    memory_fetch_fn: Callable[[], str | None] = lambda: memory  # noqa: E731
+    # the snapshot).  Default: if ``memory`` was *omitted* there is no
+    # authoritative value to act on, so treat it like an outage (raise) and
+    # preserve the snapshot; only an *explicit* ``memory`` is an authoritative
+    # reachable read.  The branches below replace this with the live source.
+    def _default_memory_fetch() -> str | None:
+        if memory is _MEMORY_OMITTED:
+            raise MemoryFetchUnavailable(
+                "no authoritative MEMORY available (memory omitted)"
+            )
+        return memory  # type: ignore[return-value]
+
+    memory_fetch_fn: Callable[[], str | None] = _default_memory_fetch
 
     if definitions is None:
         bundle = fetch_runtime_bundle(base_url, token)
@@ -385,7 +406,8 @@ def sync_sub_agents(
                 memory_fetch_fn = lambda: bundle.get("agent_memory")  # noqa: E731
             log.info(
                 "Fetched runtime bundle: %d definition(s), memory=%s",
-                len(definitions), "yes" if memory else "no",
+                len(definitions),
+                "yes" if (memory is not _MEMORY_OMITTED and memory) else "no",
             )
         else:
             try:
@@ -425,6 +447,11 @@ def sync_sub_agents(
                 "MEMORY unavailable from Superpos; using %s snapshot",
                 mem_result.source,
             )
+
+    # Normalize an omitted memory (no snapshot overlay engaged) to None so it is
+    # never injected or measured as a real value below.
+    if memory is _MEMORY_OMITTED:
+        memory = None
 
     if memory:
         log.info("Agent MEMORY: %d chars", len(memory))

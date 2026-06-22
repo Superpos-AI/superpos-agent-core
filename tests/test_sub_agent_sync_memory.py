@@ -103,6 +103,40 @@ def test_outage_falls_back_to_snapshot(tmp_path, monkeypatch):
     assert (snap_dir / MEMORY_SNAPSHOT_FILENAME).exists()
 
 
+def test_empty_definitions_with_omitted_memory_preserves_snapshot(tmp_path):
+    """Regression (PR #53 review): ``definitions=[]`` + ``inject_memory=True`` +
+    ``memory_snapshot_dir`` set, with ``memory`` *omitted*.
+
+    Previously the default fetch returned ``None`` (memory's default), which
+    ``read_memory`` classified as reachable-empty and deleted the workspace
+    snapshot — losing the last-known-good MEMORY fallback for a later outage.
+    An omitted memory is NOT an authoritative reachable read, so the snapshot
+    must be preserved.
+    """
+    sub_dir = tmp_path / "subagents"
+    snap_dir = tmp_path / "snap"
+    snap_dir.mkdir(parents=True)
+    (snap_dir / MEMORY_SNAPSHOT_FILENAME).write_text(
+        "last-known-good", encoding="utf-8"
+    )
+
+    sync_sub_agents(
+        subagents_dir=str(sub_dir),
+        base_url="http://fake",
+        token="fake",
+        definitions=[],  # explicit empty — skips the fetch branches entirely
+        inject_memory=True,
+        memory_snapshot_dir=str(snap_dir),
+        # memory omitted on purpose: no authoritative value
+    )
+
+    # No authoritative read happened, so the snapshot is the fallback and must
+    # survive — it must NOT be cleared by a default ``None`` fetch.
+    snap_file = snap_dir / MEMORY_SNAPSHOT_FILENAME
+    assert snap_file.exists(), "snapshot was wrongly cleared on omitted memory"
+    assert snap_file.read_text(encoding="utf-8") == "last-known-good"
+
+
 def test_legacy_fallback_404_clears_stale_snapshot(tmp_path, monkeypatch):
     """Regression (PR #53 review): in the legacy fallback path (no runtime
     bundle), a 404 from the MEMORY endpoint is now reachable-empty
