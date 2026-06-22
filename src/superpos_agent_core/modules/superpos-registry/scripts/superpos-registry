@@ -1,0 +1,391 @@
+#!/usr/bin/env python3
+"""CLI wrapper around SuperposClient's registry authoring methods.
+
+Author registry items (skills, subagents, modules, dynamic_workflows) on the
+Superpos server. Subcommands mirror the SDK / API:
+
+  list, show              (read)
+  create, update, delete  (write)
+
+Maps onto the agent-callable registry endpoints under ``/api/v1/registry``
+(superpos-app RegistryApiController). The hive is derived server-side from
+the agent token, so paths carry no hive id.
+
+Prints JSON to stdout, errors to stderr. Designed to be called via Bash and
+piped through ``jq``.
+
+The kind-specific ``payload`` is the body the server stores as the item's
+first revision. Provide it as raw JSON (``--payload '{...}'``) or from a file
+(``--payload-file path.json``). For the common skill/module case where the
+body is Markdown, ``--body`` / ``--body-file`` populate the payload's
+instructions field for you (see ``_assemble_payload``); pass ``--payload`` for
+full control over the shape.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import sys
+from typing import Any
+
+# `superpos_agent_core` is pip-installed via the container's requirements.txt.
+from superpos_agent_core import REGISTRY_KINDS, BaseConfig, SuperposClient
+
+
+def _config_from_env() -> BaseConfig:
+    base_url = os.environ.get("SUPERPOS_BASE_URL", "").rstrip("/")
+    hive_id = os.environ.get("SUPERPOS_HIVE_ID", "")
+    agent_id = os.environ.get("SUPERPOS_AGENT_ID", "")
+    token = os.environ.get("SUPERPOS_API_TOKEN", "")
+    refresh = os.environ.get("SUPERPOS_REFRESH_TOKEN", "")
+
+    if not (base_url and hive_id and token):
+        print(
+            "Error: SUPERPOS_BASE_URL, SUPERPOS_HIVE_ID, and "
+            "SUPERPOS_API_TOKEN must be set in the environment.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    return BaseConfig(
+        superpos_base_url=base_url,
+        superpos_hive_id=hive_id,
+        superpos_agent_id=agent_id,
+        superpos_api_token=token,
+        superpos_refresh_token=refresh,
+    )
+
+
+def _print(value: Any) -> None:
+    """Print a JSON-serialisable value, indented for human reading."""
+    print(json.dumps(value, indent=2, default=str))
+
+
+def _parse_json_arg(label: str, raw: str | None) -> dict[str, Any] | None:
+    """Parse a CLI flag value that should be a JSON object, with a clear error."""
+    if raw is None:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as e:
+        print(f"Error: --{label} must be valid JSON ({e})", file=sys.stderr)
+        sys.exit(2)
+    if not isinstance(parsed, dict):
+        print(
+            f"Error: --{label} must be a JSON object, got {type(parsed).__name__}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    return parsed
+
+
+def _read_file(label: str, path: str) -> str:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+    except OSError as e:
+        print(f"Error: could not read --{label} {path!r}: {e}", file=sys.stderr)
+        sys.exit(2)
+
+
+def _resolve_body(args: argparse.Namespace) -> str | None:
+    """Resolve a Markdown body from ``--body`` / ``--body-file`` (exclusive)."""
+    body = getattr(args, "body", None)
+    body_file = getattr(args, "body_file", None)
+    if body is not None and body_file is not None:
+        print(
+            "Error: --body and --body-file are mutually exclusive; pass only one.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if body_file is not None:
+        return _read_file("body-file", body_file)
+    return body
+
+
+def _assemble_payload(args: argparse.Namespace) -> dict[str, Any] | None:
+    """Build the registry-item payload from --payload(-file) and/or --body.
+
+    Precedence:
+      * ``--payload`` / ``--payload-file`` supply the full payload object.
+      * ``--body`` / ``--body-file`` supply Markdown instructions; when given,
+        they set ``payload["instructions"]`` (overriding any value already in
+        an explicit payload), which matches the skill payload contract
+        (``{frontmatter, instructions, files}``).
+
+    Returns ``None`` when neither source is supplied (valid for ``update``,
+    where payload is optional; the caller enforces the ``create`` requirement).
+    """
+    payload_raw = getattr(args, "payload", None)
+    payload_file = getattr(args, "payload_file", None)
+    if payload_raw is not None and payload_file is not None:
+        print(
+            "Error: --payload and --payload-file are mutually exclusive; "
+            "pass only one.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    payload: dict[str, Any] | None = None
+    if payload_file is not None:
+        payload = _parse_json_arg("payload-file", _read_file("payload-file", payload_file))
+    elif payload_raw is not None:
+        payload = _parse_json_arg("payload", payload_raw)
+
+    body = _resolve_body(args)
+    if body is not None:
+        if payload is None:
+            payload = {}
+        payload["instructions"] = body
+
+    return payload
+
+
+def _resolve_is_active(args: argparse.Namespace) -> bool | None:
+    """Map --is-active / --draft to a tri-state bool (None = leave unchanged)."""
+    is_active = getattr(args, "is_active", None)
+    draft = getattr(args, "draft", False)
+    if is_active and draft:
+        print(
+            "Error: --is-active and --draft are mutually exclusive.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if is_active:
+        return True
+    if draft:
+        return False
+    return None
+
+
+async def _run(args: argparse.Namespace) -> int:
+    config = _config_from_env()
+    client = SuperposClient(config)
+    try:
+        if args.cmd == "list":
+            _print(await client.list_registry_items(
+                args.kind,
+                include_inactive=args.include_inactive,
+                include_deleted=args.include_deleted,
+            ))
+
+        elif args.cmd == "show":
+            try:
+                _print(await client.get_registry_item(args.kind, args.slug))
+            except ValueError as e:
+                print(f"Error: {e}", file=sys.stderr)
+                return 2
+
+        elif args.cmd == "create":
+            payload = _assemble_payload(args)
+            if payload is None:
+                print(
+                    "Error: a create needs a payload — pass --payload/"
+                    "--payload-file (kind-specific JSON) and/or --body/"
+                    "--body-file (Markdown instructions).",
+                    file=sys.stderr,
+                )
+                return 2
+            visibility = "private" if args.private else None
+            try:
+                _print(await client.create_registry_item(
+                    args.kind,
+                    args.slug,
+                    name=args.name,
+                    payload=payload,
+                    description=args.description,
+                    visibility=visibility,
+                    owner_agent_id=args.owner_agent_id,
+                    message=args.message,
+                ))
+            except ValueError as e:
+                print(f"Error: {e}", file=sys.stderr)
+                return 2
+
+        elif args.cmd == "update":
+            payload = _assemble_payload(args)
+            is_active = _resolve_is_active(args)
+            visibility = "private" if args.private else ("hive" if args.hive else None)
+            if (
+                payload is None
+                and args.name is None
+                and args.description is None
+                and is_active is None
+                and visibility is None
+            ):
+                print(
+                    "Error: an update needs at least one field to change "
+                    "(--name/--description/--payload/--payload-file/--body/"
+                    "--body-file/--is-active/--draft/--private/--hive).",
+                    file=sys.stderr,
+                )
+                return 2
+            try:
+                _print(await client.update_registry_item(
+                    args.kind,
+                    args.slug,
+                    name=args.name,
+                    payload=payload,
+                    description=args.description,
+                    is_active=is_active,
+                    visibility=visibility,
+                    message=args.message,
+                ))
+            except ValueError as e:
+                print(f"Error: {e}", file=sys.stderr)
+                return 2
+
+        elif args.cmd == "delete":
+            try:
+                await client.delete_registry_item(args.kind, args.slug)
+            except ValueError as e:
+                print(f"Error: {e}", file=sys.stderr)
+                return 2
+            _print({"deleted": True, "kind": args.kind, "slug": args.slug})
+
+        else:
+            print(f"Unknown subcommand: {args.cmd}", file=sys.stderr)
+            return 2
+
+        return 0
+    finally:
+        await client.close()
+
+
+def _add_kind(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--kind",
+        required=True,
+        choices=list(REGISTRY_KINDS),
+        help="Registry item kind.",
+    )
+
+
+def _add_payload_flags(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--payload",
+        help="Kind-specific payload as a JSON object string (the item body "
+             "stored as a revision). E.g. for a skill: "
+             "'{\"frontmatter\": {...}, \"instructions\": \"...\", \"files\": []}'.",
+    )
+    p.add_argument(
+        "--payload-file",
+        dest="payload_file",
+        help="Read the payload JSON from a file (mutually exclusive with --payload).",
+    )
+    p.add_argument(
+        "--body",
+        help="Markdown body; sets payload.instructions (convenience for "
+             "skill/subagent/module SKILL.md text).",
+    )
+    p.add_argument(
+        "--body-file",
+        dest="body_file",
+        help="Read the Markdown body from a file (mutually exclusive with --body).",
+    )
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="superpos-registry",
+        description=(
+            "Author registry items (skill, subagent, module, dynamic_workflow) "
+            "on the Superpos server: list, show, create, update, delete."
+        ),
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    # list
+    p_list = sub.add_parser("list", help="List items of a kind in this hive")
+    _add_kind(p_list)
+    p_list.add_argument(
+        "--include-inactive",
+        action="store_true",
+        help="Include draft / inactive items.",
+    )
+    p_list.add_argument(
+        "--include-deleted",
+        action="store_true",
+        help="Include soft-deleted (tombstoned) items.",
+    )
+
+    # show
+    p_show = sub.add_parser("show", help="Show a single item by slug")
+    _add_kind(p_show)
+    p_show.add_argument("--slug", required=True, help="Item slug.")
+
+    # create
+    p_create = sub.add_parser("create", help="Create a new registry item")
+    _add_kind(p_create)
+    p_create.add_argument("--slug", required=True, help="Stable item slug (alpha_dash, max 100).")
+    p_create.add_argument("--name", required=True, help="Human-readable name (max 255).")
+    p_create.add_argument("--description", help="Optional longer description.")
+    _add_payload_flags(p_create)
+    p_create.add_argument(
+        "--private",
+        action="store_true",
+        help="Create as private (owner-only) instead of hive-visible.",
+    )
+    p_create.add_argument(
+        "--owner-agent-id",
+        dest="owner_agent_id",
+        help="Owner agent id (ULID); only meaningful for private items.",
+    )
+    p_create.add_argument("--message", help="Revision message (max 500).")
+
+    # update
+    p_update = sub.add_parser("update", help="Update an existing registry item")
+    _add_kind(p_update)
+    p_update.add_argument("--slug", required=True, help="Slug of the item to update.")
+    p_update.add_argument("--name", help="New name.")
+    p_update.add_argument("--description", help="New description.")
+    _add_payload_flags(p_update)
+    active_group = p_update.add_argument_group("active state")
+    active_group.add_argument(
+        "--is-active",
+        dest="is_active",
+        action="store_true",
+        help="Mark the item active.",
+    )
+    active_group.add_argument(
+        "--draft",
+        action="store_true",
+        help="Mark the item inactive (draft).",
+    )
+    vis_group = p_update.add_argument_group("visibility")
+    vis_group.add_argument(
+        "--private",
+        action="store_true",
+        help="Set visibility to private.",
+    )
+    vis_group.add_argument(
+        "--hive",
+        action="store_true",
+        help="Set visibility to hive.",
+    )
+    p_update.add_argument("--message", help="Revision message (max 500).")
+
+    # delete
+    p_delete = sub.add_parser("delete", help="Soft-delete (tombstone) an item")
+    _add_kind(p_delete)
+    p_delete.add_argument("--slug", required=True, help="Slug of the item to delete.")
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
+    if getattr(args, "private", False) and getattr(args, "hive", False):
+        print(
+            "Error: --private and --hive are mutually exclusive.",
+            file=sys.stderr,
+        )
+        return 2
+    return asyncio.run(_run(args))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
