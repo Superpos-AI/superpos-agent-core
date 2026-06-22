@@ -60,8 +60,12 @@ Flags:
 
 ### `superpos-tracks get <slug>`
 
-Fetch a single track, including the `spec` body. Use this when you
-need to read the full markdown spec rather than just the index row.
+Fetch a single track, including the `spec` body and a `linked_issues`
+array (the issues linked to the track, same shape as `list-issues`,
+capped at 100 most-recently-updated). Use this when you need the full
+markdown spec or a quick membership read; for the complete, paginated
+issue set use `list-issues`. The `index` rows omit both `spec` and
+`linked_issues`.
 
 ```bash
 superpos-tracks get agent-capabilities
@@ -135,8 +139,8 @@ superpos-tracks unlink-issue agent-capabilities 01HXYZ...
 
 List the issues linked to a track. The full envelope is returned
 (`{"data": [...], "meta": {...}}`) so callers can paginate via
-`meta.has_more` / `meta.current_page`. Closes the read-side gap
-that `get` only returns the track record.
+`meta.has_more` / `meta.current_page`. Use this for the complete,
+paginated set; `get` embeds the same issues but caps at 100.
 
 ```bash
 superpos-tracks list-issues k1

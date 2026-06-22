@@ -33,11 +33,11 @@ stdout that you can `jq` over.
 The CLI covers the issue lifecycle (list / show / create / update /
 transition / close), linking (tasks, channels, **tracks**),
 dependencies, attachments, discussion comments, approval requests, and
-the issue-type catalogue. Known backend gap: there is **no atomic
-create-and-link-to-track** call — `create --track-slug` is a CLI-side
-two-call flow (create, then link). Track *unlink* and track listing
-(`GET /tracks`) are not exposed by this CLI yet (out of scope for the
-linking use case).
+the issue-type catalogue. A track link is readable from both sides:
+`show` embeds the linked track (`track` / `track_id`), and the
+`superpos-tracks` module lists / unlinks track-issue edges. Known
+backend gap: there is **no atomic create-and-link-to-track** call —
+`create --track-slug` is a CLI-side two-call flow (create, then link).
 
 ### `superpos-issues list`
 
@@ -60,7 +60,9 @@ so you can decide whether to fetch more — pass the next index via
 ### `superpos-issues show <issue-id>`
 
 Full issue with relations: type, recent tasks, dependencies, channel,
-thread, pending approvals, allowed transitions.
+thread, **track** (the linked track, if any — `track_id` plus a
+`{id, slug, name, state}` summary), pending approvals, allowed
+transitions.
 
 ```bash
 superpos-issues show 01HXYZ...
