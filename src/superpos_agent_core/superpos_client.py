@@ -300,9 +300,15 @@ class SuperposClient:
         - **Reachable** (HTTP 200) → return the assembled ``prompt``, or ``None``
           when it is empty / missing.  ``None`` here means *reachable-empty*,
           NOT an outage.
-        - **Outage** (transport error, or any non-200 status incl. 404) → raise
-          :class:`persona_overlay.PersonaFetchUnavailable` so callers fall back
-          to the snapshot instead of treating it as a cleared persona.
+        - **Reachable-empty** (HTTP 404) → return ``None``.  The server's
+          ``PersonaController::assembled()`` returns 404 ("No active persona for
+          this agent.") for the reachable no-active-persona state — see
+          ``PersonaSdkApiTest::test_assembled_returns_404_when_no_persona``.
+          This is *not* an outage: callers must clear the snapshot rather than
+          resurrect a stale persona.
+        - **Outage** (transport error, or any other non-200 status incl. 5xx) →
+          raise :class:`persona_overlay.PersonaFetchUnavailable` so callers fall
+          back to the snapshot instead of treating it as a cleared persona.
         """
         # Imported lazily to avoid a hard import-order dependency.
         from .persona_overlay import PersonaFetchUnavailable
@@ -310,6 +316,12 @@ class SuperposClient:
         try:
             resp = await self._request("GET", "/api/v1/persona/assembled")
         except httpx.HTTPStatusError as e:
+            # 404 is the server's reachable "no active persona for this agent"
+            # state, NOT an outage — return reachable-empty so callers clear the
+            # snapshot instead of resurrecting a stale persona.
+            if e.response.status_code == 404:
+                log.info("No active persona for this agent (404, reachable-empty)")
+                return None
             log.warning(
                 "Persona endpoint returned %s; treating as outage",
                 e.response.status_code,
