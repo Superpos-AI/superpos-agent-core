@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""CLI wrapper around superpos_agent_core.SuperposClient hosted-agent methods.
+
+Subcommands mirror the client API:
+  list, show, status, logs, deployments,
+  start, stop, restart, redeploy, scale, rollback, delete, presets
+
+Prints JSON to stdout, errors to stderr.  Designed for the LLM to call
+via Bash and pipe through ``jq`` for follow-up queries.
+
+Hosted agents are a **Cloud-only** feature — every command here 404s on a
+self-hosted (CE) deployment. Create/update are intentionally NOT exposed:
+provisioning is deferred to PKV-4 (provision-by-key). See SKILL.md.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import sys
+from typing import Any
+
+# `superpos_agent_core` is pip-installed via the container's requirements.txt.
+from superpos_agent_core import BaseConfig, SuperposClient
+
+# Replica sizes accepted by the scale endpoint (mirrors ScaleHostedAgentRequest
+# on the server: `in:xs,s,m,l`).
+_REPLICA_SIZES = ("xs", "s", "m", "l")
+
+
+def _config_from_env() -> BaseConfig:
+    base_url = os.environ.get("SUPERPOS_BASE_URL", "").rstrip("/")
+    hive_id = os.environ.get("SUPERPOS_HIVE_ID", "")
+    agent_id = os.environ.get("SUPERPOS_AGENT_ID", "")
+    token = os.environ.get("SUPERPOS_API_TOKEN", "")
+    refresh = os.environ.get("SUPERPOS_REFRESH_TOKEN", "")
+
+    if not (base_url and hive_id and token):
+        print(
+            "Error: SUPERPOS_BASE_URL, SUPERPOS_HIVE_ID, and "
+            "SUPERPOS_API_TOKEN must be set in the environment.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    return BaseConfig(
+        superpos_base_url=base_url,
+        superpos_hive_id=hive_id,
+        superpos_agent_id=agent_id,
+        superpos_api_token=token,
+        superpos_refresh_token=refresh,
+    )
+
+
+def _print(value: Any) -> None:
+    """Print a JSON-serialisable value, indented for human reading."""
+    print(json.dumps(value, indent=2, default=str))
+
+
+async def _run(args: argparse.Namespace) -> int:
+    config = _config_from_env()
+    client = SuperposClient(config)
+    try:
+        if args.cmd == "list":
+            kwargs: dict[str, Any] = {}
+            if args.page is not None:
+                kwargs["page"] = args.page
+            if args.per_page is not None:
+                kwargs["per_page"] = args.per_page
+            _print(await client.list_hosted_agents(**kwargs))
+
+        elif args.cmd == "show":
+            _print(await client.get_hosted_agent(args.id))
+
+        elif args.cmd == "status":
+            _print(await client.get_hosted_agent_status(args.id))
+
+        elif args.cmd == "logs":
+            log_kwargs: dict[str, Any] = {}
+            if args.start is not None:
+                log_kwargs["start"] = args.start
+            if args.end is not None:
+                log_kwargs["end"] = args.end
+            if args.limit is not None:
+                log_kwargs["limit"] = args.limit
+            if args.direction is not None:
+                log_kwargs["direction"] = args.direction
+            if args.search is not None:
+                log_kwargs["search"] = args.search
+            if args.pod is not None:
+                log_kwargs["pod"] = args.pod
+            _print(await client.get_hosted_agent_logs(args.id, **log_kwargs))
+
+        elif args.cmd == "deployments":
+            dep_kwargs: dict[str, Any] = {}
+            if args.page is not None:
+                dep_kwargs["page"] = args.page
+            if args.per_page is not None:
+                dep_kwargs["per_page"] = args.per_page
+            _print(await client.list_hosted_agent_deployments(args.id, **dep_kwargs))
+
+        elif args.cmd == "start":
+            _print(await client.start_hosted_agent(args.id))
+
+        elif args.cmd == "stop":
+            _print(await client.stop_hosted_agent(args.id))
+
+        elif args.cmd == "restart":
+            _print(await client.restart_hosted_agent(args.id))
+
+        elif args.cmd == "redeploy":
+            _print(await client.redeploy_hosted_agent(args.id))
+
+        elif args.cmd == "scale":
+            _print(await client.scale_hosted_agent(
+                args.id, size=args.size, count=args.count,
+            ))
+
+        elif args.cmd == "rollback":
+            _print(await client.rollback_hosted_agent_deployment(
+                args.id, args.deployment_id,
+            ))
+
+        elif args.cmd == "delete":
+            _print(await client.delete_hosted_agent(args.id))
+
+        elif args.cmd == "presets":
+            _print(await client.list_hosted_agent_presets())
+
+        else:
+            print(f"Unknown subcommand: {args.cmd}", file=sys.stderr)
+            return 2
+
+        return 0
+    finally:
+        await client.close()
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="superpos-hosted-agents",
+        description=(
+            "Manage Cloud-hosted agents — list/show/status/logs/deployments, "
+            "and the start/stop/restart/redeploy/scale/rollback/delete "
+            "lifecycle, plus the preset catalogue. Cloud-only; create/update "
+            "are deferred to PKV-4. See SKILL.md."
+        ),
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    # list
+    p_list = sub.add_parser("list", help="List hosted agents in the hive (paginated)")
+    p_list.add_argument("--page", type=int, help="1-based page index (?page=)")
+    p_list.add_argument("--per-page", type=int, help="Page size (?per_page=; server caps at 100)")
+
+    # show
+    p_show = sub.add_parser("show", help="Fetch a single hosted agent by id")
+    p_show.add_argument("id", help="Hosted agent ULID")
+
+    # status
+    p_status = sub.add_parser("status", help="Live status view (adds a remote probe when non-terminal)")
+    p_status.add_argument("id", help="Hosted agent ULID")
+
+    # logs
+    p_logs = sub.add_parser("logs", help="Fetch proxied container logs (JSON)")
+    p_logs.add_argument("id", help="Hosted agent ULID")
+    p_logs.add_argument("--start", help="ISO-8601 window start (required by server)")
+    p_logs.add_argument("--end", help="ISO-8601 window end (required by server)")
+    p_logs.add_argument("--limit", type=int, help="Max lines (server caps at 1000, default 500)")
+    p_logs.add_argument(
+        "--direction", choices=("forward", "backward"),
+        help="Scan direction (server default: backward)",
+    )
+    p_logs.add_argument("--search", help="Free-text filter forwarded upstream")
+    p_logs.add_argument("--pod", help="Restrict to a specific pod")
+
+    # deployments
+    p_dep = sub.add_parser("deployments", help="List deployment history (newest first, paginated)")
+    p_dep.add_argument("id", help="Hosted agent ULID")
+    p_dep.add_argument("--page", type=int, help="1-based page index (?page=)")
+    p_dep.add_argument("--per-page", type=int, help="Page size (?per_page=; server caps at 100)")
+
+    # start
+    p_start = sub.add_parser("start", help="Start a stopped/errored agent (manage; needs credit)")
+    p_start.add_argument("id", help="Hosted agent ULID")
+
+    # stop
+    p_stop = sub.add_parser("stop", help="Stop a running/deploying agent (manage)")
+    p_stop.add_argument("id", help="Hosted agent ULID")
+
+    # restart
+    p_restart = sub.add_parser("restart", help="Bounce the container in place (manage; needs credit)")
+    p_restart.add_argument("id", help="Hosted agent ULID")
+
+    # redeploy
+    p_redeploy = sub.add_parser("redeploy", help="Re-apply the full app spec (manage; needs credit)")
+    p_redeploy.add_argument("id", help="Hosted agent ULID")
+
+    # scale
+    p_scale = sub.add_parser("scale", help="Change replica size/count (manage; needs credit)")
+    p_scale.add_argument("id", help="Hosted agent ULID")
+    p_scale.add_argument("--size", required=True, choices=_REPLICA_SIZES, help="Replica size")
+    p_scale.add_argument("--count", required=True, type=int, help="Replica count (>=1)")
+
+    # rollback
+    p_rollback = sub.add_parser(
+        "rollback", help="Roll back to a prior successful deployment (manage; needs credit)",
+    )
+    p_rollback.add_argument("id", help="Hosted agent ULID")
+    p_rollback.add_argument(
+        "--deployment-id", required=True, help="Target deployment ULID (must be 'success')",
+    )
+
+    # delete
+    p_delete = sub.add_parser("delete", help="Tear down a hosted agent (manage)")
+    p_delete.add_argument("id", help="Hosted agent ULID")
+
+    # presets
+    sub.add_parser("presets", help="List the sanitized preset catalogue (org-scoped, read)")
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
+    return asyncio.run(_run(args))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

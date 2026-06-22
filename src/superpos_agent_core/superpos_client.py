@@ -2111,6 +2111,260 @@ class SuperposClient:
         )
         return resp.json()
 
+    # ══════════════════════════════════════════════════════════════════
+    # ── Hosted Agents (Cloud-only) ────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════
+    #
+    # Lifecycle control for hosted (platform-managed) agents. These routes
+    # exist ONLY on the Cloud edition — CE builds strip the `App\Cloud`
+    # controllers, so every call here 404s on a self-hosted deployment.
+    #
+    # Routes are hive-prefixed (`/api/v1/hives/{hive}/hosted-agents/...`),
+    # EXCEPT the preset catalogue which is org-scoped
+    # (`/api/v1/hosted-agent-presets`). The hive id is resolved the same way
+    # as every other hive-scoped method on this client: from
+    # ``self._config.superpos_hive_id`` (env ``SUPERPOS_HIVE_ID``).
+    #
+    # Permission gates (server-side):
+    #   - read   → list / show / status / logs / deployments / presets
+    #   - manage → start / stop / restart / redeploy / scale / rollback /
+    #              delete
+    # The write-credit-gated ops (start / restart / redeploy / scale /
+    # rollback) additionally run `check-credit-balance` server-side.
+    #
+    # Create / update are intentionally NOT exposed here — provisioning a
+    # hosted agent is deferred to PKV-4 (provision-by-key), which couples
+    # creation to the provider-key vault reference. See issue #188.
+
+    async def list_hosted_agents(
+        self, *, page: int | None = None, per_page: int | None = None,
+    ) -> dict[str, Any]:
+        """``GET /hosted-agents`` — paginated list of hosted agents in the hive.
+
+        Returns the full envelope (``{"data": [...], "meta": {...}}``) so
+        callers can paginate via ``meta.pagination``. Requires
+        ``hosted-agents.read``.
+        """
+        hive = self._config.superpos_hive_id
+        params: dict[str, Any] = {}
+        if page is not None:
+            params["page"] = page
+        if per_page is not None:
+            params["per_page"] = per_page
+        resp = await self._request(
+            "GET", f"/api/v1/hives/{hive}/hosted-agents", params=params or None,
+        )
+        return resp.json()
+
+    async def get_hosted_agent(self, hosted_agent_id: str) -> dict[str, Any]:
+        """``GET /hosted-agents/{id}`` — fetch a single hosted agent.
+
+        Requires ``hosted-agents.read``.
+        """
+        hive = self._config.superpos_hive_id
+        resp = await self._request(
+            "GET", f"/api/v1/hives/{hive}/hosted-agents/{hosted_agent_id}",
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def get_hosted_agent_status(self, hosted_agent_id: str) -> dict[str, Any]:
+        """``GET /hosted-agents/{id}/status`` — live status view.
+
+        For non-terminal agents the server adds a fresh remote probe
+        (``novps_status``) plus a ``checked_at`` timestamp. Requires
+        ``hosted-agents.read``.
+        """
+        hive = self._config.superpos_hive_id
+        resp = await self._request(
+            "GET", f"/api/v1/hives/{hive}/hosted-agents/{hosted_agent_id}/status",
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    async def get_hosted_agent_logs(
+        self,
+        hosted_agent_id: str,
+        *,
+        start: str | None = None,
+        end: str | None = None,
+        limit: int | None = None,
+        direction: str | None = None,
+        search: str | None = None,
+        pod: str | None = None,
+    ) -> dict[str, Any]:
+        """``GET /hosted-agents/{id}/logs`` — proxied container logs.
+
+        ``start`` and ``end`` are ISO-8601 timestamps and are REQUIRED by the
+        server (max 24h span, both within the last 30 days, not in the
+        future). ``limit`` caps at 1000 (server default 500); ``direction``
+        is ``forward`` or ``backward`` (server default ``backward``).
+        ``search`` and ``pod`` are optional filters. The full envelope is
+        returned (``data`` carries the verbatim upstream log payload, ``meta``
+        carries ``source`` / ``resource_id``). Requires ``hosted-agents.read``.
+
+        SSE streaming (``Accept: text/event-stream``) is not exposed here —
+        this is the JSON-proxy path only.
+        """
+        hive = self._config.superpos_hive_id
+        params: dict[str, Any] = {}
+        if start is not None:
+            params["start"] = start
+        if end is not None:
+            params["end"] = end
+        if limit is not None:
+            params["limit"] = limit
+        if direction is not None:
+            params["direction"] = direction
+        if search is not None:
+            params["search"] = search
+        if pod is not None:
+            params["pod"] = pod
+        resp = await self._request(
+            "GET", f"/api/v1/hives/{hive}/hosted-agents/{hosted_agent_id}/logs",
+            params=params or None,
+        )
+        return resp.json()
+
+    async def list_hosted_agent_deployments(
+        self,
+        hosted_agent_id: str,
+        *,
+        page: int | None = None,
+        per_page: int | None = None,
+    ) -> dict[str, Any]:
+        """``GET /hosted-agents/{id}/deployments`` — deployment history.
+
+        Newest first, paginated. Returns the full envelope. Requires
+        ``hosted-agents.read``.
+        """
+        hive = self._config.superpos_hive_id
+        params: dict[str, Any] = {}
+        if page is not None:
+            params["page"] = page
+        if per_page is not None:
+            params["per_page"] = per_page
+        resp = await self._request(
+            "GET",
+            f"/api/v1/hives/{hive}/hosted-agents/{hosted_agent_id}/deployments",
+            params=params or None,
+        )
+        return resp.json()
+
+    async def start_hosted_agent(self, hosted_agent_id: str) -> dict[str, Any]:
+        """``POST /hosted-agents/{id}/start`` — start a stopped/errored agent.
+
+        Returns 202 Accepted with ``meta.queued_job``. Requires
+        ``hosted-agents.manage`` and a positive credit balance.
+        """
+        hive = self._config.superpos_hive_id
+        resp = await self._request(
+            "POST", f"/api/v1/hives/{hive}/hosted-agents/{hosted_agent_id}/start",
+        )
+        return resp.json()
+
+    async def stop_hosted_agent(self, hosted_agent_id: str) -> dict[str, Any]:
+        """``POST /hosted-agents/{id}/stop`` — stop a running/deploying agent.
+
+        Returns 202 Accepted with ``meta.queued_job``. Requires
+        ``hosted-agents.manage`` (no credit gate — stopping frees credit).
+        """
+        hive = self._config.superpos_hive_id
+        resp = await self._request(
+            "POST", f"/api/v1/hives/{hive}/hosted-agents/{hosted_agent_id}/stop",
+        )
+        return resp.json()
+
+    async def restart_hosted_agent(self, hosted_agent_id: str) -> dict[str, Any]:
+        """``POST /hosted-agents/{id}/restart`` — bounce the container in place.
+
+        Redeploys the existing spec (does not re-apply config). Returns 202
+        Accepted with ``meta.queued_job``. Requires ``hosted-agents.manage``
+        and a positive credit balance.
+        """
+        hive = self._config.superpos_hive_id
+        resp = await self._request(
+            "POST", f"/api/v1/hives/{hive}/hosted-agents/{hosted_agent_id}/restart",
+        )
+        return resp.json()
+
+    async def redeploy_hosted_agent(self, hosted_agent_id: str) -> dict[str, Any]:
+        """``POST /hosted-agents/{id}/redeploy`` — re-apply the full app spec.
+
+        Unlike restart (which only bounces the container), redeploy re-applies
+        the deployment spec. Returns 202 Accepted with ``meta.queued_job``.
+        Requires ``hosted-agents.manage`` and a positive credit balance.
+        """
+        hive = self._config.superpos_hive_id
+        resp = await self._request(
+            "POST", f"/api/v1/hives/{hive}/hosted-agents/{hosted_agent_id}/redeploy",
+        )
+        return resp.json()
+
+    async def scale_hosted_agent(
+        self,
+        hosted_agent_id: str,
+        *,
+        size: str,
+        count: int,
+    ) -> dict[str, Any]:
+        """``POST /hosted-agents/{id}/scale`` — change replica size/count.
+
+        The server expects ``{"replicas": {"size": ..., "count": ...}}``;
+        ``size`` is one of ``xs`` / ``s`` / ``m`` / ``l`` and ``count`` is a
+        positive integer (server-capped). Both are required server-side.
+        Returns 202 Accepted with ``meta.queued_job``. Requires
+        ``hosted-agents.manage`` and a positive credit balance.
+        """
+        hive = self._config.superpos_hive_id
+        body = {"replicas": {"size": size, "count": count}}
+        resp = await self._request(
+            "POST", f"/api/v1/hives/{hive}/hosted-agents/{hosted_agent_id}/scale",
+            json=body,
+        )
+        return resp.json()
+
+    async def rollback_hosted_agent_deployment(
+        self, hosted_agent_id: str, deployment_id: str,
+    ) -> dict[str, Any]:
+        """``POST /hosted-agents/{id}/deployments/{deployment}/rollback``.
+
+        Roll back to a prior **successful** deployment (the server 409s for
+        any other status). Returns 202 Accepted with ``meta.queued_job``.
+        Requires ``hosted-agents.manage`` and a positive credit balance.
+        """
+        hive = self._config.superpos_hive_id
+        resp = await self._request(
+            "POST",
+            f"/api/v1/hives/{hive}/hosted-agents/{hosted_agent_id}"
+            f"/deployments/{deployment_id}/rollback",
+        )
+        return resp.json()
+
+    async def delete_hosted_agent(self, hosted_agent_id: str) -> dict[str, Any]:
+        """``DELETE /hosted-agents/{id}`` — tear down a hosted agent.
+
+        The server flips the row to ``deleting`` and enqueues the destroy
+        job, returning 202 Accepted with ``meta.queued_job``. Requires
+        ``hosted-agents.manage``.
+        """
+        hive = self._config.superpos_hive_id
+        resp = await self._request(
+            "DELETE", f"/api/v1/hives/{hive}/hosted-agents/{hosted_agent_id}",
+        )
+        return resp.json()
+
+    async def list_hosted_agent_presets(self) -> Any:
+        """``GET /hosted-agent-presets`` — sanitized preset catalogue.
+
+        NOTE: this route is org-scoped, NOT hive-prefixed (the only
+        hosted-agent route that is). Returns the operator-sanitized preset
+        list powering the create wizard. Requires ``hosted-agents.read``.
+        """
+        resp = await self._request("GET", "/api/v1/hosted-agent-presets")
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
     # ── Lifecycle ─────────────────────────────────────────────────────
 
     async def close(self) -> None:

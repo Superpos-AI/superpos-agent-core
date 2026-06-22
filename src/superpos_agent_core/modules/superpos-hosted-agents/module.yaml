@@ -1,0 +1,7 @@
+description: "Superpos hosted agents (Cloud-only) — list, show, status, logs, deployments, and the start/stop/restart/redeploy/scale/rollback/delete lifecycle, plus the preset catalogue. Provisioning (create/update) is deferred to PKV-4."
+env:
+  - SUPERPOS_BASE_URL
+  - SUPERPOS_HIVE_ID
+  - SUPERPOS_AGENT_ID
+  - SUPERPOS_API_TOKEN
+  - SUPERPOS_REFRESH_TOKEN
