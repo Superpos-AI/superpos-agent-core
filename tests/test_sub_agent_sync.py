@@ -389,6 +389,91 @@ class TestFetchRaisesOnFailure:
         assert fetch_sub_agent_definitions("http://fake", "tok") == []
 
 
+class TestFetchPersonaMemory:
+    """fetch_persona_memory distinguishes reachable-empty from outage (AG-10)."""
+
+    def _client_with(self, monkeypatch, handler):
+        import httpx
+
+        class FakeClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def get(self, url, headers=None):
+                return handler(url, headers)
+
+        monkeypatch.setattr(httpx, "Client", FakeClient)
+
+    def test_reachable_with_content_returns_text(self, monkeypatch):
+        import httpx
+
+        from superpos_agent_core.sub_agent_sync import fetch_persona_memory
+
+        def handler(url, headers):  # noqa: ARG001
+            return httpx.Response(200, json={"data": {"content": "remember me"}})
+
+        self._client_with(monkeypatch, handler)
+        assert fetch_persona_memory("http://fake", "tok") == "remember me"
+
+    def test_reachable_empty_returns_none(self, monkeypatch):
+        import httpx
+
+        from superpos_agent_core.sub_agent_sync import fetch_persona_memory
+
+        def handler(url, headers):  # noqa: ARG001
+            return httpx.Response(200, json={"data": {"content": ""}})
+
+        self._client_with(monkeypatch, handler)
+        # Reachable-but-empty → None (NOT an outage; must not raise).
+        assert fetch_persona_memory("http://fake", "tok") is None
+
+    def test_reachable_empty_404_returns_none(self, monkeypatch):
+        import httpx
+
+        from superpos_agent_core.sub_agent_sync import fetch_persona_memory
+
+        def handler(url, headers):  # noqa: ARG001
+            # PersonaController::document() returns notFound() for both
+            # "no active persona" and "MEMORY document missing".
+            return httpx.Response(404, text="Not Found")
+
+        self._client_with(monkeypatch, handler)
+        # 404 is reachable-empty, NOT an outage → None (must not raise).
+        assert fetch_persona_memory("http://fake", "tok") is None
+
+    def test_non_200_raises_outage(self, monkeypatch):
+        import httpx
+
+        from superpos_agent_core.persona_overlay import MemoryFetchUnavailable
+        from superpos_agent_core.sub_agent_sync import fetch_persona_memory
+
+        def handler(url, headers):  # noqa: ARG001
+            return httpx.Response(503, text="down")
+
+        self._client_with(monkeypatch, handler)
+        with pytest.raises(MemoryFetchUnavailable):
+            fetch_persona_memory("http://fake", "tok")
+
+    def test_transport_error_raises_outage(self, monkeypatch):
+        import httpx
+
+        from superpos_agent_core.persona_overlay import MemoryFetchUnavailable
+        from superpos_agent_core.sub_agent_sync import fetch_persona_memory
+
+        def handler(url, headers):  # noqa: ARG001
+            raise httpx.ConnectError("refused")
+
+        self._client_with(monkeypatch, handler)
+        with pytest.raises(MemoryFetchUnavailable):
+            fetch_persona_memory("http://fake", "tok")
+
+
 # ── Finding 3: frontmatter must round-trip through yaml.safe_load ─────
 
 
