@@ -61,7 +61,19 @@ Flags:
 ### `superpos-tracks get <slug>`
 
 Fetch a single track, including the `spec` body. Use this when you
-need to read the full markdown spec rather than just the index row.
+need to read the full markdown spec rather than just the index row;
+the `index` rows omit `spec`.
+
+Once the superpos-app track-link read API (AG-8 / superpos-app#882) is
+deployed, `get` also embeds a `linked_issues` array (the issues linked
+to the track, same shape as `list-issues`, capped at 100
+most-recently-updated) — handy for a quick membership read alongside
+the spec, while `list-issues` still gives the complete, paginated set.
+
+> **Pending backend deploy:** until AG-8 / superpos-app#882 ships,
+> `get` returns the track record **without** `linked_issues`; use
+> `list-issues` (below) as the way to read linked issues in the
+> meantime.
 
 ```bash
 superpos-tracks get agent-capabilities
@@ -135,8 +147,11 @@ superpos-tracks unlink-issue agent-capabilities 01HXYZ...
 
 List the issues linked to a track. The full envelope is returned
 (`{"data": [...], "meta": {...}}`) so callers can paginate via
-`meta.has_more` / `meta.current_page`. Closes the read-side gap
-that `get` only returns the track record.
+`meta.has_more` / `meta.current_page`. This is the complete, paginated
+set and the canonical read-side of the track↔issue relationship. Once
+AG-8 / superpos-app#882 is deployed, `get` embeds the same issues
+(capped at 100) for convenience; until then `list-issues` is the only
+way to read linked issues.
 
 ```bash
 superpos-tracks list-issues k1
