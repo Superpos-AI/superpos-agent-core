@@ -150,8 +150,17 @@ async def _resolve_app_connection(client: SuperposClient) -> dict[str, Any] | No
     try:
         connections = await client.list_github_connections()
     except GitHubDiscoveryForbidden as exc:
+        # The ``services.read``-gated catalog is denied.  Fall back to the
+        # persona ``github`` block, which is scoped by the per-connection
+        # ``services:{id}`` permission and lists broker-compatible connections
+        # directly — so the broker path still works without ``services.read``.
+        record = await _resolve_app_connection_from_persona(client)
+        if record:
+            _write_json_private(_connection_cache_path(), record)
+            return record
         log.debug(
-            "GitHub discovery denied (HTTP %d); falling back to static "
+            "GitHub discovery denied (HTTP %d) and the persona github block "
+            "yielded no broker-compatible connection; falling back to static "
             "GITHUB_TOKEN: %s",
             exc.status_code,
             exc,
@@ -174,6 +183,56 @@ async def _resolve_app_connection(client: SuperposClient) -> dict[str, Any] | No
     record = {"id": conn.get("id"), "name": conn.get("name")}
     _write_json_private(_connection_cache_path(), record)
     return record
+
+
+async def _resolve_app_connection_from_persona(
+    client: SuperposClient,
+) -> dict[str, Any] | None:
+    """Resolve a broker-compatible connection from the persona ``github`` block.
+
+    Used as the fallback when the ``services.read`` catalog is denied.  The
+    block is scoped by the per-connection ``services:{id}`` permission, so it
+    surfaces connections the agent may use even without catalog read.  Only
+    broker-compatible (``github_app``) connections can mint installation
+    tokens, so PAT-backed ones are skipped here.
+
+    Prefers ``default_connection_id`` when set (the backend only sets it when
+    exactly one broker-compatible connection is permitted); otherwise picks the
+    single broker-compatible connection if there's exactly one.  Returns
+    ``{"id", "name"}`` or ``None``.
+    """
+    persona = await client.get_persona()
+    if not persona:
+        return None
+    block = persona.get("github")
+    if not isinstance(block, dict):
+        return None
+    conns = block.get("connections")
+    if not isinstance(conns, list):
+        return None
+    broker = [c for c in conns if c.get("broker_compatible")]
+    if not broker:
+        return None
+    default_id = block.get("default_connection_id")
+    chosen = None
+    if default_id:
+        chosen = next(
+            (c for c in broker if c.get("service_connection_id") == default_id),
+            None,
+        )
+    if chosen is None and len(broker) == 1:
+        chosen = broker[0]
+    if chosen is None:
+        log.warning(
+            "Multiple broker-compatible GitHub connections in the persona "
+            "block and no default; set SUPERPOS_GITHUB_CONNECTION_ID to pin "
+            "one.",
+        )
+        return None
+    return {
+        "id": chosen.get("service_connection_id"),
+        "name": chosen.get("name"),
+    }
 
 
 def _cached_connection_id() -> str | None:

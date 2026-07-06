@@ -287,10 +287,71 @@ async def test_resolve_app_connection_returns_none_on_forbidden(monkeypatch):
                 "GitHub service connections",
             )
 
+        async def get_persona(self):
+            # No persona github block available → nothing to fall back to.
+            return None
+
         async def close(self):
             pass
 
     monkeypatch.setattr(ga, "SuperposClient", _ForbiddenClient)
 
     result = await ga._resolve_app_connection(_ForbiddenClient())  # type: ignore[arg-type]
+    assert result is None
+
+
+async def test_resolve_app_connection_falls_back_to_persona_on_forbidden(monkeypatch):
+    # When the services.read catalog 403s, fall back to the persona github
+    # block, which is scoped by services:{id} instead.
+    class _PersonaFallbackClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def list_github_connections(self):
+            raise GitHubDiscoveryForbidden(403, "no services.read")
+
+        async def get_persona(self):
+            return {"github": {
+                "default_connection_id": "app-uuid",
+                "connections": [
+                    {"service_connection_id": "app-uuid", "name": "gh-app",
+                     "broker_compatible": True},
+                    {"service_connection_id": "pat-uuid", "name": "gh-pat",
+                     "broker_compatible": False},
+                ],
+            }}
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(ga, "_write_json_private", lambda *a, **k: None)
+
+    result = await ga._resolve_app_connection(_PersonaFallbackClient())  # type: ignore[arg-type]
+    assert result == {"id": "app-uuid", "name": "gh-app"}
+
+
+async def test_resolve_app_connection_persona_skips_pat_only(monkeypatch):
+    # A persona block with only PAT (non-broker-compatible) connections yields
+    # nothing — the broker can't mint from those, so we fall through to
+    # GITHUB_TOKEN.
+    class _PatOnlyClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def list_github_connections(self):
+            raise GitHubDiscoveryForbidden(403, "no services.read")
+
+        async def get_persona(self):
+            return {"github": {
+                "default_connection_id": None,
+                "connections": [
+                    {"service_connection_id": "pat-uuid", "name": "gh-pat",
+                     "broker_compatible": False},
+                ],
+            }}
+
+        async def close(self):
+            pass
+
+    result = await ga._resolve_app_connection(_PatOnlyClient())  # type: ignore[arg-type]
     assert result is None

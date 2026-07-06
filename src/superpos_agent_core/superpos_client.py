@@ -305,6 +305,71 @@ class SuperposClient:
             log.warning("Failed to fetch persona; proceeding without it", exc_info=True)
             return None
 
+    async def get_persona(self) -> dict[str, Any] | None:
+        """``GET /api/v1/persona`` — the agent's raw persona document.
+
+        Unlike :meth:`get_persona_assembled` (which returns the pre-rendered
+        system-prompt string), this returns the structured persona ``data``
+        object, including the ``github`` block the backend attaches for agents
+        with per-connection ``services:{id}`` / ``services:*`` permission.  That
+        block carries ``connections`` (each with ``service_connection_id``,
+        ``name``, ``auth_type``, ``broker_compatible`` …) and a
+        ``default_connection_id`` — enough to resolve the connection UUID a
+        webhook/workflow trigger needs *without* the ``services.read``-gated
+        catalog endpoint.
+
+        Returns the ``data`` dict, or ``None`` if the persona is unavailable
+        (404) or the request fails.
+        """
+        try:
+            resp = await self._request("GET", "/api/v1/persona")
+            data = resp.json()
+            return data.get("data", data) if isinstance(data, dict) else None
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                log.debug("Persona endpoint not available (404)")
+            else:
+                log.warning("Failed to fetch persona", exc_info=True)
+            return None
+        except Exception:
+            log.warning("Failed to fetch persona", exc_info=True)
+            return None
+
+    async def resolve_github_connection_id(self) -> str | None:
+        """Resolve the GitHub ``service_connection_id`` from the persona block.
+
+        Reads the ``github`` block attached to ``GET /api/v1/persona`` and
+        returns a connection UUID *without* requiring the ``services.read``
+        permission (which the catalog endpoint behind
+        :meth:`list_github_connections` needs and which 403s for most agents).
+        The persona block is scoped by the per-connection ``services:{id}`` /
+        ``services:*`` permission instead.
+
+        Resolution order:
+
+        1. ``github.default_connection_id`` — set by the backend when exactly
+           one broker-compatible (``github_app``) connection is permitted.
+        2. If there is no default but exactly one connection is present, its
+           ``service_connection_id``.
+        3. Otherwise ``None`` (no block, no connections, or ambiguous — more
+           than one connection and no default). Callers should then ask a human
+           which connection to use.
+        """
+        persona = await self.get_persona()
+        if not persona:
+            return None
+        block = persona.get("github")
+        if not isinstance(block, dict):
+            return None
+        default_id = block.get("default_connection_id")
+        if default_id:
+            return str(default_id)
+        connections = block.get("connections")
+        if isinstance(connections, list) and len(connections) == 1:
+            conn_id = connections[0].get("service_connection_id")
+            return str(conn_id) if conn_id else None
+        return None
+
     async def get_persona_version(
         self,
         known_version: int | None = None,
