@@ -187,12 +187,19 @@ def run_setup(
     bin_dir: str | None = None,
     registry_resolved: dict | None = None,
     skills_dir: str | None = None,
+    skills_layout: str = "flat",
 ) -> None:
     """Discover modules, run setup scripts, install deps, update system prompt.
 
     ``bin_dir`` (optional) — if provided, every discovered module's
     ``scripts/`` files are symlinked here.  Set to a directory that's on
     ``$PATH`` so the agent can invoke scripts by name.
+
+    ``skills_layout`` — ``flat`` (default) writes registry skills as
+    ``<skills_dir>/<slug>.md`` (the Claude agent's format); ``codex`` writes
+    them as ``<skills_dir>/<slug>/SKILL.md`` dirs (the @openai/codex CLI's
+    format).  Only affects the registry skills overlay; the Claude path is
+    unchanged at the default.
 
     ``registry_resolved`` (optional, Beat 2b) — when the
     ``PLATFORM_REGISTRY_SERVE_SKILLS_MODULES`` flag is ON, pass the parsed
@@ -262,6 +269,7 @@ def run_setup(
             registry_resolved,
             modules_dir=modules_dir,
             skills_dir=skills_dir,
+            skills_layout=skills_layout,
             agents_md_path=agents_md_path,
             bin_dir=bin_dir,
         )
@@ -450,6 +458,19 @@ def main() -> None:
             "registry modules are overlaid even without it."
         ),
     )
+    parser.add_argument(
+        "--skills-layout",
+        choices=["flat", "codex"],
+        default="flat",
+        help=(
+            "On-disk layout for registry skills. 'flat' (default) writes "
+            "<skills-dir>/<slug>.md (the Claude agent's format). 'codex' "
+            "writes <skills-dir>/<slug>/SKILL.md dirs (the @openai/codex CLI's "
+            "format — its loader only registers a skill when it finds a "
+            "directory containing a SKILL.md file, so a flat <slug>.md is "
+            "invisible to it)."
+        ),
+    )
     args = parser.parse_args()
 
     # Beat 2b: only touch the registry when the flag is on (default ON; an
@@ -472,6 +493,7 @@ def main() -> None:
         bin_dir=args.bin_dir,
         registry_resolved=registry_resolved,
         skills_dir=args.skills_dir,
+        skills_layout=args.skills_layout,
     )
 
 
