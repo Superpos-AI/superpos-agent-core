@@ -476,6 +476,52 @@ def test_credential_get_fails_clear_on_ambiguous(monkeypatch, tmp_path):
     assert out == ""
 
 
+# ── persona unavailable: owner request must NOT fall back to catalog[0] ──
+
+
+class _NoPersonaTwoAppCatalogClient:
+    """Persona is unavailable (``get_persona`` → None) but the raw catalog
+    holds two ``github_app`` connections.  Records every mint so a test can
+    assert the WRONG-org connection is never minted."""
+
+    minted: list[str] = []
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def get_persona(self):
+        return None
+
+    async def list_github_connections(self):
+        return [
+            {"id": "conn-a", "metadata": {"auth_type": "github_app"}},
+            {"id": "conn-b", "metadata": {"auth_type": "github_app"}},
+        ]
+
+    async def mint_github_token(self, conn_id):
+        type(self).minted.append(conn_id)
+        return {"token": f"tok_{conn_id}", "expires_at": _iso(3600)}
+
+    async def close(self):
+        pass
+
+
+async def test_mint_token_owner_fails_clear_when_persona_unavailable(
+    tmp_path, monkeypatch
+):
+    _std_env(monkeypatch, tmp_path)
+    _NoPersonaTwoAppCatalogClient.minted = []
+    monkeypatch.setattr(ga, "SuperposClient", _NoPersonaTwoAppCatalogClient)
+
+    # Persona resolution yields no connection id, so _mint_token falls back to
+    # catalog discovery.  With an owner and two App connections the catalog
+    # cannot prove which installation owns the repo → refuse to guess rather
+    # than minting for the first (wrong) connection.
+    with pytest.raises(ga._AmbiguousConnection):
+        await ga._mint_token("org-b")
+    assert _NoPersonaTwoAppCatalogClient.minted == []
+
+
 # ── setup enables useHttpPath ───────────────────────────────────────────
 
 

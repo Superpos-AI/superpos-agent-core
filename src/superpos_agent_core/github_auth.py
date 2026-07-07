@@ -283,7 +283,9 @@ async def _resolve_connection_id(owner: str | None) -> str | None:
     return None
 
 
-async def _resolve_app_connection(client: SuperposClient) -> dict[str, Any] | None:
+async def _resolve_app_connection(
+    client: SuperposClient, owner: str | None = None
+) -> dict[str, Any] | None:
     """Find an active ``github_app`` connection and cache its id/name.
 
     Used by ``setup`` (which has no repo owner yet) to decide whether the App
@@ -297,6 +299,14 @@ async def _resolve_app_connection(client: SuperposClient) -> dict[str, Any] | No
     return ``None`` and the caller falls through to the static
     ``GITHUB_TOKEN`` rule or the proxy.  Logged at debug level so the
     permission problem is not silently conflated with an empty catalog.
+
+    ``owner`` is the repo owner of an owner-specific credential request.  The
+    raw catalog has no ``target_login`` to match on, so when an owner is
+    supplied and discovery finds two or more App connections we cannot prove
+    which one owns the repo — raise :class:`_AmbiguousConnection` rather than
+    silently minting for ``app_conns[0]`` (the wrong installation).  With no
+    owner (setup's bootstrap) picking the first is fine: the per-repo helper
+    still resolves the owning connection for each git operation.
     """
     try:
         connections = await client.list_github_connections()
@@ -317,6 +327,18 @@ async def _resolve_app_connection(client: SuperposClient) -> dict[str, Any] | No
         return None
     conn = app_conns[0]
     if len(app_conns) > 1:
+        if owner is not None:
+            # Owner-specific request but the catalog can't tell us which
+            # installation owns the repo; guessing risks a wrong-org token.
+            log.error(
+                "Repo owner %r could not be resolved to a single GitHub "
+                "connection (persona unavailable) and catalog discovery found "
+                "%d github_app connections; set SUPERPOS_GITHUB_CONNECTION_ID "
+                "to disambiguate.",
+                owner,
+                len(app_conns),
+            )
+            raise _AmbiguousConnection(owner)
         log.info(
             "Multiple github_app connections found; the credential helper "
             "resolves the owning one per repo. Caching %r for gh bootstrap.",
@@ -426,7 +448,10 @@ async def _mint_token(owner: str | None = None) -> str | None:
         if not conn_id:
             # No persona/override signal — fall back to catalog discovery, which
             # primes setup's single-connection cache for the offline hot path.
-            conn = await _resolve_app_connection(client)
+            # Pass ``owner`` so discovery fails clear (rather than minting for
+            # ``app_conns[0]``) when the persona contract is missing/stale and
+            # the catalog holds two or more App connections.
+            conn = await _resolve_app_connection(client, owner)
             if not conn:
                 return None
             conn_id = conn["id"]
