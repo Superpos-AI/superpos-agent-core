@@ -25,9 +25,12 @@ from superpos_agent_core.registry_overlay import (
     FEATURE_FLAG_ENV,
     MODULE_INSTALL_FAILED_EVENT,
     RESOLVED_EMPTY_NO_FALLBACK_EVENT,
+    SKILLS_LAYOUT_CODEX,
+    SKILLS_LAYOUT_FLAT,
     apply_registry_overlay,
     feature_enabled,
     overlay_modules,
+    overlay_skills,
 )
 
 BEGIN = module_setup.BEGIN_MARKER
@@ -227,6 +230,101 @@ def test_flag_on_installs_skills_and_modules(tmp_path: Path, monkeypatch):
     # run_setup prepended — it must not be replaced by module docs only.
     assert "`superpos-task` CLI" in doc
     assert "--self-target" in doc
+
+
+# ── Skills layout (flat vs codex) ────────────────────────────────────
+
+
+def _skill_items():
+    return [
+        {
+            "slug": "deep-research",
+            "name": "Deep Research",
+            "instructions": "---\nname: deep-research\n---\nResearch harness.\n",
+            "files": [
+                {"path": "scripts/run.sh", "content": "echo hi\n", "mode": "+x"},
+            ],
+        },
+    ]
+
+
+def test_overlay_skills_flat_layout_default(tmp_path: Path):
+    """Default (Claude) layout writes a flat <slug>.md + sibling <slug>/ dir."""
+    skills_dir = tmp_path / "skills"
+    result = overlay_skills(_skill_items(), str(skills_dir))
+
+    assert result.written == ["deep-research"]
+    flat = skills_dir / "deep-research.md"
+    assert flat.is_file()
+    assert "Research harness" in flat.read_text()
+    # Codex would NOT discover this: no <slug>/SKILL.md dir.
+    assert not (skills_dir / "deep-research" / "SKILL.md").exists()
+    # Helper files land under the sibling per-slug dir.
+    helper = skills_dir / "deep-research" / "scripts" / "run.sh"
+    assert helper.is_file()
+    assert os.access(helper, os.X_OK)
+
+
+def test_overlay_skills_codex_layout_writes_dir_per_skill(tmp_path: Path):
+    """Codex layout writes <slug>/SKILL.md (dir-per-skill) + helper files.
+
+    This is the exact layout the OpenAI Codex CLI's skill loader discovers:
+    a directory in a scanned root containing a file named ``SKILL.md``.  A
+    flat ``<slug>.md`` file must NOT be written in this layout.
+    """
+    skills_dir = tmp_path / "skills"
+    result = overlay_skills(
+        _skill_items(), str(skills_dir), layout=SKILLS_LAYOUT_CODEX
+    )
+
+    assert result.written == ["deep-research"]
+    skill_md = skills_dir / "deep-research" / "SKILL.md"
+    assert skill_md.is_file()
+    assert "Research harness" in skill_md.read_text()
+    # No flat <slug>.md — Codex ignores those, and it would shadow nothing.
+    assert not (skills_dir / "deep-research.md").exists()
+    # Helper files land alongside SKILL.md inside the skill dir.
+    helper = skills_dir / "deep-research" / "scripts" / "run.sh"
+    assert helper.is_file()
+    assert os.access(helper, os.X_OK)
+
+
+def test_overlay_skills_rejects_unknown_layout(tmp_path: Path):
+    with pytest.raises(ValueError, match="unknown skills layout"):
+        overlay_skills(_skill_items(), str(tmp_path / "skills"), layout="bogus")
+
+
+def test_run_setup_codex_layout_end_to_end(tmp_path: Path, monkeypatch):
+    """run_setup(..., skills_layout='codex') materialises <slug>/SKILL.md."""
+    monkeypatch.setenv(FEATURE_FLAG_ENV, "true")
+    modules_dir = tmp_path / "modules"
+    skills_dir = tmp_path / "skills"
+    agents_md = _agents_md(tmp_path)
+
+    module_setup.run_setup(
+        str(modules_dir),
+        str(agents_md),
+        registry_resolved=_resolved_payload(),
+        skills_dir=str(skills_dir),
+        skills_layout=SKILLS_LAYOUT_CODEX,
+    )
+
+    assert (skills_dir / "deep-research" / "SKILL.md").is_file()
+    assert not (skills_dir / "deep-research.md").exists()
+
+
+def test_apply_overlay_default_layout_is_flat(tmp_path: Path, monkeypatch):
+    """apply_registry_overlay defaults to the flat (Claude) layout."""
+    monkeypatch.setenv(FEATURE_FLAG_ENV, "true")
+    skills_dir = tmp_path / "skills"
+    res = apply_registry_overlay(
+        {"skills": _skill_items(), "modules": []},
+        modules_dir=str(tmp_path / "modules"),
+        skills_dir=str(skills_dir),
+    )
+    assert res.skills.written == ["deep-research"]
+    assert (skills_dir / "deep-research.md").is_file()
+    assert SKILLS_LAYOUT_FLAT == "flat"
 
 
 def test_registry_overlay_preserves_task_cli_reference(tmp_path: Path, monkeypatch):

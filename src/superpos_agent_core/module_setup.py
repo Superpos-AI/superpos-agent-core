@@ -187,6 +187,7 @@ def run_setup(
     bin_dir: str | None = None,
     registry_resolved: dict | None = None,
     skills_dir: str | None = None,
+    skills_layout: str = "flat",
 ) -> None:
     """Discover modules, run setup scripts, install deps, update system prompt.
 
@@ -262,6 +263,7 @@ def run_setup(
             registry_resolved,
             modules_dir=modules_dir,
             skills_dir=skills_dir,
+            skills_layout=skills_layout,
             agents_md_path=agents_md_path,
             bin_dir=bin_dir,
         )
@@ -450,6 +452,17 @@ def main() -> None:
             "registry modules are overlaid even without it."
         ),
     )
+    parser.add_argument(
+        "--skills-layout",
+        choices=["flat", "codex"],
+        default="flat",
+        help=(
+            "On-disk layout for overlaid skills. 'flat' (default) writes "
+            "<skills-dir>/<slug>.md for Claude-style agents; 'codex' writes "
+            "<skills-dir>/<slug>/SKILL.md dirs so the OpenAI Codex CLI "
+            "discovers them (Codex only registers dirs containing SKILL.md)."
+        ),
+    )
     args = parser.parse_args()
 
     # Beat 2b: only touch the registry when the flag is on (default ON; an
@@ -472,6 +485,7 @@ def main() -> None:
         bin_dir=args.bin_dir,
         registry_resolved=registry_resolved,
         skills_dir=args.skills_dir,
+        skills_layout=args.skills_layout,
     )
 
 
