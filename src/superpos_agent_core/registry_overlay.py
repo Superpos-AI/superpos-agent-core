@@ -157,6 +157,19 @@ def _safe_rel(rel: str) -> bool:
     return bool(rel) and not rel.startswith("/") and ".." not in Path(rel).parts
 
 
+def _resolves_to(install_dir: Path, entry: dict, target: Path) -> bool:
+    """Return True if ``entry``'s (safe) path lands exactly on ``target``.
+
+    Used to guard the generated ``<slug>/SKILL.md`` body against a helper
+    file entry whose path resolves to the same location.  Unsafe paths (which
+    ``_write_file_entry`` would skip anyway) never collide.
+    """
+    rel = entry.get("path") or ""
+    if not _safe_rel(rel):
+        return False
+    return (install_dir / rel).resolve() == target.resolve()
+
+
 def _write_file_entry(install_dir: Path, entry: dict) -> None:
     """Write one ``{path, content, mode}`` file under ``install_dir``.
 
@@ -241,8 +254,20 @@ def overlay_skills(
                 # in that same dir alongside it.
                 skill_dir = root / slug
                 skill_dir.mkdir(parents=True, exist_ok=True)
-                (skill_dir / "SKILL.md").write_text(instructions, encoding="utf-8")
+                skill_md = skill_dir / "SKILL.md"
+                skill_md.write_text(instructions, encoding="utf-8")
                 for entry in files:
+                    # The generated SKILL.md body (from instructions) is the
+                    # invariant both layouts share — a helper file whose path
+                    # resolves to <slug>/SKILL.md must never clobber it.
+                    if _resolves_to(skill_dir, entry, skill_md):
+                        log.warning(
+                            "registry skill %s: helper file %r collides with the "
+                            "generated SKILL.md; keeping generated body",
+                            slug,
+                            entry.get("path"),
+                        )
+                        continue
                     _write_file_entry(skill_dir, entry)
             else:
                 # Flat (Claude) — <slug>.md at the root; helper files in a

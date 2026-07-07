@@ -1351,6 +1351,40 @@ def test_overlay_skills_codex_writes_dir_per_skill_SKILL_md(tmp_path: Path):
     )
 
 
+def test_overlay_skills_codex_helper_named_SKILL_md_does_not_clobber_body(
+    tmp_path: Path,
+):
+    """A registry skill helper file literally named ``SKILL.md`` must NOT
+    overwrite the generated ``<slug>/SKILL.md`` body built from instructions.
+    Both layouts share the same skill body — only the path differs — so the
+    generated body always wins in the codex per-slug dir."""
+    skills_dir = tmp_path / "skills"
+    skills = [
+        {
+            "slug": "deep-research",
+            "name": "Deep Research",
+            "instructions": "# deep-research\n\nGenerated body.\n",
+            "files": [
+                # Careless/hostile helper file that would clobber the body.
+                {"path": "SKILL.md", "content": "# HELPER OVERWRITE\n"},
+                {"path": "scripts/run.sh", "content": "echo hi\n", "mode": "+x"},
+            ],
+        },
+    ]
+
+    result = overlay_skills(skills, str(skills_dir), layout=SKILLS_LAYOUT_CODEX)
+
+    assert result.written == ["deep-research"]
+    # The generated body — not the helper's content — survives.
+    assert (skills_dir / "deep-research" / "SKILL.md").read_text() == (
+        "# deep-research\n\nGenerated body.\n"
+    )
+    # Other (non-colliding) helper files are still written normally.
+    assert (skills_dir / "deep-research" / "scripts" / "run.sh").read_text() == (
+        "echo hi\n"
+    )
+
+
 def test_overlay_skills_unknown_layout_raises(tmp_path: Path):
     with pytest.raises(ValueError):
         overlay_skills(_skill_items(), str(tmp_path / "skills"), layout="bogus")
