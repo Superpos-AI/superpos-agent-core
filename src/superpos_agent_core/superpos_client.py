@@ -347,15 +347,27 @@ class SuperposClient:
         The persona block is scoped by the per-connection ``services:{id}`` /
         ``services:*`` permission instead.
 
+        Only broker-compatible (``github_app``) connections are eligible: the
+        broker mints installation tokens and cannot do so from a PAT
+        (``broker_compatible=False``) connection, so a PAT id must never be
+        returned as a resolvable/default connection.  A PAT-only persona has one
+        connection and no ``default_connection_id``; returning that PAT id would
+        misrepresent it as the default despite the server contract.  This
+        mirrors :func:`github_auth._connections_from_persona`, which filters the
+        same way before matching owner/default.
+
         Resolution order:
 
         1. ``github.default_connection_id`` — set by the backend when exactly
-           one broker-compatible (``github_app``) connection is permitted.
-        2. If there is no default but exactly one connection is present, its
-           ``service_connection_id``.
-        3. Otherwise ``None`` (no block, no connections, or ambiguous — more
-           than one connection and no default). Callers should then ask a human
-           which connection to use.
+           one broker-compatible (``github_app``) connection is permitted — but
+           only when it names a broker-compatible connection actually present in
+           the block (a stale or PAT default is ignored).
+        2. If there is no usable default but exactly one broker-compatible
+           connection is present, its ``service_connection_id``.
+        3. Otherwise ``None`` (no block, no broker-compatible connections, or
+           ambiguous — more than one and no default). Callers should then ask a
+           human which connection to use or fall back to the static
+           ``GITHUB_TOKEN`` path.
         """
         persona = await self.get_persona()
         if not persona:
@@ -363,12 +375,26 @@ class SuperposClient:
         block = persona.get("github")
         if not isinstance(block, dict):
             return None
-        default_id = block.get("default_connection_id")
-        if default_id:
-            return str(default_id)
         connections = block.get("connections")
-        if isinstance(connections, list) and len(connections) == 1:
-            conn_id = connections[0].get("service_connection_id")
+        if not isinstance(connections, list):
+            connections = []
+        broker = [
+            c
+            for c in connections
+            if isinstance(c, dict) and c.get("broker_compatible")
+        ]
+        broker_ids = {
+            str(cid)
+            for c in broker
+            if (cid := c.get("service_connection_id"))
+        }
+        default_id = block.get("default_connection_id")
+        # Only honour a default that names a broker-compatible connection; a
+        # stale (not-present) or PAT default is ignored.
+        if default_id and str(default_id) in broker_ids:
+            return str(default_id)
+        if len(broker) == 1:
+            conn_id = broker[0].get("service_connection_id")
             return str(conn_id) if conn_id else None
         return None
 
