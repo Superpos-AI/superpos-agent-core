@@ -541,6 +541,36 @@ async def test_resolve_connection_id_pat_only_falls_through(tmp_path, monkeypatc
     assert await ga._resolve_connection_id("Superpos-AI") is None
 
 
+async def test_connections_from_persona_drops_pat_default():
+    # A default_connection_id pointing at a PAT (broker_compatible=False)
+    # connection must be dropped: with no owner, _resolve_connection_id would
+    # otherwise hand that PAT id straight to the installation-token mint
+    # endpoint, which cannot mint from a PAT. Mirror
+    # _resolve_app_connection_from_persona, which only honours a default that
+    # names a broker-compatible connection.
+    mixed = [
+        {"service_connection_id": "pat-superpos", "target_login": "Superpos-AI",
+         "broker_compatible": False},
+        {"service_connection_id": "app-address", "target_login": "address-so",
+         "broker_compatible": True},
+    ]
+    client = _persona_client(mixed, default_id="pat-superpos")()
+    broker, default_id = await ga._connections_from_persona(client)
+    assert [c["service_connection_id"] for c in broker] == ["app-address"]
+    assert default_id is None
+
+
+async def test_connections_from_persona_keeps_broker_default():
+    # The counterpart: a default naming a broker-compatible connection is kept.
+    conns = [
+        {"service_connection_id": "app-solo", "target_login": "solo-org",
+         "broker_compatible": True},
+    ]
+    client = _persona_client(conns, default_id="app-solo")()
+    broker, default_id = await ga._connections_from_persona(client)
+    assert default_id == "app-solo"
+
+
 # ── credential get end-to-end: mints for the OWNING connection ──────────
 
 

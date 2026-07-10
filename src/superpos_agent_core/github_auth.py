@@ -216,7 +216,15 @@ async def _connections_from_persona(
         conns = []
     broker = [c for c in conns if isinstance(c, dict) and c.get("broker_compatible")]
     default_id = block.get("default_connection_id")
-    return broker, (default_id if isinstance(default_id, str) else None)
+    if not isinstance(default_id, str):
+        default_id = None
+    elif default_id not in {_conn_id(c) for c in broker}:
+        # A default pointing at a PAT (broker_compatible=False) connection must
+        # never be handed to the mint endpoint, which cannot mint from a PAT.
+        # Mirror _resolve_app_connection_from_persona, which only honours the
+        # default when it names a broker-compatible connection.
+        default_id = None
+    return broker, default_id
 
 
 def _conn_id(conn: dict[str, Any]) -> str | None:
