@@ -134,11 +134,164 @@ def _is_fresh(expires_at: str | None) -> bool:
 # ── connection discovery ──────────────────────────────────────────────
 
 
-async def _resolve_app_connection(client: SuperposClient) -> dict[str, Any] | None:
+def _owner_from_path(path: str | None) -> str | None:
+    """Extract the repo *owner* from git's ``path=owner/repo.git`` line.
+
+    Git forwards the HTTP path only when ``credential.useHttpPath=true`` (which
+    ``setup`` configures).  The owner is the first path segment; a trailing
+    ``.git`` on the segment is stripped.  Returns ``None`` when there is no
+    usable path (older git, or the value is empty), so callers fall back to the
+    non-owner-aware precedence.
+    """
+    if not path:
+        return None
+    first = path.strip("/").split("/", 1)[0]
+    if first.endswith(".git"):
+        first = first[: -len(".git")]
+    return first or None
+
+
+async def _connections_from_persona(
+    client: SuperposClient,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Return ``(connections, default_connection_id)`` from the persona block.
+
+    The persona ``github`` block (rendered server-side by ``GitHubVersionService``)
+    carries per-connection ``target_login`` — the org/user the App installation
+    is bound to — which the raw services catalog does not.  This is the source
+    of truth for owner-aware resolution and needs only the free
+    ``services.read`` scope the persona render already relies on.
+
+    Returns ``([], None)`` on any failure so callers fall back to catalog
+    discovery or the static ``GITHUB_TOKEN`` path.
+    """
+    try:
+        persona = await client.get_persona()
+    except Exception:  # pragma: no cover - get_persona already swallows errors
+        return [], None
+    if not isinstance(persona, dict):
+        return [], None
+    block = persona.get("github")
+    if not isinstance(block, dict):
+        return [], None
+    conns = block.get("connections")
+    if not isinstance(conns, list):
+        conns = []
+    default_id = block.get("default_connection_id")
+    return conns, (default_id if isinstance(default_id, str) else None)
+
+
+def _conn_id(conn: dict[str, Any]) -> str | None:
+    """A connection's broker id — persona uses ``service_connection_id``, the
+    raw catalog uses ``id``.  Accept either."""
+    val = conn.get("service_connection_id") or conn.get("id")
+    return val if isinstance(val, str) else None
+
+
+def _match_owner(
+    conns: list[dict[str, Any]], owner: str
+) -> list[dict[str, Any]]:
+    """Connections whose ``target_login`` equals ``owner`` (case-insensitive)."""
+    owner_lc = owner.casefold()
+    return [
+        c
+        for c in conns
+        if isinstance(c.get("target_login"), str)
+        and c["target_login"].casefold() == owner_lc
+    ]
+
+
+class _AmbiguousConnection(Exception):
+    """Raised when a repo owner cannot be resolved to a single connection and
+    there is no override/default to fall back on — we refuse to guess."""
+
+
+async def _resolve_connection_id(owner: str | None) -> str | None:
+    """Resolve the ``github_app`` connection id to mint for.
+
+    Precedence:
+      1. ``SUPERPOS_GITHUB_CONNECTION_ID`` env override (explicit; always wins).
+      2. **owner match** against the persona block's ``connections[].target_login``
+         (the owner-aware path — new).
+      3. ``default_connection_id`` from the persona block (single-connection
+         agents; unchanged behaviour).
+      4. setup's cached single-connection resolution (offline fallback).
+
+    Raises :class:`_AmbiguousConnection` when there are two or more connections,
+    an owner was supplied, and none matches it (and no override/default) — a
+    clear failure beats silently minting for the wrong installation.  Returns
+    ``None`` only when there is genuinely no ``github_app`` connection to use.
+    """
+    override = os.environ.get("SUPERPOS_GITHUB_CONNECTION_ID")
+    if override:
+        return override
+
+    client = SuperposClient(_config_from_env())
+    try:
+        conns, default_id = await _connections_from_persona(client)
+    finally:
+        await client.close()
+
+    if conns:
+        if owner:
+            matches = _match_owner(conns, owner)
+            if len(matches) == 1:
+                return _conn_id(matches[0])
+            if len(matches) > 1:
+                # Two connections on the same org is a real (if rare) config;
+                # without a finer signal we cannot pick — fail clear.
+                logins = sorted(
+                    c.get("target_login", "?") for c in conns
+                )
+                log.error(
+                    "Repo owner %r matches multiple GitHub connections %r; set "
+                    "SUPERPOS_GITHUB_CONNECTION_ID to disambiguate.",
+                    owner, logins,
+                )
+                raise _AmbiguousConnection(owner)
+            # owner supplied but matched nothing.
+            if len(conns) == 1:
+                # Only one connection anyway — no ambiguity, use it.
+                return _conn_id(conns[0])
+            logins = sorted(c.get("target_login", "?") for c in conns)
+            log.error(
+                "No GitHub connection owns repo owner %r (available "
+                "target_login: %r); set SUPERPOS_GITHUB_CONNECTION_ID to pin "
+                "one.",
+                owner, logins,
+            )
+            raise _AmbiguousConnection(owner)
+        # No owner (git didn't send a path / older git): honour the default or,
+        # if unambiguous, the sole connection.
+        if default_id:
+            return default_id
+        if len(conns) == 1:
+            return _conn_id(conns[0])
+        logins = sorted(c.get("target_login", "?") for c in conns)
+        log.error(
+            "Multiple GitHub connections %r and no repo owner to resolve by; "
+            "set SUPERPOS_GITHUB_CONNECTION_ID to pin one.",
+            logins,
+        )
+        raise _AmbiguousConnection(None)
+
+    if default_id:
+        return default_id
+
+    # Persona had no usable github block — fall back to catalog discovery
+    # (setup's cached resolution, or a fresh single-connection lookup).
+    return None
+
+
+async def _resolve_app_connection(
+    client: SuperposClient, owner: str | None = None
+) -> dict[str, Any] | None:
     """Find an active ``github_app`` connection and cache its id/name.
 
-    PAT (``auth_type=token``) connections are skipped here: the broker can't
-    mint from them, so the direct git/gh path falls through to the static
+    Used by ``setup`` (which has no repo owner yet) to decide whether the App
+    path is available at all and to prime the connection cache.  PAT
+    (``auth_type=token``) connections are skipped here: the broker can't mint
+    from them, so the direct git/gh path falls through to the static
     ``GITHUB_TOKEN`` rule.  They remain usable via the proxy (Path B).
 
     A ``GitHubDiscoveryForbidden`` (HTTP 401/403, typically missing
@@ -146,6 +299,14 @@ async def _resolve_app_connection(client: SuperposClient) -> dict[str, Any] | No
     return ``None`` and the caller falls through to the static
     ``GITHUB_TOKEN`` rule or the proxy.  Logged at debug level so the
     permission problem is not silently conflated with an empty catalog.
+
+    ``owner`` is the repo owner of an owner-specific credential request.  The
+    raw catalog has no ``target_login`` to match on, so when an owner is
+    supplied and discovery finds two or more App connections we cannot prove
+    which one owns the repo — raise :class:`_AmbiguousConnection` rather than
+    silently minting for ``app_conns[0]`` (the wrong installation).  With no
+    owner (setup's bootstrap) picking the first is fine: the per-repo helper
+    still resolves the owning connection for each git operation.
     """
     try:
         connections = await client.list_github_connections()
@@ -166,9 +327,21 @@ async def _resolve_app_connection(client: SuperposClient) -> dict[str, Any] | No
         return None
     conn = app_conns[0]
     if len(app_conns) > 1:
-        log.warning(
-            "Multiple github_app connections found; using %r. Set "
-            "SUPERPOS_GITHUB_CONNECTION_ID to pin a specific one.",
+        if owner is not None:
+            # Owner-specific request but the catalog can't tell us which
+            # installation owns the repo; guessing risks a wrong-org token.
+            log.error(
+                "Repo owner %r could not be resolved to a single GitHub "
+                "connection (persona unavailable) and catalog discovery found "
+                "%d github_app connections; set SUPERPOS_GITHUB_CONNECTION_ID "
+                "to disambiguate.",
+                owner,
+                len(app_conns),
+            )
+            raise _AmbiguousConnection(owner)
+        log.info(
+            "Multiple github_app connections found; the credential helper "
+            "resolves the owning one per repo. Caching %r for gh bootstrap.",
             conn.get("name"),
         )
     record = {"id": conn.get("id"), "name": conn.get("name")}
@@ -199,36 +372,92 @@ def _cache_matches(cached: dict[str, Any] | None, conn_id: str) -> bool:
     )
 
 
-async def _mint_token() -> str | None:
+async def _mint_for_connection(conn_id: str) -> str | None:
+    """Mint (and cache) a token for a specific connection id, no resolution.
+
+    Used by ``setup`` to give ``gh`` *a* working token when the agent holds
+    several connections and there is no override/default to pick one — the
+    per-repo git credential helper still resolves the owning connection.
+    """
+    if not conn_id:
+        return None
+    cache_path = _token_cache_path()
+    cached = _read_json(cache_path)
+    if _cache_matches(cached, conn_id):
+        return cached["token"]
+    client = SuperposClient(_config_from_env())
+    try:
+        result = await client.mint_github_token(conn_id)
+    finally:
+        await client.close()
+    token = result.get("token")
+    if not token:
+        return None
+    _write_json_private(
+        cache_path,
+        {
+            "token": token,
+            "expires_at": result.get("expires_at"),
+            "connection_id": conn_id,
+        },
+    )
+    return token
+
+
+async def _mint_token(owner: str | None = None) -> str | None:
     """Return a fresh installation token, minting via the broker if needed.
 
     The broker issues an installation-wide token (it does not honour per-repo
-    scoping), so a single cached token is reused for every repository — but
-    only while it belongs to the connection currently selected.  A token minted
-    for one ``github_app`` connection must never be reused after
-    ``SUPERPOS_GITHUB_CONNECTION_ID`` (or discovery) selects a different one.
+    scoping), so a single cached token is reused for every repository the
+    *selected connection* can reach — but only while it belongs to the
+    connection currently selected.  With two or more ``github_app`` connections
+    the selected connection depends on ``owner`` (the repo owner git is
+    authenticating): a token minted for org A must never be handed to a request
+    for a repo owned by org B.  The token cache is keyed by ``connection_id``,
+    so a different owner resolves to a different id → cache miss → correct
+    re-mint; there is no stale cross-org reuse.
+
+    ``owner`` is the repo owner parsed from git's ``path`` line; ``None`` when
+    git did not forward a path (older git / ``useHttpPath`` off), in which case
+    resolution falls back to override → default → single connection.
     """
     cache_path = _token_cache_path()
     cached = _read_json(cache_path)
 
-    # Resolve the target connection first; a cached token is only valid for the
-    # connection it was minted from.  ``_cached_connection_id`` reads an env
-    # override or setup's cached resolution, so this common path stays offline.
-    conn_id = _cached_connection_id()
-    if conn_id and _cache_matches(cached, conn_id):
-        return cached["token"]
+    # Fast offline path: an explicit override or setup's cached single-connection
+    # id, with a fresh cached token already minted for it.  Owner-aware
+    # resolution needs the persona block (a network call), so only take this
+    # shortcut when we can decide the connection without owner information —
+    # i.e. an explicit override.  With an owner present we must resolve properly.
+    if owner is None:
+        conn_id = _cached_connection_id()
+        if conn_id and _cache_matches(cached, conn_id):
+            return cached["token"]
+    elif os.environ.get("SUPERPOS_GITHUB_CONNECTION_ID"):
+        conn_id = os.environ["SUPERPOS_GITHUB_CONNECTION_ID"]
+        if _cache_matches(cached, conn_id):
+            return cached["token"]
+
+    # Owner-aware resolution (persona block → target_login).  Raises
+    # _AmbiguousConnection when it refuses to guess; the caller turns that into
+    # a clean credential-request failure rather than a wrong-org token.
+    conn_id = await _resolve_connection_id(owner)
 
     client = SuperposClient(_config_from_env())
     try:
         if not conn_id:
-            conn = await _resolve_app_connection(client)
+            # No persona/override signal — fall back to catalog discovery, which
+            # primes setup's single-connection cache for the offline hot path.
+            # Pass ``owner`` so discovery fails clear (rather than minting for
+            # ``app_conns[0]``) when the persona contract is missing/stale and
+            # the catalog holds two or more App connections.
+            conn = await _resolve_app_connection(client, owner)
             if not conn:
                 return None
             conn_id = conn["id"]
-            # Discovery may have produced the connection the cached token
-            # already belongs to — reuse it instead of minting again.
-            if _cache_matches(cached, conn_id):
-                return cached["token"]
+        # A cached token may already belong to the resolved connection.
+        if _cache_matches(cached, conn_id):
+            return cached["token"]
         result = await client.mint_github_token(conn_id)
     finally:
         await client.close()
@@ -275,9 +504,13 @@ def _gh_login_with_token(token: str) -> None:
 def _configure_app_credential_helper() -> None:
     """Point git at this module's credential helper for github.com only.
 
-    The broker mints installation-wide tokens, so the helper does not vary by
-    repository.  We replace (not append) any existing helper for the host to
-    avoid stacking a stale one from a previous boot.
+    A single GitHub App installation is often not the only connection an agent
+    holds: with two or more ``github_app`` connections the helper must know
+    *which repo* git is authenticating so it can mint from the connection that
+    owns it.  Git only forwards the repo path (``path=owner/repo.git``) to a
+    credential helper when ``useHttpPath`` is set, so we enable it here.  We
+    replace (not append) any existing helper for the host to avoid stacking a
+    stale one from a previous boot.
     """
     helper = f"!{sys.executable} -m superpos_agent_core.github_auth credential"
     key = f"credential.https://{_GITHUB_HOST}.helper"
@@ -287,15 +520,15 @@ def _configure_app_credential_helper() -> None:
         check=False,
     )
     _git_config("--add", key, helper)
-    # Tokens are installation-wide; drop any stale useHttpPath from a previous
-    # boot so git does not needlessly vary credential lookups by repo path.
+    # Forward the repo path to the helper so it can resolve the owning
+    # connection (owner-aware minting).  Clear-then-set keeps setup idempotent —
+    # re-running never stacks duplicate values.
+    path_key = f"credential.https://{_GITHUB_HOST}.useHttpPath"
     subprocess.run(
-        [
-            "git", "config", "--global", "--unset-all",
-            f"credential.https://{_GITHUB_HOST}.useHttpPath",
-        ],
+        ["git", "config", "--global", "--unset-all", path_key],
         check=False,
     )
+    _git_config(path_key, "true")
 
 
 def cmd_setup() -> int:
@@ -345,9 +578,18 @@ def cmd_setup() -> int:
 
     _configure_app_credential_helper()
 
-    # git now mints on demand via the helper, but gh won't — log it in with a
-    # freshly minted token so direct ``gh`` calls work right after setup.
-    token = asyncio.run(_mint_token())
+    # git now mints on demand via the helper (owner-aware, per repo), but gh
+    # won't — log it in with a freshly minted token so direct ``gh`` calls work
+    # right after setup.  gh has no repo context at setup time, so this uses the
+    # bootstrap connection resolved above; the credential helper still picks the
+    # owning connection for each git operation.
+    try:
+        token = asyncio.run(_mint_token())
+    except _AmbiguousConnection:
+        # ≥2 connections with no override/default: there is no single "gh"
+        # identity to pick at setup.  Mint from the bootstrap connection so gh
+        # has *a* working token; per-repo git auth is still owner-resolved.
+        token = asyncio.run(_mint_for_connection(str(conn.get("id"))))
     if token:
         _gh_login_with_token(token)
         log.info(
@@ -384,9 +626,17 @@ def cmd_credential(action: str) -> int:
     if attrs.get("host") != _GITHUB_HOST:
         return 0  # not ours — let git try other helpers
 
-    # The minted token is installation-wide, so any ``path`` git supplies is
-    # irrelevant — one token serves every repo.
-    token = asyncio.run(_mint_token())
+    # With ``useHttpPath=true`` git forwards ``path=owner/repo.git``; the owner
+    # selects which App connection to mint from when the agent holds several.
+    owner = _owner_from_path(attrs.get("path"))
+    try:
+        token = asyncio.run(_mint_token(owner))
+    except _AmbiguousConnection:
+        # We refuse to mint a wrong-org token.  Emit nothing and fail the
+        # request: git surfaces a clear auth error (the resolver already logged
+        # the owner and the available target_logins), which the agent can act
+        # on — far better than silently authenticating as the wrong org.
+        return 1
     if not token:
         return 0  # fall through to any other helper / fail naturally
 
@@ -398,12 +648,31 @@ def cmd_credential(action: str) -> int:
 
 
 def cmd_token() -> int:
-    """Print a fresh token (static or broker-minted) for ``gh`` invocations."""
+    """Print a fresh token (static or broker-minted) for ``gh`` invocations.
+
+    Unlike the git credential helper, ``gh`` does not hand us a repo path, so
+    owner-aware resolution is best-effort here: it honours the
+    ``SUPERPOS_GITHUB_CONNECTION_ID`` override and the single-connection default,
+    and accepts an optional ``SUPERPOS_GITHUB_REPO_OWNER`` hint (an owner login
+    a caller can export when it knows the repo).  When several connections exist
+    with no owner hint and no override, resolution fails clear rather than
+    minting for the wrong org.
+    """
     static = os.environ.get("GITHUB_TOKEN")
     if static:
         sys.stdout.write(static)
         return 0
-    token = asyncio.run(_mint_token())
+    owner = os.environ.get("SUPERPOS_GITHUB_REPO_OWNER") or None
+    try:
+        token = asyncio.run(_mint_token(owner))
+    except _AmbiguousConnection:
+        print(
+            "github_auth: multiple GitHub connections and no repo owner to "
+            "resolve by; set SUPERPOS_GITHUB_CONNECTION_ID (or "
+            "SUPERPOS_GITHUB_REPO_OWNER) to pin one.",
+            file=sys.stderr,
+        )
+        return 1
     if not token:
         print("github_auth: no GitHub credential available.", file=sys.stderr)
         return 1

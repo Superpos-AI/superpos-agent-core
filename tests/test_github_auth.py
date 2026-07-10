@@ -119,15 +119,16 @@ def _run_credential(monkeypatch, stdin_text):
 
 
 def test_credential_get_emits_token_for_github(monkeypatch):
-    calls = {"n": 0}
+    calls = {"n": 0, "owner": "unset"}
 
-    async def fake_mint():
+    async def fake_mint(owner=None):
         calls["n"] += 1
+        calls["owner"] = owner
         return "TKN123"
 
     monkeypatch.setattr(ga, "_mint_token", fake_mint)
-    # A repo path is supplied, but the helper must ignore it: the broker token
-    # is installation-wide, so minting takes no repo argument.
+    # The repo path is forwarded (useHttpPath=true); the helper parses the owner
+    # from it and passes it to minting for owner-aware resolution.
     rc, out = _run_credential(
         monkeypatch, "protocol=https\nhost=github.com\npath=acme/widgets.git\n\n"
     )
@@ -136,10 +137,11 @@ def test_credential_get_emits_token_for_github(monkeypatch):
     assert "username=x-access-token" in out
     assert "password=TKN123" in out
     assert calls["n"] == 1
+    assert calls["owner"] == "acme"
 
 
 def test_credential_get_ignores_other_hosts(monkeypatch):
-    async def fake_mint():  # pragma: no cover - must not be called
+    async def fake_mint(owner=None):  # pragma: no cover - must not be called
         raise AssertionError("should not mint for non-github host")
 
     monkeypatch.setattr(ga, "_mint_token", fake_mint)
@@ -294,3 +296,251 @@ async def test_resolve_app_connection_returns_none_on_forbidden(monkeypatch):
 
     result = await ga._resolve_app_connection(_ForbiddenClient())  # type: ignore[arg-type]
     assert result is None
+
+
+# ── owner parsing ───────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "path,expected",
+    [
+        ("acme/widgets.git", "acme"),
+        ("acme/widgets", "acme"),
+        ("/acme/widgets.git", "acme"),
+        ("Address-SO/Repo.git", "Address-SO"),
+        ("owner.git", "owner"),  # single segment, .git stripped
+        (None, None),
+        ("", None),
+    ],
+)
+def test_owner_from_path(path, expected):
+    assert ga._owner_from_path(path) == expected
+
+
+# ── owner-aware connection resolution ───────────────────────────────────
+
+
+def _persona_client(connections, default_id=None):
+    """A SuperposClient stand-in whose persona block carries the given
+    github connections + default_connection_id."""
+
+    class _Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def get_persona(self):
+            return {
+                "github": {
+                    "connections": connections,
+                    "default_connection_id": default_id,
+                }
+            }
+
+        async def close(self):
+            pass
+
+    return _Client
+
+
+_TWO_CONNS = [
+    {"service_connection_id": "conn-superpos", "target_login": "Superpos-AI"},
+    {"service_connection_id": "conn-address", "target_login": "address-so"},
+]
+
+
+def _std_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("SUPERPOS_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("SUPERPOS_BASE_URL", "https://hive.example")
+    monkeypatch.setenv("SUPERPOS_HIVE_ID", "hive-1")
+    monkeypatch.setenv("SUPERPOS_API_TOKEN", "api-tok")
+    monkeypatch.delenv("SUPERPOS_GITHUB_CONNECTION_ID", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+
+
+async def test_resolve_connection_id_matches_owner(tmp_path, monkeypatch):
+    _std_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(ga, "SuperposClient", _persona_client(_TWO_CONNS))
+    assert await ga._resolve_connection_id("address-so") == "conn-address"
+    assert await ga._resolve_connection_id("Superpos-AI") == "conn-superpos"
+
+
+async def test_resolve_connection_id_owner_match_case_insensitive(tmp_path, monkeypatch):
+    _std_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(ga, "SuperposClient", _persona_client(_TWO_CONNS))
+    # Owner casing differs from the persona target_login — must still match.
+    assert await ga._resolve_connection_id("ADDRESS-SO") == "conn-address"
+    assert await ga._resolve_connection_id("superpos-ai") == "conn-superpos"
+
+
+async def test_resolve_connection_id_override_wins_over_owner(tmp_path, monkeypatch):
+    _std_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("SUPERPOS_GITHUB_CONNECTION_ID", "conn-pinned")
+    monkeypatch.setattr(ga, "SuperposClient", _persona_client(_TWO_CONNS))
+    # Override short-circuits before any persona lookup, even with a valid owner.
+    assert await ga._resolve_connection_id("address-so") == "conn-pinned"
+
+
+async def test_resolve_connection_id_single_connection_default(tmp_path, monkeypatch):
+    _std_env(monkeypatch, tmp_path)
+    one = [{"service_connection_id": "conn-solo", "target_login": "solo-org"}]
+    monkeypatch.setattr(
+        ga, "SuperposClient", _persona_client(one, default_id="conn-solo")
+    )
+    # No owner → default_connection_id (single-connection agents, unchanged).
+    assert await ga._resolve_connection_id(None) == "conn-solo"
+    # Even an owner that doesn't match is fine with a single connection.
+    assert await ga._resolve_connection_id("whoever") == "conn-solo"
+
+
+async def test_resolve_connection_id_ambiguous_no_match_fails_clear(tmp_path, monkeypatch):
+    _std_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(ga, "SuperposClient", _persona_client(_TWO_CONNS))
+    # ≥2 connections, owner matches none, no override/default → refuse to guess.
+    with pytest.raises(ga._AmbiguousConnection):
+        await ga._resolve_connection_id("unrelated-org")
+
+
+async def test_resolve_connection_id_ambiguous_no_owner_fails_clear(tmp_path, monkeypatch):
+    _std_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(ga, "SuperposClient", _persona_client(_TWO_CONNS))
+    # ≥2 connections, no owner, no override/default → refuse to guess.
+    with pytest.raises(ga._AmbiguousConnection):
+        await ga._resolve_connection_id(None)
+
+
+# ── credential get end-to-end: mints for the OWNING connection ──────────
+
+
+class _OwnerAwareMintClient:
+    """Records every mint_github_token call so tests can assert the RIGHT
+    connection id was minted per owner."""
+
+    minted: list[str] = []
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def get_persona(self):
+        return {
+            "github": {
+                "connections": _TWO_CONNS,
+                "default_connection_id": None,
+            }
+        }
+
+    async def mint_github_token(self, conn_id):
+        type(self).minted.append(conn_id)
+        return {"token": f"tok_{conn_id}", "expires_at": _iso(3600)}
+
+    async def close(self):
+        pass
+
+
+async def test_mint_token_owner_resolves_and_mints_correct_connection(tmp_path, monkeypatch):
+    _std_env(monkeypatch, tmp_path)
+    _OwnerAwareMintClient.minted = []
+    monkeypatch.setattr(ga, "SuperposClient", _OwnerAwareMintClient)
+
+    tok = await ga._mint_token("address-so")
+    assert tok == "tok_conn-address"
+    assert _OwnerAwareMintClient.minted == ["conn-address"]
+
+
+async def test_mint_token_cache_distinct_per_owner(tmp_path, monkeypatch):
+    _std_env(monkeypatch, tmp_path)
+    _OwnerAwareMintClient.minted = []
+    monkeypatch.setattr(ga, "SuperposClient", _OwnerAwareMintClient)
+
+    # Two sequential requests for different owners must mint two DIFFERENT
+    # connection ids — no stale cross-org token reuse.
+    tok_a = await ga._mint_token("Superpos-AI")
+    tok_b = await ga._mint_token("address-so")
+    assert tok_a == "tok_conn-superpos"
+    assert tok_b == "tok_conn-address"
+    assert _OwnerAwareMintClient.minted == ["conn-superpos", "conn-address"]
+    # A repeat request for the first owner reuses the cache (no re-mint) only if
+    # its token is still cached under that connection id.
+    cached = json.loads(ga._token_cache_path().read_text())
+    assert cached["connection_id"] == "conn-address"
+
+
+def test_credential_get_fails_clear_on_ambiguous(monkeypatch, tmp_path):
+    _std_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(ga, "SuperposClient", _persona_client(_TWO_CONNS))
+    # Owner matches none of two connections → credential request fails (rc=1)
+    # and emits no credential rather than minting for the wrong org.
+    rc, out = _run_credential(
+        monkeypatch, "protocol=https\nhost=github.com\npath=nobody/repo.git\n\n"
+    )
+    assert rc == 1
+    assert out == ""
+
+
+# ── persona unavailable: owner request must NOT fall back to catalog[0] ──
+
+
+class _NoPersonaTwoAppCatalogClient:
+    """Persona is unavailable (``get_persona`` → None) but the raw catalog
+    holds two ``github_app`` connections.  Records every mint so a test can
+    assert the WRONG-org connection is never minted."""
+
+    minted: list[str] = []
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def get_persona(self):
+        return None
+
+    async def list_github_connections(self):
+        return [
+            {"id": "conn-a", "metadata": {"auth_type": "github_app"}},
+            {"id": "conn-b", "metadata": {"auth_type": "github_app"}},
+        ]
+
+    async def mint_github_token(self, conn_id):
+        type(self).minted.append(conn_id)
+        return {"token": f"tok_{conn_id}", "expires_at": _iso(3600)}
+
+    async def close(self):
+        pass
+
+
+async def test_mint_token_owner_fails_clear_when_persona_unavailable(
+    tmp_path, monkeypatch
+):
+    _std_env(monkeypatch, tmp_path)
+    _NoPersonaTwoAppCatalogClient.minted = []
+    monkeypatch.setattr(ga, "SuperposClient", _NoPersonaTwoAppCatalogClient)
+
+    # Persona resolution yields no connection id, so _mint_token falls back to
+    # catalog discovery.  With an owner and two App connections the catalog
+    # cannot prove which installation owns the repo → refuse to guess rather
+    # than minting for the first (wrong) connection.
+    with pytest.raises(ga._AmbiguousConnection):
+        await ga._mint_token("org-b")
+    assert _NoPersonaTwoAppCatalogClient.minted == []
+
+
+# ── setup enables useHttpPath ───────────────────────────────────────────
+
+
+def test_configure_helper_sets_use_http_path(monkeypatch):
+    calls = []
+
+    def fake_run(cmd, *args, **kwargs):
+        calls.append(cmd)
+
+        class _R:
+            returncode = 0
+
+        return _R()
+
+    monkeypatch.setattr(ga.subprocess, "run", fake_run)
+    ga._configure_app_credential_helper()
+
+    joined = [" ".join(c) for c in calls]
+    # useHttpPath is set to true so git forwards the repo path to the helper.
+    assert any(
+        "credential.https://github.com.useHttpPath true" in j for j in joined
+    ), joined

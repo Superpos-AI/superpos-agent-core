@@ -305,6 +305,38 @@ class SuperposClient:
             log.warning("Failed to fetch persona; proceeding without it", exc_info=True)
             return None
 
+    async def get_persona(self) -> dict[str, Any] | None:
+        """Fetch the structured persona document (``GET /api/v1/persona``).
+
+        Unlike :meth:`get_persona_assembled` (which returns the flattened
+        system-prompt string), this returns the structured ``data`` object.  Of
+        interest to the GitHub credential path is ``data.github`` — the block
+        the superpos-app ``GitHubVersionService`` renders — which carries:
+
+          * ``connections[]`` — one per GitHub service connection, each with
+            ``service_connection_id``, ``name``, ``target_login`` (the org/user
+            the App is installed on) and ``target_type``.
+          * ``default_connection_id`` — the single-connection default, or
+            ``null`` when there are two or more connections.
+
+        Requires only the free ``services.read`` scope the persona render
+        already relies on; returns ``None`` on any error so callers can fall
+        back to catalog discovery or the static ``GITHUB_TOKEN`` path.
+        """
+        try:
+            resp = await self._request("GET", "/api/v1/persona")
+            data = resp.json()
+            return data.get("data", data) if isinstance(data, dict) else None
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                log.debug("Persona endpoint not available (404)")
+            else:
+                log.warning("Failed to fetch structured persona", exc_info=True)
+            return None
+        except Exception:
+            log.warning("Failed to fetch structured persona", exc_info=True)
+            return None
+
     async def get_persona_version(
         self,
         known_version: int | None = None,
