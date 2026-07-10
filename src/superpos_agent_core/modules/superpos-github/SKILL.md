@@ -71,6 +71,38 @@ By default the first active GitHub connection is used. Override with
 `--service <name>` or the `SUPERPOS_GITHUB_SERVICE` env var when the hive has
 more than one.
 
+## Multiple connections and `gh` (401 on the wrong org)
+
+On agents backed by a **GitHub App connection** with **two or more** GitHub
+connections, raw `gh` is a trap. At container start `gh` is logged in **once**
+to a single boot token (from the first/bootstrap connection). `gh` does **not**
+consult git's credential helper, so it keeps using that one token for every
+call — and it **401s** on repos owned by a *different* connection.
+
+For PR review/comment work on such agents, do **one** of:
+
+- **(a) Route through the proxy (always correct).** `superpos-github api ...`
+  resolves the right connection server-side, so it never hits the 401:
+
+  ```bash
+  superpos-github api POST /repos/other-org/repo/issues/7/comments --body '{"body":"…"}'
+  ```
+
+- **(b) Mint the owning connection's token for the `gh` call.** `github_auth
+  token` is owner-aware — pass the repo owner (or its remote URL) so it mints
+  the *right* connection's token:
+
+  ```bash
+  GH_TOKEN="$(python3 -m superpos_agent_core.github_auth token --owner other-org)" \
+    gh pr review 42 --repo other-org/repo --approve
+  # or derive the owner from the checkout:
+  GH_TOKEN="$(python3 -m superpos_agent_core.github_auth token \
+    --repo "$(git config --get remote.origin.url)")" gh pr create ...
+  ```
+
+Direct `git` (clone/push) is already owner-aware via the credential helper and
+needs none of this. Single-connection agents are unaffected either way.
+
 ## Limits
 
 - The proxy forwards to whatever the connection is permitted to do; a `403`

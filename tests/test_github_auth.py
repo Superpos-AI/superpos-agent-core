@@ -289,6 +289,10 @@ async def test_resolve_app_connection_returns_none_on_forbidden(monkeypatch):
                 "GitHub service connections",
             )
 
+        async def get_persona(self):
+            # No persona github block available → nothing to fall back to.
+            return None
+
         async def close(self):
             pass
 
@@ -296,6 +300,101 @@ async def test_resolve_app_connection_returns_none_on_forbidden(monkeypatch):
 
     result = await ga._resolve_app_connection(_ForbiddenClient())  # type: ignore[arg-type]
     assert result is None
+
+
+async def test_resolve_app_connection_falls_back_to_persona_on_forbidden(monkeypatch):
+    # When the services.read catalog 403s, fall back to the persona github
+    # block, which is scoped by services:{id} instead.
+    class _PersonaFallbackClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def list_github_connections(self):
+            raise GitHubDiscoveryForbidden(403, "no services.read")
+
+        async def get_persona(self):
+            return {"github": {
+                "default_connection_id": "app-uuid",
+                "connections": [
+                    {"service_connection_id": "app-uuid", "name": "gh-app",
+                     "broker_compatible": True},
+                    {"service_connection_id": "pat-uuid", "name": "gh-pat",
+                     "broker_compatible": False},
+                ],
+            }}
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(ga, "_write_json_private", lambda *a, **k: None)
+
+    result = await ga._resolve_app_connection(_PersonaFallbackClient())  # type: ignore[arg-type]
+    assert result == {"id": "app-uuid", "name": "gh-app"}
+
+
+async def test_resolve_app_connection_persona_skips_pat_only(monkeypatch):
+    # A persona block with only PAT (non-broker-compatible) connections yields
+    # nothing — the broker can't mint from those, so we fall through to
+    # GITHUB_TOKEN.
+    class _PatOnlyClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def list_github_connections(self):
+            raise GitHubDiscoveryForbidden(403, "no services.read")
+
+        async def get_persona(self):
+            return {"github": {
+                "default_connection_id": None,
+                "connections": [
+                    {"service_connection_id": "pat-uuid", "name": "gh-pat",
+                     "broker_compatible": False},
+                ],
+            }}
+
+        async def close(self):
+            pass
+
+    result = await ga._resolve_app_connection(_PatOnlyClient())  # type: ignore[arg-type]
+    assert result is None
+
+
+async def test_resolve_app_connection_persona_owner_aware_on_forbidden(monkeypatch):
+    # Catalog 403s and the persona block holds two broker-compatible
+    # connections; the owner selects the right one (owner-aware fallback).
+    class _TwoBrokerClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def list_github_connections(self):
+            raise GitHubDiscoveryForbidden(403, "no services.read")
+
+        async def get_persona(self):
+            return {"github": {
+                "default_connection_id": None,
+                "connections": [
+                    {"service_connection_id": "conn-a", "name": "gh-a",
+                     "broker_compatible": True, "target_login": "org-a"},
+                    {"service_connection_id": "conn-b", "name": "gh-b",
+                     "broker_compatible": True, "target_login": "org-b"},
+                ],
+            }}
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(ga, "_write_json_private", lambda *a, **k: None)
+
+    result = await ga._resolve_app_connection(
+        _TwoBrokerClient(), owner="org-b"  # type: ignore[arg-type]
+    )
+    assert result == {"id": "conn-b", "name": "gh-b"}
+
+    # An owner matching none of two connections fails clear (no wrong-org mint).
+    with pytest.raises(ga._AmbiguousConnection):
+        await ga._resolve_app_connection(
+            _TwoBrokerClient(), owner="nobody"  # type: ignore[arg-type]
+        )
 
 
 # ── owner parsing ───────────────────────────────────────────────────────
@@ -544,3 +643,139 @@ def test_configure_helper_sets_use_http_path(monkeypatch):
     assert any(
         "credential.https://github.com.useHttpPath true" in j for j in joined
     ), joined
+
+
+# ── gh owner-aware token: --owner / --repo ──────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "repo,expected",
+    [
+        ("git@github.com:acme/widgets.git", "acme"),
+        ("https://github.com/acme/widgets.git", "acme"),
+        ("https://github.com/acme/widgets", "acme"),
+        ("ssh://git@github.com/acme/widgets", "acme"),
+        ("acme/widgets", "acme"),
+        ("acme/widgets.git", "acme"),
+        (None, None),
+        ("", None),
+    ],
+)
+def test_owner_from_repo_arg(repo, expected):
+    assert ga._owner_from_repo_arg(repo) == expected
+
+
+def test_cmd_token_static_ignores_owner(monkeypatch, capsys):
+    # A static GITHUB_TOKEN always wins and ignores owner resolution entirely.
+    monkeypatch.setenv("GITHUB_TOKEN", "STATIC")
+
+    async def fake_mint(owner=None):  # pragma: no cover - must not be called
+        raise AssertionError("should not mint when GITHUB_TOKEN is set")
+
+    monkeypatch.setattr(ga, "_mint_token", fake_mint)
+    rc = ga.cmd_token(owner="acme")
+    assert rc == 0
+    assert capsys.readouterr().out == "STATIC"
+
+
+def test_cmd_token_owner_flows_to_mint(monkeypatch, capsys):
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("SUPERPOS_GITHUB_REPO_OWNER", raising=False)
+    seen = {}
+
+    async def fake_mint(owner=None):
+        seen["owner"] = owner
+        return f"tok-for-{owner}"
+
+    monkeypatch.setattr(ga, "_mint_token", fake_mint)
+    rc = ga.cmd_token(owner="address-so")
+    assert rc == 0
+    assert seen["owner"] == "address-so"
+    assert capsys.readouterr().out == "tok-for-address-so"
+
+
+def test_cmd_token_repo_url_owner_flows_to_mint(monkeypatch, capsys):
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("SUPERPOS_GITHUB_REPO_OWNER", raising=False)
+    seen = {}
+
+    async def fake_mint(owner=None):
+        seen["owner"] = owner
+        return "tok"
+
+    monkeypatch.setattr(ga, "_mint_token", fake_mint)
+    # A git remote URL is accepted and the owner parsed out.
+    rc = ga.cmd_token(repo="git@github.com:Superpos-AI/x.git")
+    assert rc == 0
+    assert seen["owner"] == "Superpos-AI"
+
+
+def test_cmd_token_owner_beats_repo_and_env(monkeypatch):
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.setenv("SUPERPOS_GITHUB_REPO_OWNER", "env-org")
+    seen = {}
+
+    async def fake_mint(owner=None):
+        seen["owner"] = owner
+        return "tok"
+
+    monkeypatch.setattr(ga, "_mint_token", fake_mint)
+    # Explicit --owner wins over --repo and over the env hint.
+    ga.cmd_token(owner="explicit-org", repo="git@github.com:repo-org/x.git")
+    assert seen["owner"] == "explicit-org"
+
+
+def test_cmd_token_repo_beats_env(monkeypatch):
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.setenv("SUPERPOS_GITHUB_REPO_OWNER", "env-org")
+    seen = {}
+
+    async def fake_mint(owner=None):
+        seen["owner"] = owner
+        return "tok"
+
+    monkeypatch.setattr(ga, "_mint_token", fake_mint)
+    # --repo (parsed owner) wins over the env hint when --owner is absent.
+    ga.cmd_token(repo="repo-org/x")
+    assert seen["owner"] == "repo-org"
+
+
+def test_cmd_token_ambiguous_fails_clear(monkeypatch, capsys):
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+
+    async def fake_mint(owner=None):
+        raise ga._AmbiguousConnection(owner)
+
+    monkeypatch.setattr(ga, "_mint_token", fake_mint)
+    rc = ga.cmd_token(owner="nobody")
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "--owner/--repo" in err
+
+
+def test_main_token_parses_owner_and_repo(monkeypatch):
+    seen = {}
+
+    def fake_cmd_token(owner=None, repo=None):
+        seen["owner"] = owner
+        seen["repo"] = repo
+        return 0
+
+    monkeypatch.setattr(ga, "cmd_token", fake_cmd_token)
+    rc = ga.main(["token", "--owner", "acme", "--repo", "acme/widgets"])
+    assert rc == 0
+    assert seen == {"owner": "acme", "repo": "acme/widgets"}
+
+
+def test_main_token_no_args_still_works(monkeypatch):
+    seen = {}
+
+    def fake_cmd_token(owner=None, repo=None):
+        seen["owner"] = owner
+        seen["repo"] = repo
+        return 0
+
+    monkeypatch.setattr(ga, "cmd_token", fake_cmd_token)
+    rc = ga.main(["token"])
+    assert rc == 0
+    assert seen == {"owner": None, "repo": None}

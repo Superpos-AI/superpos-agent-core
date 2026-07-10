@@ -87,11 +87,27 @@ matches all of `service_connection_id`, `event_type`, and (optionally)
 every entry in `field_filters`. The service connection is the
 org-level integration the webhook arrived on (GitHub, Slack, etc.);
 `event_type` is the normalised event (e.g. `"pull_request"`,
-`"push"`). `field_filters` is an **array of `{field, operator, value}`
-objects** evaluated by `FieldFilterEvaluator` — supports `eq`,
-`contains`, `in`, `exists`, `regex`, `gt`/`lt`, and wildcard paths.
-All filters must pass (AND). Empty/missing `field_filters` matches any
-payload for the event.
+`"push"`).
+
+`field_filters` is an **array of `{field, operator, value}` objects**
+evaluated by `FieldFilterEvaluator`. All filters must pass (AND).
+Empty/missing `field_filters` matches any payload for the event. The
+full operator set (`FieldFilterEvaluator::OPERATORS`) is **15**:
+
+| Operator | Meaning |
+| --- | --- |
+| `eq` / `neq` | equals / **not** equals |
+| `contains` / `not_contains` | substring present / **absent** |
+| `starts_with` / `ends_with` | prefix / suffix match |
+| `regex` | regex match |
+| `in` / `not_in` | value in / **not in** a list (`value` is an array) |
+| `exists` / `not_exists` | field present / **absent** |
+| `gt` / `lt` / `gte` / `lte` | numeric comparisons |
+
+Negation is fully supported — there is a `neq`, a `not_in`, a
+`not_contains`, and a `not_exists`. Do **not** work around a
+"missing not-equal" by inverting logic elsewhere; use `neq`. `field`
+paths are dotted and support wildcards.
 
 ```json
 {
@@ -100,7 +116,7 @@ payload for the event.
   "event_type": "pull_request",
   "field_filters": [
     { "field": "pull_request.base.ref", "operator": "eq", "value": "main" },
-    { "field": "action", "operator": "eq", "value": "opened" }
+    { "field": "action", "operator": "neq", "value": "closed" }
   ]
 }
 ```
@@ -109,6 +125,69 @@ The full parsed webhook payload is available to steps under
 `{{trigger.payload}}`. Note: `webhook_route_id` is **not** part of
 the top-level trigger config — that field belongs only to
 `webhook_wait` *steps* (see below).
+
+### Getting the `service_connection_id`
+
+The `service_connection_id` above is the UUID of the org-level GitHub
+(or Slack, etc.) connection the webhook arrives on. Resolve it from
+your **persona `github` block** — you do **not** need the
+`services.read` permission:
+
+```bash
+# Prints {"service_connection_id": "...", "name": "..."}
+superpos-github default-connection
+```
+
+The backend attaches a `github` block to `GET /api/v1/persona` (surfaced
+by the SDK as `SuperposClient.get_persona()` /
+`resolve_github_connection_id()`). It lists every connection you're
+permitted to use and sets `default_connection_id` when exactly one
+broker-compatible GitHub connection is permitted — that's the id
+`default-connection` returns. This block is scoped by the per-connection
+`services:{id}` / `services:*` permission, **not** `services.read`, so
+it works even when `superpos-github connections` 403s (that command now
+falls back to the same persona block).
+
+Only ask a human for the UUID when there are **multiple** permitted
+connections and **none** is the default (ambiguous) — inspect the block
+(`superpos-github connections`) and pick the right `service_connection_id`.
+
+### One webhook trigger = one `event_type`
+
+A workflow webhook trigger matches a **single** `event_type` (strict
+equality). It is **not** multi-event. So a GitHub PR/issue comment
+(`issue_comment`) and a PR *inline review* comment
+(`pull_request_review_comment`) are two distinct events and need **two
+separate workflows** with identical `steps` — one per `event_type`.
+(Contrast: the legacy webhook-route dashboard supports multi-event
+routes; workflow triggers do not.)
+
+### Loop prevention (skip bot/agent authors)
+
+There is **no** built-in bot-skip. Webhooks fired by your own comments
+(and other bots/apps) will re-trigger the workflow, so filter them out
+in `field_filters`. The canonical recipe drops non-human authors:
+
+```json
+{ "field": "comment.user.type", "operator": "neq", "value": "Bot" }
+```
+
+(Equivalently `{"operator": "eq", "value": "User"}`.) GitHub sets
+`comment.user.type` to `"Bot"` for App/bot accounts, so this also drops
+the agent's **own** comments — which is exactly what prevents the loop.
+Add an analogous filter to every comment-driven workflow.
+
+### Reviewing/commenting on a PR (avoid the `gh` 401)
+
+When the workflow step reviews or comments on a PR, prefer the
+`superpos-github api` **proxy** — it resolves the right connection
+server-side. On App-connection agents with **two or more** GitHub
+connections, raw `gh` uses a single boot token and will **401** on repos
+owned by a *different* connection (it can't use git's credential helper).
+If you must use `gh`, mint the owning connection's token first:
+`GH_TOKEN="$(python3 -m superpos_agent_core.github_auth token --owner <repo-owner>)"`
+(or `--repo "$(git config --get remote.origin.url)"`). See the
+`superpos-github` skill for details.
 
 ## Step types
 

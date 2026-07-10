@@ -10,6 +10,7 @@ methods mocked — no network. Mirrors ``test_issues_module_script.py``.
 from __future__ import annotations
 
 import importlib.util
+import json
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -197,3 +198,107 @@ async def test_pr_create_no_tag_when_env_unset(monkeypatch):
     sent_body = mock_service_request.await_args.kwargs["json"]
     assert sent_body["title"] == "fix: x"
     assert sent_body["body"] == "Body"
+
+
+# ── default-connection subcommand ───────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_default_connection_prints_resolved_id(monkeypatch, capsys):
+    mod = _load_script()
+    _set_env(monkeypatch)
+
+    persona = {"github": {
+        "default_connection_id": "conn-uuid",
+        "connections": [
+            {"service_connection_id": "conn-uuid", "name": "gh-bot"},
+        ],
+    }}
+
+    with patch.object(mod.SuperposClient, "resolve_github_connection_id",
+                      AsyncMock(return_value="conn-uuid")), \
+         patch.object(mod.SuperposClient, "get_persona",
+                      AsyncMock(return_value=persona)), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        args = mod._build_parser().parse_args(["default-connection"])
+        rc = await mod._run(args)
+
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out == {"service_connection_id": "conn-uuid", "name": "gh-bot"}
+
+
+@pytest.mark.asyncio
+async def test_default_connection_errors_when_ambiguous(monkeypatch, capsys):
+    mod = _load_script()
+    _set_env(monkeypatch)
+
+    persona = {"github": {
+        "default_connection_id": None,
+        "connections": [
+            {"service_connection_id": "a", "name": "a"},
+            {"service_connection_id": "b", "name": "b"},
+        ],
+    }}
+
+    with patch.object(mod.SuperposClient, "resolve_github_connection_id",
+                      AsyncMock(return_value=None)), \
+         patch.object(mod.SuperposClient, "get_persona",
+                      AsyncMock(return_value=persona)), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        args = mod._build_parser().parse_args(["default-connection"])
+        rc = await mod._run(args)
+
+    assert rc == 4
+    err = capsys.readouterr().err
+    assert "multiple" in err.lower()
+
+
+# ── connections 403 → persona fallback ──────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_connections_falls_back_to_persona_on_403(monkeypatch, capsys):
+    mod = _load_script()
+    _set_env(monkeypatch)
+
+    forbidden = mod.GitHubDiscoveryForbidden(403, "no services.read")
+    persona = {"github": {
+        "default_connection_id": "c1",
+        "connections": [
+            {"service_connection_id": "c1", "name": "gh-bot", "auth_type": "github_app"},
+        ],
+    }}
+
+    with patch.object(mod.SuperposClient, "list_github_connections",
+                      AsyncMock(side_effect=forbidden)), \
+         patch.object(mod.SuperposClient, "get_persona",
+                      AsyncMock(return_value=persona)), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        args = mod._build_parser().parse_args(["connections"])
+        rc = await mod._run(args)
+
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out[0]["service_connection_id"] == "c1"
+
+
+@pytest.mark.asyncio
+async def test_connections_403_and_empty_persona_errors(monkeypatch, capsys):
+    mod = _load_script()
+    _set_env(monkeypatch)
+
+    forbidden = mod.GitHubDiscoveryForbidden(403, "no services.read")
+
+    with patch.object(mod.SuperposClient, "list_github_connections",
+                      AsyncMock(side_effect=forbidden)), \
+         patch.object(mod.SuperposClient, "get_persona",
+                      AsyncMock(return_value=None)), \
+         patch.object(mod.SuperposClient, "close", AsyncMock()):
+        args = mod._build_parser().parse_args(["connections"])
+        rc = await mod._run(args)
+
+    assert rc == 4
+    err = capsys.readouterr().err
+    # Should NOT primarily tell the user to grant services.read.
+    assert "services:{id}" in err or "services:*" in err

@@ -172,3 +172,100 @@ async def test_mint_github_token_posts_and_unwraps():
     assert body == {"service_connection_id": "c1"}
     assert result["token"] == "ghs_minted"
     await client.close()
+
+
+# ── get_persona ────────────────────────────────────────────────────────
+
+
+async def test_get_persona_hits_persona_endpoint_and_unwraps():
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(
+            200,
+            json={"data": {"name": "p", "github": {"default_connection_id": "d1"}}},
+        )
+
+    client = _make_client(handler)
+    result = await client.get_persona()
+
+    req = captured[0]
+    assert req.method == "GET"
+    assert req.url.path == "/api/v1/persona"
+    assert result["github"]["default_connection_id"] == "d1"
+    await client.close()
+
+
+async def test_get_persona_returns_none_on_404():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"errors": [{"message": "no persona"}]})
+
+    client = _make_client(handler)
+    assert await client.get_persona() is None
+    await client.close()
+
+
+# ── resolve_github_connection_id ───────────────────────────────────────
+
+
+async def test_resolve_github_connection_id_prefers_default():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"data": {"github": {
+                "default_connection_id": "default-uuid",
+                "connections": [
+                    {"service_connection_id": "default-uuid", "name": "a"},
+                    {"service_connection_id": "other-uuid", "name": "b"},
+                ],
+            }}},
+        )
+
+    client = _make_client(handler)
+    assert await client.resolve_github_connection_id() == "default-uuid"
+    await client.close()
+
+
+async def test_resolve_github_connection_id_single_connection_no_default():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"data": {"github": {
+                "default_connection_id": None,
+                "connections": [
+                    {"service_connection_id": "only-uuid", "name": "a"},
+                ],
+            }}},
+        )
+
+    client = _make_client(handler)
+    assert await client.resolve_github_connection_id() == "only-uuid"
+    await client.close()
+
+
+async def test_resolve_github_connection_id_ambiguous_returns_none():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"data": {"github": {
+                "default_connection_id": None,
+                "connections": [
+                    {"service_connection_id": "a-uuid", "name": "a"},
+                    {"service_connection_id": "b-uuid", "name": "b"},
+                ],
+            }}},
+        )
+
+    client = _make_client(handler)
+    assert await client.resolve_github_connection_id() is None
+    await client.close()
+
+
+async def test_resolve_github_connection_id_no_github_block_returns_none():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": {"name": "p"}})
+
+    client = _make_client(handler)
+    assert await client.resolve_github_connection_id() is None
+    await client.close()

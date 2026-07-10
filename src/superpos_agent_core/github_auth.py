@@ -151,6 +151,36 @@ def _owner_from_path(path: str | None) -> str | None:
     return first or None
 
 
+def _owner_from_repo_arg(repo: str | None) -> str | None:
+    """Extract the repo *owner* from an ``owner/repo`` slug or a git remote URL.
+
+    Accepts what ``git config --get remote.origin.url`` prints as well as a bare
+    ``owner/repo``:
+
+      * ``git@github.com:acme/widgets.git`` → ``acme``
+      * ``https://github.com/acme/widgets.git`` → ``acme``
+      * ``ssh://git@github.com/acme/widgets`` → ``acme``
+      * ``acme/widgets`` → ``acme``
+
+    Returns ``None`` when no owner can be parsed, so callers fall back to the
+    non-owner-aware precedence.
+    """
+    if not repo:
+        return None
+    val = repo.strip()
+    if not val:
+        return None
+    # scp-style ``git@host:owner/repo`` — the owner follows the ``:``.
+    if "@" in val and ":" in val and "://" not in val:
+        val = val.rsplit(":", 1)[-1]
+    # URL form ``scheme://host/owner/repo`` — drop scheme + host, keep the path.
+    elif "://" in val:
+        after_scheme = val.split("://", 1)[1]
+        val = after_scheme.split("/", 1)[1] if "/" in after_scheme else ""
+    # Now ``val`` looks like ``owner/repo[.git]`` (or just ``owner``).
+    return _owner_from_path(val)
+
+
 async def _connections_from_persona(
     client: SuperposClient,
 ) -> tuple[list[dict[str, Any]], str | None]:
@@ -311,8 +341,20 @@ async def _resolve_app_connection(
     try:
         connections = await client.list_github_connections()
     except GitHubDiscoveryForbidden as exc:
+        # The ``services.read``-gated catalog is denied.  Before giving up, fall
+        # back to the persona ``github`` block, which is scoped by the
+        # per-connection ``services:{id}`` permission and lists
+        # broker-compatible connections directly — so the broker path still
+        # works without ``services.read``.  When an ``owner`` is supplied the
+        # fallback stays owner-aware (it may raise :class:`_AmbiguousConnection`
+        # rather than mint for the wrong installation).
+        record = await _resolve_app_connection_from_persona(client, owner)
+        if record:
+            _write_json_private(_connection_cache_path(), record)
+            return record
         log.debug(
-            "GitHub discovery denied (HTTP %d); falling back to static "
+            "GitHub discovery denied (HTTP %d) and the persona github block "
+            "yielded no broker-compatible connection; falling back to static "
             "GITHUB_TOKEN: %s",
             exc.status_code,
             exc,
@@ -347,6 +389,84 @@ async def _resolve_app_connection(
     record = {"id": conn.get("id"), "name": conn.get("name")}
     _write_json_private(_connection_cache_path(), record)
     return record
+
+
+async def _resolve_app_connection_from_persona(
+    client: SuperposClient, owner: str | None = None
+) -> dict[str, Any] | None:
+    """Resolve a broker-compatible connection from the persona ``github`` block.
+
+    Used as the fallback when the ``services.read`` catalog is denied.  The
+    block is scoped by the per-connection ``services:{id}`` permission, so it
+    surfaces connections the agent may use even without catalog read.  Only
+    broker-compatible (``github_app``) connections can mint installation
+    tokens, so PAT-backed ones are skipped here.
+
+    When ``owner`` is supplied and there is more than one broker-compatible
+    connection, the owner is matched against ``target_login`` first (the
+    owner-aware path).  A supplied owner that matches none of two-or-more
+    connections raises :class:`_AmbiguousConnection` rather than guessing.
+
+    Otherwise it prefers ``default_connection_id`` when set (the backend only
+    sets it when exactly one broker-compatible connection is permitted);
+    failing that, the single broker-compatible connection when there's exactly
+    one.  Returns ``{"id", "name"}`` or ``None``.
+    """
+    persona = await client.get_persona()
+    if not persona:
+        return None
+    block = persona.get("github")
+    if not isinstance(block, dict):
+        return None
+    conns = block.get("connections")
+    if not isinstance(conns, list):
+        return None
+    broker = [c for c in conns if c.get("broker_compatible")]
+    if not broker:
+        return None
+
+    def _record(conn: dict[str, Any]) -> dict[str, Any]:
+        return {"id": conn.get("service_connection_id"), "name": conn.get("name")}
+
+    if owner:
+        matches = _match_owner(broker, owner)
+        if len(matches) == 1:
+            return _record(matches[0])
+        if len(matches) > 1:
+            logins = sorted(c.get("target_login", "?") for c in broker)
+            log.error(
+                "Repo owner %r matches multiple GitHub connections %r; set "
+                "SUPERPOS_GITHUB_CONNECTION_ID to disambiguate.",
+                owner, logins,
+            )
+            raise _AmbiguousConnection(owner)
+        if len(broker) == 1:
+            return _record(broker[0])
+        logins = sorted(c.get("target_login", "?") for c in broker)
+        log.error(
+            "No GitHub connection owns repo owner %r (available "
+            "target_login: %r); set SUPERPOS_GITHUB_CONNECTION_ID to pin one.",
+            owner, logins,
+        )
+        raise _AmbiguousConnection(owner)
+
+    default_id = block.get("default_connection_id")
+    chosen = None
+    if default_id:
+        chosen = next(
+            (c for c in broker if c.get("service_connection_id") == default_id),
+            None,
+        )
+    if chosen is None and len(broker) == 1:
+        chosen = broker[0]
+    if chosen is None:
+        log.warning(
+            "Multiple broker-compatible GitHub connections in the persona "
+            "block and no default; set SUPERPOS_GITHUB_CONNECTION_ID to pin "
+            "one.",
+        )
+        return None
+    return _record(chosen)
 
 
 def _cached_connection_id() -> str | None:
@@ -647,29 +767,44 @@ def cmd_credential(action: str) -> int:
     return 0
 
 
-def cmd_token() -> int:
+def cmd_token(owner: str | None = None, repo: str | None = None) -> int:
     """Print a fresh token (static or broker-minted) for ``gh`` invocations.
 
     Unlike the git credential helper, ``gh`` does not hand us a repo path, so
-    owner-aware resolution is best-effort here: it honours the
-    ``SUPERPOS_GITHUB_CONNECTION_ID`` override and the single-connection default,
-    and accepts an optional ``SUPERPOS_GITHUB_REPO_OWNER`` hint (an owner login
-    a caller can export when it knows the repo).  When several connections exist
-    with no owner hint and no override, resolution fails clear rather than
-    minting for the wrong org.
+    the caller must tell us which repo it is acting on for owner-aware
+    resolution.  This is how ``gh`` (which uses a single static boot token and
+    cannot consult git's credential helper) gets the *right* connection's token
+    per operation on multi-connection agents.
+
+    Owner precedence (highest wins):
+
+      1. ``SUPERPOS_GITHUB_CONNECTION_ID`` env override (inside ``_mint_token``).
+      2. ``--owner`` explicit argument.
+      3. ``--repo`` argument (an ``owner/repo`` slug or a git remote URL — the
+         owner is parsed out).
+      4. ``SUPERPOS_GITHUB_REPO_OWNER`` env hint.
+      5. the single-connection default / cached resolution.
+
+    When several connections exist and none of the above resolves one, minting
+    fails clear rather than handing back the wrong org's token.
     """
     static = os.environ.get("GITHUB_TOKEN")
     if static:
         sys.stdout.write(static)
         return 0
-    owner = os.environ.get("SUPERPOS_GITHUB_REPO_OWNER") or None
+    resolved_owner = (
+        owner
+        or _owner_from_repo_arg(repo)
+        or (os.environ.get("SUPERPOS_GITHUB_REPO_OWNER") or None)
+    )
     try:
-        token = asyncio.run(_mint_token(owner))
+        token = asyncio.run(_mint_token(resolved_owner))
     except _AmbiguousConnection:
         print(
             "github_auth: multiple GitHub connections and no repo owner to "
-            "resolve by; set SUPERPOS_GITHUB_CONNECTION_ID (or "
-            "SUPERPOS_GITHUB_REPO_OWNER) to pin one.",
+            "resolve by; pass --owner/--repo, or set "
+            "SUPERPOS_GITHUB_CONNECTION_ID (or SUPERPOS_GITHUB_REPO_OWNER) to "
+            "pin one.",
             file=sys.stderr,
         )
         return 1
@@ -689,7 +824,18 @@ def main(argv: list[str] | None = None) -> int:
     cred = sub.add_parser("credential", help="git credential helper protocol.")
     cred.add_argument("action", choices=["get", "store", "erase"])
 
-    sub.add_parser("token", help="Print a fresh GitHub token to stdout.")
+    tok = sub.add_parser("token", help="Print a fresh GitHub token to stdout.")
+    tok.add_argument(
+        "--owner",
+        help="Repo owner (org/user login) to mint the owning connection's "
+        "token for, on multi-connection agents.",
+    )
+    tok.add_argument(
+        "--repo",
+        help="An owner/repo slug or a git remote URL; the owner is parsed out "
+        "for owner-aware minting (e.g. --repo \"$(git config --get "
+        "remote.origin.url)\").",
+    )
 
     args = parser.parse_args(argv)
     if args.command == "setup":
@@ -697,7 +843,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "credential":
         return cmd_credential(args.action)
     if args.command == "token":
-        return cmd_token()
+        return cmd_token(owner=args.owner, repo=args.repo)
     return 2
 
 
