@@ -308,3 +308,35 @@ async def test_connections_403_and_empty_persona_errors(monkeypatch, capsys):
     err = capsys.readouterr().err
     # Should NOT primarily tell the user to grant services.read.
     assert "services:{id}" in err or "services:*" in err
+
+
+# ── --service argument ordering (pins the SKILL.md multi-connection example) ──
+
+
+def test_service_is_a_root_level_option_before_subcommand():
+    """``--service`` must precede the subcommand, matching the doc example.
+
+    ``superpos-github --service <name> api POST ...`` parses; ``--service`` is
+    attached to the root parser, not the ``api`` subparser.
+    """
+    mod = _load_script()
+    args = mod._build_parser().parse_args(
+        ["--service", "other-org-conn", "api", "POST", "/repos/o/r/issues/7/comments"]
+    )
+    assert args.service == "other-org-conn"
+    assert args.cmd == "api"
+    assert args.method == "POST"
+    assert args.path == "/repos/o/r/issues/7/comments"
+
+
+def test_service_after_subcommand_is_rejected():
+    """``superpos-github api --service <name> ...`` exits 2 (the reviewed bug).
+
+    argparse treats a root-level option placed after the subcommand as an
+    unrecognized argument, so the pre-fix doc example could never work.
+    """
+    mod = _load_script()
+    with pytest.raises(SystemExit):
+        mod._build_parser().parse_args(
+            ["api", "--service", "other-org-conn", "POST", "/repos/o/r/issues/7/comments"]
+        )

@@ -87,9 +87,13 @@ For PR review/comment work on such agents, do **one** of:
   a multi-connection agent, pass `--service <name>` (from `superpos-github
   connections`) for the connection that owns the repo:
 
+  `--service` is a **root-level** option — it must come *before* the
+  subcommand (`argparse` rejects it after `api` with "unrecognized
+  arguments"):
+
   ```bash
-  superpos-github api --service other-org-conn \
-    POST /repos/other-org/repo/issues/7/comments --body '{"body":"…"}'
+  superpos-github --service other-org-conn \
+    api POST /repos/other-org/repo/issues/7/comments --body '{"body":"…"}'
   ```
 
 - **(b) Mint the owning connection's token for the `gh` call.** `github_auth
