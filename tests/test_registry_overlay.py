@@ -25,9 +25,12 @@ from superpos_agent_core.registry_overlay import (
     FEATURE_FLAG_ENV,
     MODULE_INSTALL_FAILED_EVENT,
     RESOLVED_EMPTY_NO_FALLBACK_EVENT,
+    SKILLS_LAYOUT_CODEX,
+    SKILLS_LAYOUT_FLAT,
     apply_registry_overlay,
     feature_enabled,
     overlay_modules,
+    overlay_skills,
 )
 
 BEGIN = module_setup.BEGIN_MARKER
@@ -1269,3 +1272,214 @@ def test_cache_write_is_atomic_via_replace(tmp_path: Path, monkeypatch):
     assert replaced and Path(replaced[-1][1]) == cache
     # The temp source must not linger.
     assert not Path(replaced[-1][0]).exists()
+
+
+# ── Skills layout: flat (Claude, default) vs codex (dir-per-skill) ───
+
+
+def _skill_items():
+    """Two skills, one with helper files, for layout assertions."""
+    return [
+        {
+            "slug": "deep-research",
+            "name": "Deep Research",
+            "instructions": "# deep-research\n\nResearch harness.\n",
+            "files": [
+                {"path": "scripts/run.sh", "content": "echo hi\n", "mode": "+x"},
+            ],
+        },
+        {
+            "slug": "simplify",
+            "name": "Simplify",
+            "instructions": "# simplify\n\nSimplify the diff.\n",
+        },
+    ]
+
+
+def test_overlay_skills_flat_is_default_and_writes_slug_md(tmp_path: Path):
+    """Default layout writes ``<slug>.md`` — the Claude agent's format,
+    unchanged.  Helper files land in a per-slug dir."""
+    skills_dir = tmp_path / "skills"
+    result = overlay_skills(_skill_items(), str(skills_dir))
+
+    assert sorted(result.written) == ["deep-research", "simplify"]
+    # Flat <slug>.md files (Claude).
+    assert (skills_dir / "deep-research.md").read_text() == (
+        "# deep-research\n\nResearch harness.\n"
+    )
+    assert (skills_dir / "simplify.md").read_text() == (
+        "# simplify\n\nSimplify the diff.\n"
+    )
+    # No SKILL.md dirs written under flat.
+    assert not (skills_dir / "deep-research" / "SKILL.md").exists()
+    # Helper files still land in the per-slug dir.
+    assert (skills_dir / "deep-research" / "scripts" / "run.sh").read_text() == (
+        "echo hi\n"
+    )
+
+
+def test_overlay_skills_flat_explicit_matches_default(tmp_path: Path):
+    """Passing layout='flat' explicitly is identical to the default."""
+    skills_dir = tmp_path / "skills"
+    overlay_skills(_skill_items(), str(skills_dir), layout=SKILLS_LAYOUT_FLAT)
+    assert (skills_dir / "deep-research.md").is_file()
+    assert not (skills_dir / "deep-research" / "SKILL.md").exists()
+
+
+def test_overlay_skills_codex_writes_dir_per_skill_SKILL_md(tmp_path: Path):
+    """Codex layout writes ``<slug>/SKILL.md`` dirs — the @openai/codex
+    format — with identical body, and helper files alongside SKILL.md."""
+    skills_dir = tmp_path / "skills"
+    result = overlay_skills(
+        _skill_items(), str(skills_dir), layout=SKILLS_LAYOUT_CODEX
+    )
+
+    assert sorted(result.written) == ["deep-research", "simplify"]
+    # dir-per-skill <slug>/SKILL.md (Codex) — same body as the flat file.
+    assert (skills_dir / "deep-research" / "SKILL.md").read_text() == (
+        "# deep-research\n\nResearch harness.\n"
+    )
+    assert (skills_dir / "simplify" / "SKILL.md").read_text() == (
+        "# simplify\n\nSimplify the diff.\n"
+    )
+    # No flat <slug>.md at the root under codex.
+    assert not (skills_dir / "deep-research.md").exists()
+    assert not (skills_dir / "simplify.md").exists()
+    # Helper files land inside the skill dir, alongside SKILL.md.
+    assert (skills_dir / "deep-research" / "scripts" / "run.sh").read_text() == (
+        "echo hi\n"
+    )
+
+
+def test_overlay_skills_codex_helper_named_SKILL_md_does_not_clobber_body(
+    tmp_path: Path,
+):
+    """A registry skill helper file literally named ``SKILL.md`` must NOT
+    overwrite the generated ``<slug>/SKILL.md`` body built from instructions.
+    Both layouts share the same skill body — only the path differs — so the
+    generated body always wins in the codex per-slug dir."""
+    skills_dir = tmp_path / "skills"
+    skills = [
+        {
+            "slug": "deep-research",
+            "name": "Deep Research",
+            "instructions": "# deep-research\n\nGenerated body.\n",
+            "files": [
+                # Careless/hostile helper file that would clobber the body.
+                {"path": "SKILL.md", "content": "# HELPER OVERWRITE\n"},
+                {"path": "scripts/run.sh", "content": "echo hi\n", "mode": "+x"},
+            ],
+        },
+    ]
+
+    result = overlay_skills(skills, str(skills_dir), layout=SKILLS_LAYOUT_CODEX)
+
+    assert result.written == ["deep-research"]
+    # The generated body — not the helper's content — survives.
+    assert (skills_dir / "deep-research" / "SKILL.md").read_text() == (
+        "# deep-research\n\nGenerated body.\n"
+    )
+    # Other (non-colliding) helper files are still written normally.
+    assert (skills_dir / "deep-research" / "scripts" / "run.sh").read_text() == (
+        "echo hi\n"
+    )
+
+
+def test_overlay_skills_unknown_layout_raises(tmp_path: Path):
+    with pytest.raises(ValueError):
+        overlay_skills(_skill_items(), str(tmp_path / "skills"), layout="bogus")
+
+
+def test_apply_overlay_threads_codex_layout_to_skills(tmp_path: Path, monkeypatch):
+    """apply_registry_overlay(skills_layout='codex') materialises registry
+    skills as <slug>/SKILL.md dirs; modules unaffected."""
+    monkeypatch.setenv(FEATURE_FLAG_ENV, "true")
+    skills_dir = tmp_path / "skills"
+    modules_dir = tmp_path / "modules"
+    agents_md = _agents_md(tmp_path)
+
+    result = apply_registry_overlay(
+        _resolved_payload(),
+        modules_dir=str(modules_dir),
+        skills_dir=str(skills_dir),
+        skills_layout=SKILLS_LAYOUT_CODEX,
+        agents_md_path=str(agents_md),
+    )
+
+    assert result.skipped is False
+    assert "deep-research" in result.skills.written
+    assert (skills_dir / "deep-research" / "SKILL.md").is_file()
+    assert not (skills_dir / "deep-research.md").exists()
+
+
+def test_apply_overlay_default_layout_is_flat(tmp_path: Path, monkeypatch):
+    """apply_registry_overlay without skills_layout keeps the flat <slug>.md
+    Claude format — the default is unchanged."""
+    monkeypatch.setenv(FEATURE_FLAG_ENV, "true")
+    skills_dir = tmp_path / "skills"
+    modules_dir = tmp_path / "modules"
+    agents_md = _agents_md(tmp_path)
+
+    apply_registry_overlay(
+        _resolved_payload(),
+        modules_dir=str(modules_dir),
+        skills_dir=str(skills_dir),
+        agents_md_path=str(agents_md),
+    )
+
+    assert (skills_dir / "deep-research.md").is_file()
+    assert not (skills_dir / "deep-research" / "SKILL.md").exists()
+
+
+def test_cli_main_passes_skills_layout_codex(tmp_path: Path, monkeypatch):
+    """CLI ``--skills-layout codex`` threads through to the skills overlay."""
+    monkeypatch.setenv(FEATURE_FLAG_ENV, "true")
+    skills_dir = tmp_path / "skills"
+    modules_dir = tmp_path / "modules"
+    agents_md = _agents_md(tmp_path)
+
+    monkeypatch.setattr(
+        module_setup, "_fetch_registry_resolved", lambda *a, **k: _resolved_payload()
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "module_setup",
+            "--modules-dir", str(modules_dir),
+            "--agents-md", str(agents_md),
+            "--skills-dir", str(skills_dir),
+            "--skills-layout", "codex",
+        ],
+    )
+
+    module_setup.main()
+
+    assert (skills_dir / "deep-research" / "SKILL.md").is_file()
+    assert not (skills_dir / "deep-research.md").exists()
+
+
+def test_cli_main_default_skills_layout_is_flat(tmp_path: Path, monkeypatch):
+    """CLI without ``--skills-layout`` defaults to flat (Claude) — regression
+    guard that Claude agents keep <slug>.md."""
+    monkeypatch.setenv(FEATURE_FLAG_ENV, "true")
+    skills_dir = tmp_path / "skills"
+    modules_dir = tmp_path / "modules"
+    agents_md = _agents_md(tmp_path)
+
+    monkeypatch.setattr(
+        module_setup, "_fetch_registry_resolved", lambda *a, **k: _resolved_payload()
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "module_setup",
+            "--modules-dir", str(modules_dir),
+            "--agents-md", str(agents_md),
+            "--skills-dir", str(skills_dir),
+        ],
+    )
+
+    module_setup.main()
+
+    assert (skills_dir / "deep-research.md").is_file()
+    assert not (skills_dir / "deep-research" / "SKILL.md").exists()

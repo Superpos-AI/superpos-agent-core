@@ -20,6 +20,22 @@ container, so you never handle a token.
   bump its priority, extend its timeout, or merge extra payload —
   without losing its id, parent, or trace → `update`.
 
+## Persona + memory doubling (degraded mode)
+
+Persona and MEMORY follow the same **doubling** pattern as modules/skills
+(`registry_overlay.py`): Superpos is primary, the agent image carries a
+bundled snapshot fallback, re-synced into the workspace on every reachable
+startup. Gated by `PLATFORM_PERSONA_MEMORY_DOUBLING` (default ON; set an
+explicit falsey value to restore the pre-doubling behaviour).
+
+- **Reads** degrade gracefully: if Superpos is unreachable, the persona and
+  the MEMORY default rules are served from the last-known-good snapshot, so
+  the agent still boots with an identity.
+- **`memory` writes stay Superpos-only.** During an outage a `memory` write
+  **fails loudly** (nonzero exit) — there is deliberately no agent-local
+  fallback. Degraded mode is read-only by design; do not work around it by
+  writing memory elsewhere. Retry the write once Superpos is reachable.
+
 ## `superpos-task update <task-id>`
 
 Partially updates a not-yet-terminal task via

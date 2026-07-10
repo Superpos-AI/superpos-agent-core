@@ -71,6 +71,17 @@ from .module_setup import (
 log = logging.getLogger(__name__)
 
 
+#: Skills layout: ``flat`` writes ``<skills-dir>/<slug>.md`` — the format the
+#: Claude agent discovers.  ``codex`` writes ``<skills-dir>/<slug>/SKILL.md``
+#: dirs — the format the @openai/codex CLI discovers (its skill loader only
+#: registers a skill when it finds a *directory* under a scanned root
+#: containing a file named exactly ``SKILL.md``, so a flat ``<slug>.md`` is
+#: invisible to it).  Default is ``flat`` so the Claude agent is unchanged.
+SKILLS_LAYOUT_FLAT = "flat"
+SKILLS_LAYOUT_CODEX = "codex"
+SKILLS_LAYOUTS = (SKILLS_LAYOUT_FLAT, SKILLS_LAYOUT_CODEX)
+
+
 #: Structured log record emitted when the flag is ON, the live fetch failed,
 #: there is no last-good cache, AND nothing baked-in is available — the
 #: "degraded-empty" boot.  The agent still comes up and keeps polling so it
@@ -146,6 +157,19 @@ def _safe_rel(rel: str) -> bool:
     return bool(rel) and not rel.startswith("/") and ".." not in Path(rel).parts
 
 
+def _resolves_to(install_dir: Path, entry: dict, target: Path) -> bool:
+    """Return True if ``entry``'s (safe) path lands exactly on ``target``.
+
+    Used to guard the generated ``<slug>/SKILL.md`` body against a helper
+    file entry whose path resolves to the same location.  Unsafe paths (which
+    ``_write_file_entry`` would skip anyway) never collide.
+    """
+    rel = entry.get("path") or ""
+    if not _safe_rel(rel):
+        return False
+    return (install_dir / rel).resolve() == target.resolve()
+
+
 def _write_file_entry(install_dir: Path, entry: dict) -> None:
     """Write one ``{path, content, mode}`` file under ``install_dir``.
 
@@ -181,14 +205,35 @@ class SkillOverlayResult:
     skipped: list[str] = field(default_factory=list)
 
 
-def overlay_skills(skills: list[dict], skills_dir: str) -> SkillOverlayResult:
-    """Write each registry skill to ``<skills_dir>/<slug>.md`` (+ its ``files[]``).
+def overlay_skills(
+    skills: list[dict],
+    skills_dir: str,
+    *,
+    layout: str = SKILLS_LAYOUT_FLAT,
+) -> SkillOverlayResult:
+    """Write each registry skill under ``skills_dir`` (+ its ``files[]``).
 
-    Registry skill with the same slug as a baked-in one wins (the file is
-    overwritten).  Baked-in skills absent from the registry remain
-    untouched.  Per-skill failures are logged and skipped — a bad skill
-    must not abort the rest.
+    Two on-disk layouts, selected by ``layout``:
+
+    - ``flat`` (default) — write ``<skills_dir>/<slug>.md`` (the Claude
+      agent's format).  Helper ``files[]`` land in a per-slug dir so they
+      don't collide with sibling skills.  This is unchanged from before the
+      layout knob existed, so the Claude agent is byte-for-byte unaffected.
+    - ``codex`` — write ``<skills_dir>/<slug>/SKILL.md`` (the @openai/codex
+      CLI's format: a skill is a *directory* containing ``SKILL.md``; a flat
+      ``<slug>.md`` is invisible to Codex's loader).  Helper ``files[]`` land
+      inside that same per-slug dir, alongside ``SKILL.md``.
+
+    The skill body/frontmatter written is identical in both layouts — only
+    the path differs.  Registry skill with the same slug as a baked-in one
+    wins (the file/dir is overwritten).  Baked-in skills absent from the
+    registry remain untouched.  Per-skill failures are logged and skipped —
+    a bad skill must not abort the rest.
     """
+    if layout not in SKILLS_LAYOUTS:
+        raise ValueError(
+            f"unknown skills layout {layout!r}; expected one of {SKILLS_LAYOUTS}"
+        )
     result = SkillOverlayResult()
     root = Path(skills_dir)
     root.mkdir(parents=True, exist_ok=True)
@@ -201,18 +246,42 @@ def overlay_skills(skills: list[dict], skills_dir: str) -> SkillOverlayResult:
             continue
         try:
             instructions = skill.get("instructions") or ""
-            (root / f"{slug}.md").write_text(instructions, encoding="utf-8")
-
             files = skill.get("files") or []
-            if files:
-                # Helper files (e.g. scripts/) live in a per-slug dir so they
-                # don't collide with sibling skills.
-                files_dir = root / slug
-                files_dir.mkdir(parents=True, exist_ok=True)
+
+            if layout == SKILLS_LAYOUT_CODEX:
+                # Codex discovers a skill as <slug>/SKILL.md — the body goes
+                # into a SKILL.md inside a per-slug dir, and helper files land
+                # in that same dir alongside it.
+                skill_dir = root / slug
+                skill_dir.mkdir(parents=True, exist_ok=True)
+                skill_md = skill_dir / "SKILL.md"
+                skill_md.write_text(instructions, encoding="utf-8")
                 for entry in files:
-                    _write_file_entry(files_dir, entry)
+                    # The generated SKILL.md body (from instructions) is the
+                    # invariant both layouts share — a helper file whose path
+                    # resolves to <slug>/SKILL.md must never clobber it.
+                    if _resolves_to(skill_dir, entry, skill_md):
+                        log.warning(
+                            "registry skill %s: helper file %r collides with the "
+                            "generated SKILL.md; keeping generated body",
+                            slug,
+                            entry.get("path"),
+                        )
+                        continue
+                    _write_file_entry(skill_dir, entry)
+            else:
+                # Flat (Claude) — <slug>.md at the root; helper files in a
+                # per-slug dir so they don't collide with sibling skills.
+                (root / f"{slug}.md").write_text(instructions, encoding="utf-8")
+                if files:
+                    files_dir = root / slug
+                    files_dir.mkdir(parents=True, exist_ok=True)
+                    for entry in files:
+                        _write_file_entry(files_dir, entry)
             result.written.append(slug)
-            log.info("registry skill overlay: wrote %s", slug)
+            log.info(
+                "registry skill overlay: wrote %s (layout=%s)", slug, layout
+            )
         except Exception as exc:  # noqa: BLE001 — isolate one bad skill
             log.warning("registry skill %s overlay failed: %s", slug, exc)
             result.skipped.append(slug)
@@ -483,15 +552,21 @@ def remove_registry_overlay_modules(
 # ── Top-level overlay entry point ────────────────────────────────────
 
 
-def _has_baked_in_fallback(modules_dir: str, skills_dir: str | None) -> bool:
+def _has_baked_in_fallback(
+    modules_dir: str,
+    skills_dir: str | None,
+    skills_layout: str = SKILLS_LAYOUT_FLAT,
+) -> bool:
     """True when *something* is already on disk to fall back to.
 
     Used only on a failed fetch with no cache to decide between a benign
     "degrade to baked-in" and the "degraded-empty" boot.  We count any
-    discoverable module (bundled or workspace) and any ``<slug>.md`` skill
-    already written under ``skills_dir``.  Beat 4 drops the baked-in
-    artifacts, so on the lean image this returns False and the degraded-empty
-    path lights up — exactly the case this PR makes safe.
+    discoverable module (bundled or workspace) and any baked skill already
+    written under ``skills_dir``.  A baked skill is a flat ``<slug>.md``
+    under ``flat`` layout, or a ``<slug>/SKILL.md`` dir under ``codex``
+    layout — so we check the shape matching the active layout.  Beat 4 drops
+    the baked-in artifacts, so on the lean image this returns False and the
+    degraded-empty path lights up — exactly the case this PR makes safe.
     """
     try:
         if discover_modules(modules_dir if os.path.isdir(modules_dir) else None):
@@ -500,8 +575,12 @@ def _has_baked_in_fallback(modules_dir: str, skills_dir: str | None) -> bool:
         pass
     if skills_dir:
         skills_root = Path(skills_dir)
-        if skills_root.is_dir() and any(skills_root.glob("*.md")):
-            return True
+        if skills_root.is_dir():
+            if skills_layout == SKILLS_LAYOUT_CODEX:
+                if any(skills_root.glob("*/SKILL.md")):
+                    return True
+            elif any(skills_root.glob("*.md")):
+                return True
     return False
 
 
@@ -530,6 +609,7 @@ def apply_registry_overlay(
     *,
     modules_dir: str,
     skills_dir: str | None = None,
+    skills_layout: str = SKILLS_LAYOUT_FLAT,
     agents_md_path: str | None = None,
     bin_dir: str | None = None,
     env: dict[str, str] | None = None,
@@ -549,11 +629,14 @@ def apply_registry_overlay(
             shadowing bundled ones of the same slug).  Modules are
             **always** overlaid when the flag is on — they target this
             workspace dir and don't depend on ``skills_dir``.
-        skills_dir: workspace skills root (``<slug>.md`` files written
-            here).  Optional — when ``None`` the **skills** portion of the
-            overlay is skipped (a structured warning is logged) but modules
-            are still overlaid.  This decouples module rollout from a
-            startup command that doesn't pass a skills dir.
+        skills_dir: workspace skills root (skills written here).  Optional —
+            when ``None`` the **skills** portion of the overlay is skipped
+            (a structured warning is logged) but modules are still overlaid.
+            This decouples module rollout from a startup command that
+            doesn't pass a skills dir.
+        skills_layout: ``flat`` (default) writes ``<skills_dir>/<slug>.md``
+            (Claude); ``codex`` writes ``<skills_dir>/<slug>/SKILL.md`` dirs
+            (@openai/codex).  Only affects the skills half of the overlay.
         agents_md_path: optional system-prompt file to re-render the
             module doc block into after installing registry modules.
         bin_dir: optional PATH dir to (re-)symlink module scripts into.
@@ -576,7 +659,7 @@ def apply_registry_overlay(
         # self-heal once the registry recovers.  The destructive reconcile is
         # *not* run on this path, so a transient outage can't wipe a
         # previously-installed registry module.
-        if _has_baked_in_fallback(modules_dir, skills_dir):
+        if _has_baked_in_fallback(modules_dir, skills_dir, skills_layout):
             # Benign degrade — baked-in (bundled / already-installed) artifacts
             # remain the source of truth, exactly as today.
             log.warning(
@@ -607,7 +690,7 @@ def apply_registry_overlay(
     # Decoupling the two means a flag-on startup command without a skills
     # dir still gets its registry modules — only the skills half is skipped.
     if skills_dir is not None:
-        skills_result = overlay_skills(skill_items, skills_dir)
+        skills_result = overlay_skills(skill_items, skills_dir, layout=skills_layout)
     else:
         skills_result = SkillOverlayResult(skipped=[s.get("slug") for s in skill_items])
         if skill_items:
@@ -672,6 +755,9 @@ __all__ = [
     "MODULE_REMOVED_EVENT",
     "REGISTRY_MANAGED_MARKER",
     "RESOLVED_EMPTY_NO_FALLBACK_EVENT",
+    "SKILLS_LAYOUTS",
+    "SKILLS_LAYOUT_CODEX",
+    "SKILLS_LAYOUT_FLAT",
     "ModuleOverlayResult",
     "RegistryOverlayResult",
     "SkillOverlayResult",

@@ -13,6 +13,11 @@ import sys
 
 import httpx
 
+try:  # package import when run as a module …
+    from .persona_overlay import MemoryWriteUnavailable, write_memory
+except ImportError:  # … or sibling import when run as a standalone script
+    from persona_overlay import MemoryWriteUnavailable, write_memory
+
 
 def _base_config() -> tuple[str, str, str, str]:
     base_url = os.environ.get("SUPERPOS_BASE_URL", "").rstrip("/")
@@ -388,23 +393,37 @@ def update_memory(content: str, message: str | None = None, mode: str = "append"
     if message:
         body["message"] = message
 
-    with httpx.Client(base_url=base_url, timeout=30.0, follow_redirects=True) as client:
-        resp = client.patch(
-            "/api/v1/persona/memory",
-            json=body,
-            headers=_headers(token),
+    def _do_write() -> None:
+        with httpx.Client(base_url=base_url, timeout=30.0, follow_redirects=True) as client:
+            resp = client.patch(
+                "/api/v1/persona/memory",
+                json=body,
+                headers=_headers(token),
+            )
+            if resp.status_code in (200, 201):
+                print("Memory updated.")
+            elif resp.status_code == 403:
+                print("Error: MEMORY document is locked by persona lock policy", file=sys.stderr)
+                sys.exit(1)
+            elif resp.status_code == 409:
+                print("Error: Persona version conflict — retry", file=sys.stderr)
+                sys.exit(1)
+            else:
+                print(f"Error: {resp.status_code} {resp.text}", file=sys.stderr)
+                sys.exit(1)
+
+    # AG-10 memory doubling: writes stay Superpos-only with no local fallback —
+    # a genuine outage fails loudly via MemoryWriteUnavailable.  The status-code
+    # branches above call sys.exit (SystemExit, a BaseException), so write_memory's
+    # `except Exception` won't swallow them.
+    try:
+        write_memory(_do_write)
+    except MemoryWriteUnavailable as exc:
+        print(
+            f"Error: MEMORY write unavailable (Superpos unreachable): {exc}",
+            file=sys.stderr,
         )
-        if resp.status_code in (200, 201):
-            print("Memory updated.")
-        elif resp.status_code == 403:
-            print("Error: MEMORY document is locked by persona lock policy", file=sys.stderr)
-            sys.exit(1)
-        elif resp.status_code == 409:
-            print("Error: Persona version conflict — retry", file=sys.stderr)
-            sys.exit(1)
-        else:
-            print(f"Error: {resp.status_code} {resp.text}", file=sys.stderr)
-            sys.exit(1)
+        sys.exit(1)
 
 
 def build_parser() -> argparse.ArgumentParser:

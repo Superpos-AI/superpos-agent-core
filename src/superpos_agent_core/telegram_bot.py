@@ -151,7 +151,6 @@ def register_handlers(
     bound_thread = config.telegram_thread_id
     legacy_session_keys = config.telegram_legacy_session_keys
     known_models = type(runtime).KNOWN_MODELS
-    effort_levels = type(runtime).EFFORT_LEVELS
 
     def is_allowed(user_id: int) -> bool:
         return not allowed or user_id in allowed
@@ -351,7 +350,12 @@ def register_handlers(
             return
         args = ctx.args or []
         if not args:
-            levels = ", ".join(effort_levels)
+            # Render the valid set for the *currently selected* model, not the
+            # static union of every model's ladder. Reading through
+            # efforts_for_model() keeps the advertised usage in lockstep with
+            # what set_effort() will accept — and reflects a mid-session
+            # /model switch, since it is evaluated on each invocation.
+            levels = ", ".join(runtime.efforts_for_model(runtime.model))
             await update.message.reply_text(
                 f"Current effort: `{runtime.effort}`\n\n"
                 f"Usage: `/effort <{levels}>`",
