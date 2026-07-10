@@ -33,6 +33,7 @@ superpos_agent_core = [
     "modules/**/scripts/*",
     "skills/*.md",
     "wiki/*.md",
+    "snapshots/*.md",
     "superpos_task_SKILL.md",
 ]
 

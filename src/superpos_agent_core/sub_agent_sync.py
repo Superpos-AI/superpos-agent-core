@@ -21,14 +21,22 @@ import logging
 import os
 import sys
 from pathlib import Path
+from typing import Callable
 
 import httpx
 import yaml
+
+from .persona_overlay import MemoryFetchUnavailable, read_memory
 
 log = logging.getLogger(__name__)
 
 MANAGED_MARKER = "<!-- managed-by: superpos-sync -->"
 DOCUMENT_ORDER = ("SOUL", "AGENT", "RULES", "STYLE", "EXAMPLES", "NOTES")
+
+# Sentinel for the ``memory`` argument so we can tell "caller omitted memory"
+# (no authoritative value — must NOT clear the snapshot) apart from "caller
+# explicitly passed an empty/cleared MEMORY" (authoritative reachable-empty).
+_MEMORY_OMITTED = object()
 
 
 class SubAgentFetchError(RuntimeError):
@@ -139,18 +147,52 @@ def fetch_sub_agent_definitions(
 
 
 def fetch_persona_memory(base_url: str, token: str) -> str | None:
-    """Fetch the MEMORY document from the active persona (fallback)."""
-    with httpx.Client(base_url=base_url, timeout=30.0, follow_redirects=True) as client:
-        resp = client.get(
-            "/api/v1/persona/documents/MEMORY", headers=_headers(token),
-        )
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
-        payload = data.get("data", data) if isinstance(data, dict) else {}
-        if isinstance(payload, dict):
-            return _get_document_content(payload.get("content"))
+    """Fetch the MEMORY document from the active persona.
+
+    Distinguishes a *reachable* read from an *outage* so the AG-10 overlay can
+    tell "the user cleared MEMORY" (→ stop injecting) from "Superpos is down"
+    (→ serve the snapshot):
+
+    - **Reachable** (HTTP 200) → return the document content, or ``None`` when
+      the document is empty / blank.  ``None`` here means *reachable-empty*.
+    - **Reachable-empty** (HTTP 404) → return ``None``.  The server's
+      ``PersonaController::document()`` returns ``notFound()`` for both "no
+      active persona for this agent" and "MEMORY document missing", so a 404 is
+      a reachable cleared state — NOT an outage.  Mirrors
+      :meth:`SuperposClient.get_persona_assembled`.
+    - **Outage** (transport error, or any other non-200 status) → raise
+      :class:`MemoryFetchUnavailable` so callers fall back to the snapshot.
+    """
+    try:
+        with httpx.Client(
+            base_url=base_url, timeout=30.0, follow_redirects=True,
+        ) as client:
+            resp = client.get(
+                "/api/v1/persona/documents/MEMORY", headers=_headers(token),
+            )
+    except httpx.HTTPError as exc:
+        raise MemoryFetchUnavailable(
+            f"MEMORY fetch transport error: {exc}"
+        ) from exc
+    # 404 is the server's reachable "no active persona / no MEMORY document"
+    # state, NOT an outage — return reachable-empty so callers clear the stale
+    # snapshot instead of resurrecting it.
+    if resp.status_code == 404:
         return None
+    if resp.status_code != 200:
+        raise MemoryFetchUnavailable(
+            f"MEMORY endpoint returned {resp.status_code}"
+        )
+    try:
+        data = resp.json()
+    except ValueError as exc:
+        raise MemoryFetchUnavailable(
+            f"MEMORY response not JSON: {exc}"
+        ) from exc
+    payload = data.get("data", data) if isinstance(data, dict) else {}
+    if isinstance(payload, dict):
+        return _get_document_content(payload.get("content"))
+    return None
 
 
 # ── Document helpers ──────────────────────────────────────────────────
@@ -310,7 +352,8 @@ def sync_sub_agents(
     modules_dir: str | None = None,
     skills_dir: str | None = None,
     definitions: list[dict] | None = None,
-    memory: str | None = None,
+    memory: str | None = _MEMORY_OMITTED,  # type: ignore[assignment]
+    memory_snapshot_dir: str | None = None,
 ) -> int:
     """Sync SubAgentDefinitions from Superpos to the subagents directory.
 
@@ -319,9 +362,37 @@ def sync_sub_agents(
     ``SuperposClient.get_runtime_bundle()`` call).  Otherwise, fetches
     from the API using sync HTTP.
 
+    ``memory`` distinguishes *omitted* (default ``_MEMORY_OMITTED`` — no
+    authoritative value, e.g. the caller passed ``definitions`` directly but no
+    memory) from an *explicit* value (``str``/``None``, an authoritative
+    reachable read).  An omitted memory must NOT be treated as a reachable-empty
+    document — that would clear the workspace snapshot and lose the last-known-
+    good MEMORY fallback for a later outage.
+
+    When ``memory_snapshot_dir`` is provided (and ``inject_memory`` is set),
+    the MEMORY read is routed through the AG-10 snapshot overlay: a Superpos
+    outage degrades to the read-only workspace snapshot instead of dropping
+    MEMORY injection, and a reachable read re-syncs that snapshot.
+
     Returns the number of definitions synced.
     """
     Path(subagents_dir).mkdir(parents=True, exist_ok=True)
+
+    # MEMORY read for the doubling overlay.  ``fetch_fn`` must distinguish a
+    # *reachable-empty* document (returns ``None``/blank → clears the snapshot,
+    # no injection) from an *outage* (raises ``MemoryFetchUnavailable`` → serve
+    # the snapshot).  Default: if ``memory`` was *omitted* there is no
+    # authoritative value to act on, so treat it like an outage (raise) and
+    # preserve the snapshot; only an *explicit* ``memory`` is an authoritative
+    # reachable read.  The branches below replace this with the live source.
+    def _default_memory_fetch() -> str | None:
+        if memory is _MEMORY_OMITTED:
+            raise MemoryFetchUnavailable(
+                "no authoritative MEMORY available (memory omitted)"
+            )
+        return memory  # type: ignore[return-value]
+
+    memory_fetch_fn: Callable[[], str | None] = _default_memory_fetch
 
     if definitions is None:
         bundle = fetch_runtime_bundle(base_url, token)
@@ -329,10 +400,14 @@ def sync_sub_agents(
         if bundle is not None:
             definitions = bundle.get("definitions") or []
             if inject_memory:
+                # The bundle was reachable, so its memory value (possibly empty)
+                # is authoritative — never an outage.
                 memory = bundle.get("agent_memory")
+                memory_fetch_fn = lambda: bundle.get("agent_memory")  # noqa: E731
             log.info(
                 "Fetched runtime bundle: %d definition(s), memory=%s",
-                len(definitions), "yes" if memory else "no",
+                len(definitions),
+                "yes" if (memory is not _MEMORY_OMITTED and memory) else "no",
             )
         else:
             try:
@@ -347,8 +422,35 @@ def sync_sub_agents(
                 )
                 return 0
             if inject_memory and definitions:
-                memory = fetch_persona_memory(base_url, token)
+                # Defer the fetch into ``fetch_fn`` so an outage raises *inside*
+                # read_memory (→ snapshot fallback) while a reachable-empty read
+                # returns None (→ clears the snapshot, no injection).
+                memory_fetch_fn = lambda: fetch_persona_memory(base_url, token)  # noqa: E731
     elif not inject_memory:
+        memory = None
+
+    # AG-10 memory doubling: route the read through the snapshot overlay so a
+    # Superpos outage degrades to the read-only snapshot instead of dropping
+    # MEMORY injection, a reachable read re-syncs the workspace snapshot, and a
+    # reachable-empty (cleared) document clears it so we stop injecting stale
+    # memory.  ttl_seconds=0 forces a fresh fetch every sync (the overlay only
+    # owns the success-resync / clear-on-empty / outage-fallback edges).
+    if inject_memory and memory_snapshot_dir is not None:
+        mem_result = read_memory(
+            memory_fetch_fn,
+            snapshot_dir=memory_snapshot_dir,
+            ttl_seconds=0,
+        )
+        memory = mem_result.content
+        if mem_result.fetch_failed:
+            log.warning(
+                "MEMORY unavailable from Superpos; using %s snapshot",
+                mem_result.source,
+            )
+
+    # Normalize an omitted memory (no snapshot overlay engaged) to None so it is
+    # never injected or measured as a real value below.
+    if memory is _MEMORY_OMITTED:
         memory = None
 
     if memory:
@@ -435,6 +537,10 @@ def main() -> None:
         "--skills-dir",
         help="Skills directory to scan",
     )
+    parser.add_argument(
+        "--memory-snapshot-dir",
+        help="Snapshot dir for MEMORY read fallback (AG-10 doubling)",
+    )
 
     args = parser.parse_args()
     base_url, token = _base_config()
@@ -446,6 +552,7 @@ def main() -> None:
         inject_memory=args.inject_memory,
         modules_dir=args.modules_dir if args.inject_modules else None,
         skills_dir=args.skills_dir if args.inject_modules else None,
+        memory_snapshot_dir=args.memory_snapshot_dir,
     )
 
     print(f"Synced {count} sub-agent definition(s)")
