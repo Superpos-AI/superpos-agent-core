@@ -180,11 +180,13 @@ Add an analogous filter to every comment-driven workflow.
 ### Reviewing/commenting on a PR (avoid the `gh` 401)
 
 When the workflow step reviews or comments on a PR, prefer the
-`superpos-github api` **proxy** — it resolves the right connection
-server-side. On App-connection agents with **two or more** GitHub
-connections, raw `gh` uses a single boot token and will **401** on repos
-owned by a *different* connection (it can't use git's credential helper).
-If you must use `gh`, mint the owning connection's token first:
+`superpos-github api` **proxy** — it mints server-side (no `gh` 401). On
+App-connection agents with **two or more** GitHub connections, pass
+`--service <name>` for the connection that owns the repo: with `--service`
+omitted the proxy falls back to the *first active* connection, which may not
+own the target repo. Raw `gh` uses a single boot token and will **401** on
+repos owned by a *different* connection (it can't use git's credential
+helper). If you must use `gh`, mint the owning connection's token first:
 `GH_TOKEN="$(python3 -m superpos_agent_core.github_auth token --owner <repo-owner>)"`
 (or `--repo "$(git config --get remote.origin.url)"`). See the
 `superpos-github` skill for details.

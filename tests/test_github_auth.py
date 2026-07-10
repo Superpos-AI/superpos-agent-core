@@ -639,6 +639,84 @@ def test_credential_get_fails_clear_on_ambiguous(monkeypatch, tmp_path):
     assert out == ""
 
 
+# ── ownerless fast path must not reuse an ambiguous bootstrap cache ──────
+
+
+def _seed_connection_cache(record):
+    ga._write_json_private(ga._connection_cache_path(), record)
+
+
+def _seed_token_cache(conn_id, token):
+    ga._write_json_private(
+        ga._token_cache_path(),
+        {"token": token, "expires_at": _iso(3600), "connection_id": conn_id},
+    )
+
+
+class _RaiseOnMintClient(_persona_client(_TWO_CONNS)):  # type: ignore[misc]
+    """Persona holds two App connections; minting must never be reached on the
+    ownerless fast path (that is the whole point of the fast path)."""
+
+    async def mint_github_token(self, conn_id):  # pragma: no cover - guard
+        raise AssertionError(f"unexpected mint for {conn_id!r}")
+
+
+async def test_mint_token_ownerless_refuses_ambiguous_bootstrap_cache(
+    tmp_path, monkeypatch
+):
+    _std_env(monkeypatch, tmp_path)
+    # setup writes app_conns[0] with ambiguous=True when it bootstraps gh from
+    # two-or-more App connections, and mints a token for it.  An ownerless
+    # credential request (older git / useHttpPath off) must NOT reuse that
+    # arbitrary connection — it would authenticate to the wrong org.  With two
+    # persona connections and no default, resolution must fail clear instead.
+    _seed_connection_cache({"id": "conn-superpos", "name": "gh", "ambiguous": True})
+    _seed_token_cache("conn-superpos", "boot_tok")
+    monkeypatch.setattr(ga, "SuperposClient", _persona_client(_TWO_CONNS))
+
+    with pytest.raises(ga._AmbiguousConnection):
+        await ga._mint_token(None)
+
+
+async def test_mint_token_ownerless_reuses_unambiguous_cache(tmp_path, monkeypatch):
+    _std_env(monkeypatch, tmp_path)
+    # The counterpart: a cache resolved unambiguously (single/default/owner —
+    # ambiguous=False) is still fast-pathed, returning the cached token without
+    # any network mint.
+    _seed_connection_cache({"id": "conn-solo", "name": "gh", "ambiguous": False})
+    _seed_token_cache("conn-solo", "solo_tok")
+    monkeypatch.setattr(ga, "SuperposClient", _RaiseOnMintClient)
+
+    assert await ga._mint_token(None) == "solo_tok"
+
+
+async def test_resolve_app_connection_marks_multi_cache_ambiguous(tmp_path, monkeypatch):
+    _std_env(monkeypatch, tmp_path)
+
+    class _TwoAppCatalog:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def list_github_connections(self):
+            return [
+                {"id": "conn-a", "name": "gh-a",
+                 "metadata": {"auth_type": "github_app"}},
+                {"id": "conn-b", "name": "gh-b",
+                 "metadata": {"auth_type": "github_app"}},
+            ]
+
+        async def close(self):
+            pass
+
+    # Ownerless bootstrap over two App connections picks the first for gh, but
+    # the persisted cache must flag it ambiguous so the mint fast path refuses
+    # to reuse it later.
+    await ga._resolve_app_connection(_TwoAppCatalog())  # type: ignore[arg-type]
+    cached = json.loads(ga._connection_cache_path().read_text())
+    assert cached["ambiguous"] is True
+    assert cached["id"] == "conn-a"
+
+
 # ── persona unavailable: owner request must NOT fall back to catalog[0] ──
 
 

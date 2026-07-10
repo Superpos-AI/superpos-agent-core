@@ -366,7 +366,12 @@ async def _resolve_app_connection(
         # rather than mint for the wrong installation).
         record = await _resolve_app_connection_from_persona(client, owner)
         if record:
-            _write_json_private(_connection_cache_path(), record)
+            # The persona resolver returns only a single/default/owner-matched
+            # connection (it raises _AmbiguousConnection otherwise), so this id
+            # is safe for the ownerless mint fast path.
+            _write_json_private(
+                _connection_cache_path(), {**record, "ambiguous": False}
+            )
             return record
         log.debug(
             "GitHub discovery denied (HTTP %d) and the persona github block "
@@ -403,7 +408,13 @@ async def _resolve_app_connection(
             conn.get("name"),
         )
     record = {"id": conn.get("id"), "name": conn.get("name")}
-    _write_json_private(_connection_cache_path(), record)
+    # ``ambiguous`` records that this id was picked from two-or-more App
+    # connections with no owner to disambiguate (setup's gh bootstrap).  The
+    # ownerless mint fast path must NOT reuse such a connection — it would
+    # authenticate an ownerless credential request to an arbitrary org.
+    _write_json_private(
+        _connection_cache_path(), {**record, "ambiguous": len(app_conns) > 1}
+    )
     return record
 
 
@@ -492,7 +503,15 @@ def _cached_connection_id() -> str | None:
     if override:
         return override
     cached = _read_json(_connection_cache_path())
-    return cached.get("id") if cached else None
+    if not cached:
+        return None
+    # Refuse a connection that setup picked arbitrarily from two-or-more App
+    # connections: the ownerless fast path would otherwise mint for the wrong
+    # org.  Falling through here routes the request to owner-aware resolution,
+    # which raises _AmbiguousConnection instead of guessing.
+    if cached.get("ambiguous"):
+        return None
+    return cached.get("id")
 
 
 # ── token minting (cached) ────────────────────────────────────────────
@@ -560,11 +579,12 @@ async def _mint_token(owner: str | None = None) -> str | None:
     cache_path = _token_cache_path()
     cached = _read_json(cache_path)
 
-    # Fast offline path: an explicit override or setup's cached single-connection
-    # id, with a fresh cached token already minted for it.  Owner-aware
-    # resolution needs the persona block (a network call), so only take this
-    # shortcut when we can decide the connection without owner information —
-    # i.e. an explicit override.  With an owner present we must resolve properly.
+    # Fast offline path: an explicit override or a cache resolved unambiguously
+    # (single/default/owner — never a bootstrap pick from ≥2 connections), with
+    # a fresh cached token already minted for it.  Owner-aware resolution needs
+    # the persona block (a network call); we only skip it when the connection is
+    # decidable without owner information.  ``_cached_connection_id`` refuses an
+    # ambiguous bootstrap cache, so this never reuses an arbitrary connection.
     if owner is None:
         conn_id = _cached_connection_id()
         if conn_id and _cache_matches(cached, conn_id):

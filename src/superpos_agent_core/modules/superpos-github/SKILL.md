@@ -81,11 +81,15 @@ call — and it **401s** on repos owned by a *different* connection.
 
 For PR review/comment work on such agents, do **one** of:
 
-- **(a) Route through the proxy (always correct).** `superpos-github api ...`
-  resolves the right connection server-side, so it never hits the 401:
+- **(a) Route through the proxy, naming the owning connection.** The proxy
+  mints server-side (never a `gh` 401), but with `--service` **omitted** it
+  falls back to the *first active* connection — which may not own the repo. On
+  a multi-connection agent, pass `--service <name>` (from `superpos-github
+  connections`) for the connection that owns the repo:
 
   ```bash
-  superpos-github api POST /repos/other-org/repo/issues/7/comments --body '{"body":"…"}'
+  superpos-github api --service other-org-conn \
+    POST /repos/other-org/repo/issues/7/comments --body '{"body":"…"}'
   ```
 
 - **(b) Mint the owning connection's token for the `gh` call.** `github_auth
