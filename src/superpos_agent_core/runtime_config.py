@@ -75,10 +75,24 @@ class RuntimeConfig:
         self.model = model
         self._save()
 
+    @classmethod
+    def efforts_for_model(cls, model: str) -> tuple[str, ...]:
+        """Reasoning-effort levels valid for ``model``.
+
+        The base runtime treats the ladder as global, so every model maps to
+        the full :attr:`EFFORT_LEVELS` tuple.  Subclasses whose effort ladder
+        is model-specific (e.g. Codex) override this to narrow the set per
+        model — and both :meth:`set_effort` validation and the Telegram
+        ``/effort`` help read through here so the advertised contract always
+        matches what is actually accepted.
+        """
+        return cls.EFFORT_LEVELS
+
     def set_effort(self, effort: str) -> None:
-        if effort not in self.EFFORT_LEVELS:
+        allowed = self.efforts_for_model(self.model)
+        if effort not in allowed:
             raise ValueError(
-                f"Effort must be one of {', '.join(self.EFFORT_LEVELS)} — got {effort!r}"
+                f"Effort must be one of {', '.join(allowed)} — got {effort!r}"
             )
         self.effort = effort
         self._save()
