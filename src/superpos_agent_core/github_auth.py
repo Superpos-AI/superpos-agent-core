@@ -192,6 +192,13 @@ async def _connections_from_persona(
     of truth for owner-aware resolution and needs only the free
     ``services.read`` scope the persona render already relies on.
 
+    Only broker-compatible (``github_app``) connections are returned: the
+    broker mints installation tokens and cannot do so from a PAT
+    (``broker_compatible=False``) connection, so a PAT connection must never be
+    handed to the mint endpoint — even when its ``target_login`` matches the
+    repo owner.  This mirrors :func:`_resolve_app_connection_from_persona`,
+    which filters the same way before matching owner/default.
+
     Returns ``([], None)`` on any failure so callers fall back to catalog
     discovery or the static ``GITHUB_TOKEN`` path.
     """
@@ -207,8 +214,9 @@ async def _connections_from_persona(
     conns = block.get("connections")
     if not isinstance(conns, list):
         conns = []
+    broker = [c for c in conns if isinstance(c, dict) and c.get("broker_compatible")]
     default_id = block.get("default_connection_id")
-    return conns, (default_id if isinstance(default_id, str) else None)
+    return broker, (default_id if isinstance(default_id, str) else None)
 
 
 def _conn_id(conn: dict[str, Any]) -> str | None:

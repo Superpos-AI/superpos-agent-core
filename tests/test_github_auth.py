@@ -442,8 +442,10 @@ def _persona_client(connections, default_id=None):
 
 
 _TWO_CONNS = [
-    {"service_connection_id": "conn-superpos", "target_login": "Superpos-AI"},
-    {"service_connection_id": "conn-address", "target_login": "address-so"},
+    {"service_connection_id": "conn-superpos", "target_login": "Superpos-AI",
+     "broker_compatible": True},
+    {"service_connection_id": "conn-address", "target_login": "address-so",
+     "broker_compatible": True},
 ]
 
 
@@ -481,7 +483,8 @@ async def test_resolve_connection_id_override_wins_over_owner(tmp_path, monkeypa
 
 async def test_resolve_connection_id_single_connection_default(tmp_path, monkeypatch):
     _std_env(monkeypatch, tmp_path)
-    one = [{"service_connection_id": "conn-solo", "target_login": "solo-org"}]
+    one = [{"service_connection_id": "conn-solo", "target_login": "solo-org",
+            "broker_compatible": True}]
     monkeypatch.setattr(
         ga, "SuperposClient", _persona_client(one, default_id="conn-solo")
     )
@@ -505,6 +508,37 @@ async def test_resolve_connection_id_ambiguous_no_owner_fails_clear(tmp_path, mo
     # ≥2 connections, no owner, no override/default → refuse to guess.
     with pytest.raises(ga._AmbiguousConnection):
         await ga._resolve_connection_id(None)
+
+
+async def test_resolve_connection_id_skips_pat_for_matching_owner(tmp_path, monkeypatch):
+    # A persona holding BOTH a PAT and a github_app connection for the SAME
+    # owner must resolve to the github_app (broker-compatible) one — the broker
+    # cannot mint an installation token from a PAT, so its id must never reach
+    # the mint endpoint even when its target_login matches the repo owner.
+    _std_env(monkeypatch, tmp_path)
+    mixed = [
+        {"service_connection_id": "pat-superpos", "target_login": "Superpos-AI",
+         "broker_compatible": False},
+        {"service_connection_id": "app-superpos", "target_login": "Superpos-AI",
+         "broker_compatible": True},
+    ]
+    monkeypatch.setattr(ga, "SuperposClient", _persona_client(mixed))
+    # Owner match: the PAT is filtered out, leaving one App connection — no
+    # ambiguity, and definitely not the PAT's id.
+    assert await ga._resolve_connection_id("Superpos-AI") == "app-superpos"
+
+
+async def test_resolve_connection_id_pat_only_falls_through(tmp_path, monkeypatch):
+    # A persona whose only owner-matching connection is a PAT yields no
+    # broker-compatible connection → _resolve_connection_id returns None so the
+    # caller falls through to the static GITHUB_TOKEN path (never mints the PAT).
+    _std_env(monkeypatch, tmp_path)
+    pat_only = [
+        {"service_connection_id": "pat-superpos", "target_login": "Superpos-AI",
+         "broker_compatible": False},
+    ]
+    monkeypatch.setattr(ga, "SuperposClient", _persona_client(pat_only))
+    assert await ga._resolve_connection_id("Superpos-AI") is None
 
 
 # ── credential get end-to-end: mints for the OWNING connection ──────────
