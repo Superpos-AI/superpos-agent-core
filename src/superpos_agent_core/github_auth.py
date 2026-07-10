@@ -366,11 +366,16 @@ async def _resolve_app_connection(
         # rather than mint for the wrong installation).
         record = await _resolve_app_connection_from_persona(client, owner)
         if record:
-            # The persona resolver returns only a single/default/owner-matched
-            # connection (it raises _AmbiguousConnection otherwise), so this id
-            # is safe for the ownerless mint fast path.
+            # Cache the resolution for the offline hot path, but mark it
+            # reusable for a later *ownerless* request only when it was itself
+            # resolved without an owner (a valid default or the sole
+            # broker-compatible connection).  An owner-matched pick from a
+            # multi-connection persona is owner-specific — reusing it for an
+            # ownerless request would authenticate to the wrong org — so cache
+            # it non-owner-agnostic and let a later ownerless request re-resolve.
             _write_json_private(
-                _connection_cache_path(), {**record, "ambiguous": False}
+                _connection_cache_path(),
+                {**record, "owner_agnostic": owner is None},
             )
             return record
         log.debug(
@@ -408,12 +413,14 @@ async def _resolve_app_connection(
             conn.get("name"),
         )
     record = {"id": conn.get("id"), "name": conn.get("name")}
-    # ``ambiguous`` records that this id was picked from two-or-more App
-    # connections with no owner to disambiguate (setup's gh bootstrap).  The
-    # ownerless mint fast path must NOT reuse such a connection — it would
-    # authenticate an ownerless credential request to an arbitrary org.
+    # ``owner_agnostic`` marks a cache safe to reuse for a later *ownerless*
+    # request.  Only the sole broker-compatible connection qualifies: a
+    # bootstrap pick from two-or-more App connections with no owner to
+    # disambiguate (setup's gh bootstrap) is arbitrary, and reusing it would
+    # authenticate an ownerless credential request to whichever org came first.
     _write_json_private(
-        _connection_cache_path(), {**record, "ambiguous": len(app_conns) > 1}
+        _connection_cache_path(),
+        {**record, "owner_agnostic": len(app_conns) == 1},
     )
     return record
 
@@ -505,13 +512,17 @@ def _cached_connection_id() -> str | None:
     cached = _read_json(_connection_cache_path())
     if not cached:
         return None
-    # Refuse a connection that setup picked arbitrarily from two-or-more App
-    # connections: the ownerless fast path would otherwise mint for the wrong
-    # org.  Falling through here routes the request to owner-aware resolution,
-    # which raises _AmbiguousConnection instead of guessing.
-    if cached.get("ambiguous"):
-        return None
-    return cached.get("id")
+    # Reuse a cache on the ownerless fast path only when it was *proven* safe
+    # without an owner: resolved from an explicit override (handled above), a
+    # valid default, or the sole broker-compatible connection.  Anything else —
+    # a bootstrap pick from two-or-more App connections, an owner→target_login
+    # match from a multi-connection persona, or a legacy record written before
+    # this marker existed — carries no such proof.  Treat a missing marker as
+    # unsafe and fall through to owner-aware resolution, which raises
+    # _AmbiguousConnection instead of minting for an arbitrary org.
+    if cached.get("owner_agnostic") is True:
+        return cached.get("id")
+    return None
 
 
 # ── token minting (cached) ────────────────────────────────────────────
@@ -579,12 +590,14 @@ async def _mint_token(owner: str | None = None) -> str | None:
     cache_path = _token_cache_path()
     cached = _read_json(cache_path)
 
-    # Fast offline path: an explicit override or a cache resolved unambiguously
-    # (single/default/owner — never a bootstrap pick from ≥2 connections), with
-    # a fresh cached token already minted for it.  Owner-aware resolution needs
-    # the persona block (a network call); we only skip it when the connection is
-    # decidable without owner information.  ``_cached_connection_id`` refuses an
-    # ambiguous bootstrap cache, so this never reuses an arbitrary connection.
+    # Fast offline path: an explicit override or a cache proven owner-agnostic
+    # (a valid default or the sole connection — never a bootstrap pick from ≥2
+    # connections nor an owner-matched pick), with a fresh cached token already
+    # minted for it.  Owner-aware resolution needs the persona block (a network
+    # call); we only skip it when the connection is decidable without owner
+    # information.  ``_cached_connection_id`` refuses any cache not marked
+    # owner-agnostic (including legacy records), so this never reuses an
+    # arbitrary or owner-specific connection for an ownerless request.
     if owner is None:
         conn_id = _cached_connection_id()
         if conn_id and _cache_matches(cached, conn_id):

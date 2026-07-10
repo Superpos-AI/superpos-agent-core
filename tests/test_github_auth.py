@@ -670,7 +670,9 @@ async def test_mint_token_ownerless_refuses_ambiguous_bootstrap_cache(
     # credential request (older git / useHttpPath off) must NOT reuse that
     # arbitrary connection — it would authenticate to the wrong org.  With two
     # persona connections and no default, resolution must fail clear instead.
-    _seed_connection_cache({"id": "conn-superpos", "name": "gh", "ambiguous": True})
+    _seed_connection_cache(
+        {"id": "conn-superpos", "name": "gh", "owner_agnostic": False}
+    )
     _seed_token_cache("conn-superpos", "boot_tok")
     monkeypatch.setattr(ga, "SuperposClient", _persona_client(_TWO_CONNS))
 
@@ -678,19 +680,39 @@ async def test_mint_token_ownerless_refuses_ambiguous_bootstrap_cache(
         await ga._mint_token(None)
 
 
-async def test_mint_token_ownerless_reuses_unambiguous_cache(tmp_path, monkeypatch):
+async def test_mint_token_ownerless_refuses_legacy_unmarked_cache(
+    tmp_path, monkeypatch
+):
     _std_env(monkeypatch, tmp_path)
-    # The counterpart: a cache resolved unambiguously (single/default/owner —
-    # ambiguous=False) is still fast-pathed, returning the cached token without
-    # any network mint.
-    _seed_connection_cache({"id": "conn-solo", "name": "gh", "ambiguous": False})
+    # A connection.json written by a prior release has no owner_agnostic marker.
+    # Treating a missing marker as "safe" would let an ownerless request reuse
+    # an arbitrary bootstrap connection minted before the marker existed.  It
+    # must be refused and fall through to owner-aware resolution instead.
+    _seed_connection_cache({"id": "conn-superpos", "name": "gh"})
+    _seed_token_cache("conn-superpos", "legacy_tok")
+    monkeypatch.setattr(ga, "SuperposClient", _persona_client(_TWO_CONNS))
+
+    with pytest.raises(ga._AmbiguousConnection):
+        await ga._mint_token(None)
+
+
+async def test_mint_token_ownerless_reuses_owner_agnostic_cache(tmp_path, monkeypatch):
+    _std_env(monkeypatch, tmp_path)
+    # The counterpart: a cache proven owner-agnostic (a valid default or the
+    # sole connection — owner_agnostic=True) is still fast-pathed, returning the
+    # cached token without any network mint.
+    _seed_connection_cache(
+        {"id": "conn-solo", "name": "gh", "owner_agnostic": True}
+    )
     _seed_token_cache("conn-solo", "solo_tok")
     monkeypatch.setattr(ga, "SuperposClient", _RaiseOnMintClient)
 
     assert await ga._mint_token(None) == "solo_tok"
 
 
-async def test_resolve_app_connection_marks_multi_cache_ambiguous(tmp_path, monkeypatch):
+async def test_resolve_app_connection_marks_multi_cache_not_owner_agnostic(
+    tmp_path, monkeypatch
+):
     _std_env(monkeypatch, tmp_path)
 
     class _TwoAppCatalog:
@@ -709,12 +731,73 @@ async def test_resolve_app_connection_marks_multi_cache_ambiguous(tmp_path, monk
             pass
 
     # Ownerless bootstrap over two App connections picks the first for gh, but
-    # the persisted cache must flag it ambiguous so the mint fast path refuses
-    # to reuse it later.
+    # the persisted cache must NOT be marked owner-agnostic so the mint fast
+    # path refuses to reuse it later.
     await ga._resolve_app_connection(_TwoAppCatalog())  # type: ignore[arg-type]
     cached = json.loads(ga._connection_cache_path().read_text())
-    assert cached["ambiguous"] is True
+    assert cached["owner_agnostic"] is False
     assert cached["id"] == "conn-a"
+
+
+async def test_resolve_app_connection_marks_sole_cache_owner_agnostic(
+    tmp_path, monkeypatch
+):
+    _std_env(monkeypatch, tmp_path)
+
+    class _OneAppCatalog:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def list_github_connections(self):
+            return [
+                {"id": "conn-solo", "name": "gh-solo",
+                 "metadata": {"auth_type": "github_app"}},
+            ]
+
+        async def close(self):
+            pass
+
+    # The sole broker-compatible connection is genuinely owner-agnostic — any
+    # request (owner or not) resolves to it — so its cache is reusable.
+    await ga._resolve_app_connection(_OneAppCatalog())  # type: ignore[arg-type]
+    cached = json.loads(ga._connection_cache_path().read_text())
+    assert cached["owner_agnostic"] is True
+    assert cached["id"] == "conn-solo"
+
+
+class _ForbiddenCatalogPersonaClient:
+    """Catalog discovery is 403 (no services.read); the persona block holds
+    two broker-compatible connections so resolution falls back to it."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def list_github_connections(self):
+        raise GitHubDiscoveryForbidden(403, "no services.read")
+
+    async def get_persona(self):
+        return {"github": {"connections": _TWO_CONNS, "default_connection_id": None}}
+
+    async def close(self):
+        pass
+
+
+async def test_resolve_app_connection_persona_owner_match_not_owner_agnostic(
+    tmp_path, monkeypatch
+):
+    _std_env(monkeypatch, tmp_path)
+    # Catalog 403 → persona fallback resolves the owner-matched connection out
+    # of two. That id is owner-specific: it must be cached NON-owner-agnostic so
+    # a later ownerless request does not reuse the wrong org's connection.
+    record = await ga._resolve_app_connection(
+        _ForbiddenCatalogPersonaClient(), owner="address-so"  # type: ignore[arg-type]
+    )
+    assert record["id"] == "conn-address"
+    cached = json.loads(ga._connection_cache_path().read_text())
+    assert cached["owner_agnostic"] is False
+    assert cached["id"] == "conn-address"
+    # And the ownerless fast path must refuse the owner-matched cache.
+    assert ga._cached_connection_id() is None
 
 
 # ── persona unavailable: owner request must NOT fall back to catalog[0] ──
