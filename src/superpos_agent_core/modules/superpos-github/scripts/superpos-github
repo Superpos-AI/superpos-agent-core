@@ -9,6 +9,8 @@ installation token — see ``superpos_agent_core.github_auth``).
 
 Subcommands:
   connections                 List GitHub service connections in the hive.
+  default-connection          Resolve the github service_connection_id from
+                              the persona block (no services.read needed).
   api METHOD PATH             Raw GitHub REST call (e.g. api GET /user).
   pr-list OWNER REPO          List pull requests.
   pr-create OWNER REPO ...    Open a pull request.
@@ -65,6 +67,20 @@ def _parse_json_arg(label: str, raw: str | None) -> Any:
     except json.JSONDecodeError as e:
         print(f"Error: --{label} must be valid JSON ({e})", file=sys.stderr)
         sys.exit(2)
+
+
+async def _persona_github_block(client: SuperposClient) -> dict[str, Any] | None:
+    """Return the ``github`` block from the persona, or ``None``.
+
+    The block is scoped by the per-connection ``services:{id}`` permission,
+    NOT ``services.read`` — so it works for agents that can use a connection
+    but can't list the whole catalog.
+    """
+    persona = await client.get_persona()
+    if not persona:
+        return None
+    block = persona.get("github")
+    return block if isinstance(block, dict) else None
 
 
 async def _resolve_service(client: SuperposClient, override: str | None) -> str:
@@ -150,15 +166,55 @@ async def _run(args: argparse.Namespace) -> int:
             try:
                 _print(await client.list_github_connections(status=args.status))
             except GitHubDiscoveryForbidden as exc:
-                # The user explicitly asked what connections exist — a silent
-                # ``[]`` would be misleading.  Surface the permission problem
-                # loudly and exit non-zero.
+                # The catalog is ``services.read``-gated and denied.  Before
+                # giving up, fall back to the persona ``github`` block, which is
+                # scoped by the per-connection ``services:{id}`` permission and
+                # carries the same connection ids most agents actually need.
+                block = await _persona_github_block(client)
+                conns = (block or {}).get("connections") or []
+                if conns:
+                    _print(conns)
+                    return 0
                 print(
-                    f"Error: {exc} (HTTP {exc.status_code}). Ask a hive admin "
-                    "to grant the `services.read` permission to this agent.",
+                    f"Error: {exc} (HTTP {exc.status_code}). The persona "
+                    "`github` block is also empty or unavailable. Ask a hive "
+                    "admin to grant this agent a `services:{id}` (or "
+                    "`services:*`) permission on the GitHub connection — or "
+                    "ask a human which connection to use.",
                     file=sys.stderr,
                 )
                 return 4
+            return 0
+
+        if args.cmd == "default-connection":
+            conn_id = await client.resolve_github_connection_id()
+            if not conn_id:
+                block = await _persona_github_block(client)
+                conns = (block or {}).get("connections") or []
+                if len(conns) > 1:
+                    print(
+                        "Error: multiple GitHub connections are permitted and "
+                        "none is the default. Pass the desired "
+                        "service_connection_id explicitly (see the persona "
+                        "`github` block) or ask a human which to use.",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        "Error: no GitHub connection found in the persona "
+                        "`github` block. Ask a hive admin to grant a "
+                        "`services:{id}` / `services:*` permission on a GitHub "
+                        "connection.",
+                        file=sys.stderr,
+                    )
+                return 4
+            name = None
+            block = await _persona_github_block(client)
+            for conn in (block or {}).get("connections") or []:
+                if conn.get("service_connection_id") == conn_id:
+                    name = conn.get("name")
+                    break
+            _print({"service_connection_id": conn_id, "name": name})
             return 0
 
         service = await _resolve_service(client, args.service)
@@ -222,6 +278,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
     c = sub.add_parser("connections", help="List GitHub service connections.")
     c.add_argument("--status", default="active", choices=["active", "inactive", "all"])
+
+    sub.add_parser(
+        "default-connection",
+        help="Resolve the github service_connection_id from the persona block "
+        "(no services.read needed).",
+    )
 
     a = sub.add_parser("api", help="Raw GitHub REST call through the proxy.")
     a.add_argument("method", help="HTTP method (GET, POST, PATCH, ...).")

@@ -343,6 +343,99 @@ class SuperposClient:
         # Reachable 200 — empty / missing prompt is a reachable-empty persona.
         return persona_data.get("prompt") or None
 
+    async def get_persona(self) -> dict[str, Any] | None:
+        """Fetch the structured persona document (``GET /api/v1/persona``).
+
+        Unlike :meth:`get_persona_assembled` (which returns the flattened
+        system-prompt string), this returns the structured ``data`` object.  Of
+        interest to the GitHub credential path is ``data.github`` — the block
+        the superpos-app ``GitHubVersionService`` renders — which carries:
+
+          * ``connections[]`` — one per GitHub service connection, each with
+            ``service_connection_id``, ``name``, ``target_login`` (the org/user
+            the App is installed on) and ``target_type``.
+          * ``default_connection_id`` — the single-connection default, or
+            ``null`` when there are two or more connections.
+
+        Requires only the free ``services.read`` scope the persona render
+        already relies on; returns ``None`` on any error so callers can fall
+        back to catalog discovery or the static ``GITHUB_TOKEN`` path.
+        """
+        try:
+            resp = await self._request("GET", "/api/v1/persona")
+            data = resp.json()
+            return data.get("data", data) if isinstance(data, dict) else None
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                log.debug("Persona endpoint not available (404)")
+            else:
+                log.warning("Failed to fetch structured persona", exc_info=True)
+            return None
+        except Exception:
+            log.warning("Failed to fetch structured persona", exc_info=True)
+            return None
+
+    async def resolve_github_connection_id(self) -> str | None:
+        """Resolve the GitHub ``service_connection_id`` from the persona block.
+
+        Reads the ``github`` block attached to ``GET /api/v1/persona`` and
+        returns a connection UUID *without* requiring the ``services.read``
+        permission (which the catalog endpoint behind
+        :meth:`list_github_connections` needs and which 403s for most agents).
+        The persona block is scoped by the per-connection ``services:{id}`` /
+        ``services:*`` permission instead.
+
+        Only broker-compatible (``github_app``) connections are eligible: the
+        broker mints installation tokens and cannot do so from a PAT
+        (``broker_compatible=False``) connection, so a PAT id must never be
+        returned as a resolvable/default connection.  A PAT-only persona has one
+        connection and no ``default_connection_id``; returning that PAT id would
+        misrepresent it as the default despite the server contract.  This
+        mirrors :func:`github_auth._connections_from_persona`, which filters the
+        same way before matching owner/default.
+
+        Resolution order:
+
+        1. ``github.default_connection_id`` — set by the backend when exactly
+           one broker-compatible (``github_app``) connection is permitted — but
+           only when it names a broker-compatible connection actually present in
+           the block (a stale or PAT default is ignored).
+        2. If there is no usable default but exactly one broker-compatible
+           connection is present, its ``service_connection_id``.
+        3. Otherwise ``None`` (no block, no broker-compatible connections, or
+           ambiguous — more than one and no default). Callers should then ask a
+           human which connection to use or fall back to the static
+           ``GITHUB_TOKEN`` path.
+        """
+        persona = await self.get_persona()
+        if not persona:
+            return None
+        block = persona.get("github")
+        if not isinstance(block, dict):
+            return None
+        connections = block.get("connections")
+        if not isinstance(connections, list):
+            connections = []
+        broker = [
+            c
+            for c in connections
+            if isinstance(c, dict) and c.get("broker_compatible")
+        ]
+        broker_ids = {
+            str(cid)
+            for c in broker
+            if (cid := c.get("service_connection_id"))
+        }
+        default_id = block.get("default_connection_id")
+        # Only honour a default that names a broker-compatible connection; a
+        # stale (not-present) or PAT default is ignored.
+        if default_id and str(default_id) in broker_ids:
+            return str(default_id)
+        if len(broker) == 1:
+            conn_id = broker[0].get("service_connection_id")
+            return str(conn_id) if conn_id else None
+        return None
+
     async def get_persona_version(
         self,
         known_version: int | None = None,

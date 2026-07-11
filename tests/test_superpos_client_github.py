@@ -172,3 +172,195 @@ async def test_mint_github_token_posts_and_unwraps():
     assert body == {"service_connection_id": "c1"}
     assert result["token"] == "ghs_minted"
     await client.close()
+
+
+# ── get_persona ────────────────────────────────────────────────────────
+
+
+async def test_get_persona_hits_persona_endpoint_and_unwraps():
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(
+            200,
+            json={"data": {"name": "p", "github": {"default_connection_id": "d1"}}},
+        )
+
+    client = _make_client(handler)
+    result = await client.get_persona()
+
+    req = captured[0]
+    assert req.method == "GET"
+    assert req.url.path == "/api/v1/persona"
+    assert result["github"]["default_connection_id"] == "d1"
+    await client.close()
+
+
+async def test_get_persona_returns_none_on_404():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"errors": [{"message": "no persona"}]})
+
+    client = _make_client(handler)
+    assert await client.get_persona() is None
+    await client.close()
+
+
+# ── resolve_github_connection_id ───────────────────────────────────────
+
+
+async def test_resolve_github_connection_id_prefers_default():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"data": {"github": {
+                "default_connection_id": "default-uuid",
+                "connections": [
+                    {"service_connection_id": "default-uuid", "name": "a",
+                     "broker_compatible": True},
+                    {"service_connection_id": "other-uuid", "name": "b",
+                     "broker_compatible": True},
+                ],
+            }}},
+        )
+
+    client = _make_client(handler)
+    assert await client.resolve_github_connection_id() == "default-uuid"
+    await client.close()
+
+
+async def test_resolve_github_connection_id_single_connection_no_default():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"data": {"github": {
+                "default_connection_id": None,
+                "connections": [
+                    {"service_connection_id": "only-uuid", "name": "a",
+                     "broker_compatible": True},
+                ],
+            }}},
+        )
+
+    client = _make_client(handler)
+    assert await client.resolve_github_connection_id() == "only-uuid"
+    await client.close()
+
+
+async def test_resolve_github_connection_id_pat_only_returns_none():
+    # A PAT-only persona has exactly one connection that is NOT
+    # broker-compatible and no default_connection_id.  The broker cannot mint
+    # an installation token from a PAT, so the resolver must NOT present that
+    # PAT id as the (default) connection — it returns None so callers fall
+    # through to the static GITHUB_TOKEN path.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"data": {"github": {
+                "default_connection_id": None,
+                "connections": [
+                    {"service_connection_id": "pat-uuid", "name": "pat",
+                     "broker_compatible": False},
+                ],
+            }}},
+        )
+
+    client = _make_client(handler)
+    assert await client.resolve_github_connection_id() is None
+    await client.close()
+
+
+async def test_resolve_github_connection_id_default_not_present_returns_none():
+    # A stale default pointing at a connection id not in the block must not be
+    # returned; here there is also no single broker-compatible fallback.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"data": {"github": {
+                "default_connection_id": "ghost-uuid",
+                "connections": [
+                    {"service_connection_id": "a-uuid", "name": "a",
+                     "broker_compatible": True},
+                    {"service_connection_id": "b-uuid", "name": "b",
+                     "broker_compatible": True},
+                ],
+            }}},
+        )
+
+    client = _make_client(handler)
+    assert await client.resolve_github_connection_id() is None
+    await client.close()
+
+
+async def test_resolve_github_connection_id_pat_default_returns_none():
+    # A default naming a PAT (broker_compatible=False) connection must not be
+    # returned even though the id is present in the connections list.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"data": {"github": {
+                "default_connection_id": "pat-uuid",
+                "connections": [
+                    {"service_connection_id": "pat-uuid", "name": "pat",
+                     "broker_compatible": False},
+                    {"service_connection_id": "app-uuid", "name": "app",
+                     "broker_compatible": True},
+                ],
+            }}},
+        )
+
+    client = _make_client(handler)
+    # Falls back to the sole broker-compatible connection, never the PAT.
+    assert await client.resolve_github_connection_id() == "app-uuid"
+    await client.close()
+
+
+async def test_resolve_github_connection_id_broker_default_kept():
+    # An explicit default that IS broker-compatible is honoured even when a
+    # PAT connection is also present.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"data": {"github": {
+                "default_connection_id": "app-uuid",
+                "connections": [
+                    {"service_connection_id": "pat-uuid", "name": "pat",
+                     "broker_compatible": False},
+                    {"service_connection_id": "app-uuid", "name": "app",
+                     "broker_compatible": True},
+                    {"service_connection_id": "app2-uuid", "name": "app2",
+                     "broker_compatible": True},
+                ],
+            }}},
+        )
+
+    client = _make_client(handler)
+    assert await client.resolve_github_connection_id() == "app-uuid"
+    await client.close()
+
+
+async def test_resolve_github_connection_id_ambiguous_returns_none():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"data": {"github": {
+                "default_connection_id": None,
+                "connections": [
+                    {"service_connection_id": "a-uuid", "name": "a"},
+                    {"service_connection_id": "b-uuid", "name": "b"},
+                ],
+            }}},
+        )
+
+    client = _make_client(handler)
+    assert await client.resolve_github_connection_id() is None
+    await client.close()
+
+
+async def test_resolve_github_connection_id_no_github_block_returns_none():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": {"name": "p"}})
+
+    client = _make_client(handler)
+    assert await client.resolve_github_connection_id() is None
+    await client.close()
