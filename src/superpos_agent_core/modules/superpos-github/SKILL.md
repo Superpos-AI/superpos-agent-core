@@ -111,6 +111,37 @@ For PR review/comment work on such agents, do **one** of:
 Direct `git` (clone/push) is already owner-aware via the credential helper and
 needs none of this. Single-connection agents are unaffected either way.
 
+## Reviewing a PR you authored (APPROVE → COMMENT fallback)
+
+On App auth the reviewing connection is frequently the **same identity that
+opened the PR** (both mint from the same GitHub App). GitHub then rejects
+`--approve` with `422 "Can not approve your own pull request."` — a hard GitHub
+rule, not an auth failure and not something a retry fixes.
+
+**Never drop the review when this happens.** Re-submit the *same verdict body*
+as a `COMMENT` review, which GitHub accepts regardless of authorship:
+
+```bash
+# instead of: gh pr review 42 --repo owner/repo --approve
+gh pr review 42 --repo owner/repo --comment --body "$VERDICT"
+
+# proxy equivalent (name the owning connection):
+superpos-github --service <conn> \
+  api POST /repos/owner/repo/pulls/42/reviews \
+  --body '{"event":"COMMENT","body":"<verdict>"}'
+```
+
+Rules:
+
+- If you authored the PR, skip `--approve` entirely and post `--comment` — the
+  APPROVE call will always `422`.
+- A review verdict is the **deliverable, not webhook noise.** The "prefer
+  commits over comments / never comment just to say done" anti-noise guidance
+  does **not** apply to a review agent landing its findings — always post the
+  verdict, even (especially) a clean "no blocking issues" one.
+- Use the **same auth path** as the original APPROVE attempt (owner-aware `gh`
+  token, or the `--service <conn>` proxy).
+
 ## Limits
 
 - The proxy forwards to whatever the connection is permitted to do; a `403`
