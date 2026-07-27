@@ -174,6 +174,41 @@ async def test_mint_github_token_posts_and_unwraps():
     await client.close()
 
 
+# ── resolve_mcp_credentials ────────────────────────────────────────────
+
+
+async def test_resolve_mcp_credentials_posts_and_unwraps():
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(
+            200,
+            json={"data": {
+                "service_connection_id": "c1",
+                "credentials": {"API_KEY": "sk-secret"},
+                "missing": [],
+                "expires_at": None,
+            }},
+        )
+
+    client = _make_client(handler)
+    result = await client.resolve_mcp_credentials("c1", ["API_KEY"])
+
+    req = captured[0]
+    assert req.method == "POST"
+    assert req.url.path == "/api/v1/mcp/credentials"
+    import json as _json
+    body = _json.loads(req.content)
+    # Only the connection id and the bare env NAMES cross the wire — never
+    # ``KEY=value`` forms and never resolved values.
+    assert body == {"service_connection_id": "c1", "keys": ["API_KEY"]}
+    # The ``data`` envelope is unwrapped for the caller.
+    assert result["credentials"] == {"API_KEY": "sk-secret"}
+    assert result["missing"] == []
+    await client.close()
+
+
 # ── get_persona ────────────────────────────────────────────────────────
 
 
