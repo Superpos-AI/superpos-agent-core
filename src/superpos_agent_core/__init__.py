@@ -13,6 +13,11 @@ from .config import BaseConfig
 from .executor import Executor, ExecutionRequest
 from .knowledge import KnowledgeClient, KnowledgeNotFound
 from .main import ExecutorFactory, run_agent, setup_logging
+from .mcp_credentials import (
+    extract_placeholder_names,
+    inject_credentials,
+    resolve_mcp_servers,
+)
 from .module_loader import (
     bundled_modules_dir,
     collect_mcp_servers,
@@ -83,13 +88,16 @@ __all__ = [
     "collect_mcp_servers",
     "discover_modules",
     "ensure_worktree",
+    "extract_placeholder_names",
     "generate_modules_doc",
     "infer_branch",
+    "inject_credentials",
     "is_git_repo",
     "prune_worktrees",
     "redact",
     "remove_registry_overlay_modules",
     "report_progress",
+    "resolve_mcp_servers",
     "run_agent",
     "run_module_setup",
     "run_superpos_poller",
