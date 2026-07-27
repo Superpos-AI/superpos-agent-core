@@ -2083,6 +2083,39 @@ class SuperposClient:
         data = resp.json()
         return data.get("data", data) if isinstance(data, dict) else data
 
+    async def resolve_mcp_credentials(
+        self,
+        service_connection_id: str,
+        keys: list[str],
+    ) -> dict[str, Any]:
+        """``POST /mcp/credentials`` — resolve MCP-server secret VALUES (MCP-3).
+
+        A module's ``manifest.mcp`` block declares env / header NAMES only; the
+        real values live in a linked ``service_connection`` and never ship
+        through the registry.  This broker call resolves the requested NAMES to
+        their values so they can be injected into the MCP child process (stdio
+        env) or request headers (remote) at boot.
+
+        ``keys`` must be bare env NAMES — a ``KEY=value`` form is rejected by
+        the broker (the credential-safe invariant holds at resolution time).
+
+        Returns the ``data`` envelope::
+
+            {"service_connection_id": "...",
+             "credentials": {"NAME": "value", ...},
+             "missing": ["NAME", ...],
+             "expires_at": None}
+        """
+        body: dict[str, Any] = {
+            "service_connection_id": service_connection_id,
+            "keys": keys,
+        }
+        resp = await self._request(
+            "POST", "/api/v1/mcp/credentials", json=body,
+        )
+        data = resp.json()
+        return data.get("data", data) if isinstance(data, dict) else data
+
     # ── Drain mode (graceful shutdown) ────────────────────────────────
 
     async def enter_drain(
