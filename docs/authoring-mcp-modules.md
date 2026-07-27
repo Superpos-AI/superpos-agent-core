@@ -3,7 +3,10 @@
 This is the canonical guide for shipping an [MCP](https://modelcontextprotocol.io/)
 server to Superpos agents **via a module**. A module declares its MCP
 servers in a top-level `mcp:` block; agent-core materialises that block on
-boot and hands the merged set to the coding agent (Claude / Codex).
+boot and merges it into a single MCP-server set. The coding-agent handoff
+that feeds that set to Claude (`ClaudeAgentOptions.mcp_servers`) or Codex
+(`~/.codex/config.json`) lives in the executor repos (`superpos-claude-agent`
+/ `superpos-codex-agent`), not in agent-core.
 
 ## The module `mcp:` block
 
@@ -54,7 +57,9 @@ overlay or the module loader.
 
 - **Prefer remote-HTTP when the server needs no per-agent secret.** The URL
   is public-ish config, nothing sensitive lands in the container, and it
-  works **today** end-to-end (overlay → discover → collect → agent).
+  survives the full agent-core chain **today** (overlay → discover →
+  collect). Feeding the collected set to the running agent is the executor's
+  job (see the pipeline below).
 - **Use stdio (with the broker) when a local process needs a secret.** This
   depends on boot-time credential injection, which is a **pending follow-up**
   (see below) — until it lands, a stdio server that references `${NAME}`
@@ -87,9 +92,10 @@ module mcp: block (authored in the registry)
   → agent-core overlay materialises module.yaml   (registry_overlay._materialise_module)
   → module_loader.discover_modules reads mcp back  (ModuleInfo.mcp_config)
   → module_loader.collect_mcp_servers merges all   (one dict)
-  → coding agent:
-        Claude  → ClaudeAgentOptions.mcp_servers
-        Codex   → ~/.codex/config.json  mcpServers
+─── agent-core boundary ends here (proven by tests/test_mcp_module_e2e.py) ───
+  → coding-agent handoff — lives in the executor repos, NOT agent-core:
+        Claude  → ClaudeAgentOptions.mcp_servers   (superpos-claude-agent)
+        Codex   → ~/.codex/config.json  mcpServers (superpos-codex-agent)
   → (pending) boot-time broker resolves ${NAME} → value
 ```
 
@@ -100,7 +106,7 @@ The overlay passes `manifest.mcp` through to the top-level `mcp:` key of
 
 ## Testing locally
 
-The end-to-end agent-side chain is exercised by
+The agent-core chain (overlay → discover → collect) is exercised by
 [`tests/test_mcp_module_e2e.py`](../tests/test_mcp_module_e2e.py). It builds
 the canonical `example-remote-mcp` registry payload, runs the real overlay
 into a tmp modules dir, reads the written `module.yaml` back, and asserts the

@@ -8,6 +8,11 @@ asserts the remote-HTTP server survives every hop:
         → module_loader.discover_modules     (reads module.yaml back)
         → module_loader.collect_mcp_servers  (merges into one dict)
 
+This is agent-core's boundary. Feeding the collected set to the running
+coding agent (``ClaudeAgentOptions.mcp_servers`` / ``~/.codex/config.json``)
+lives in the executor repos (superpos-claude-agent / superpos-codex-agent)
+and is covered there, not here.
+
 The assertions are on the CONCRETE server (name + url), so the test fails
 the moment ``mcp`` is dropped anywhere in the chain — it is non-vacuous by
 construction.
